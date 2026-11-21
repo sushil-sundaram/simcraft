@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "simcraft": {
+      "command": "/path/to/simcraft/target/release/simcraft",
+      "args": ["mcp"]
+    }
+  }
+}
