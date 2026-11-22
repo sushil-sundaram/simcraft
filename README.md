@@ -96,3 +96,6 @@ src/gui.rs       egui desktop app
 src/bridge.rs    GUI ⇄ MCP local socket
 src/mcp.rs       MCP stdio server
 ```
+
+## License
+MIT — see [LICENSE](LICENSE).
