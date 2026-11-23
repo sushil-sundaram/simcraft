@@ -497,10 +497,30 @@ Agents can also request Latin-hypercube sampling (`samples`).
 ### Optimize
 Pick parameters and ranges, an **objective** (minimise or maximise a response) and any number of
 **constraints** (`≤` / `≥`), e.g. *minimise mass with max:von_mises ≤ 150 and min:safety_factor ≥ 2*.
-SimCraft samples the design space (Latin hypercube), then refines the best design with a bounded
-Nelder–Mead search; 20–40 evaluations is typical for 1–3 parameters. The results table marks the best
-feasible design ★ and designs that violate a constraint. Because the mesh is made of cubes,
-dimensions effectively change in steps of one element: use a finer element size for finer answers.
+Two methods:
+- **Surrogate (Bayesian)** — default. After a small space-filling sample, SimCraft fits Gaussian-process
+  response surfaces to the objective and every constraint and picks each next design where the
+  *expected improvement × probability of meeting the constraints* is highest. Every proposal is
+  verified with a real solve, so the best design shown is always a real result. Typically 8–15 real
+  solves for 1–3 parameters (e.g. lightest beam meeting a stress limit: 10 solves, on the limit to
+  0.6 %). Reuses the designs of the current study when the parameters match.
+- **Direct search** — Latin hypercube then a bounded Nelder–Mead search on real solves only; 20–40
+  evaluations for 1–3 parameters. Robust for jumpy responses.
+
+The results table marks the best feasible design ★ and designs that violate a constraint. In Static
+Structural, curved-surface fitting makes dimensions change smoothly; other analyses mesh in whole
+cubes, so dimensions change in steps of one element — use a finer element size for finer answers.
+
+### What-if (surrogates)
+Once a study has at least 3 solved designs, its window shows **🔮 What-if**: one slider per parameter
+and an **instant estimate** of every response with a ±2σ band, from Gaussian-process response surfaces
+fitted to the study (inputs scaled to their ranges, anisotropic squared-exponential kernel,
+hyper-parameters by maximum likelihood). Estimates are labelled **not verified**; **Verify with a real
+solve** applies the values and solves. Over MCP: `fit_surrogate` reports each response's quality —
+leave-one-out RMSE and Q² (> 0.9 good) — and which parameters matter most; `predict_surrogate
+{values}` gives estimates (and warns when you leave the studied range); `apply_design {values}` adopts
+any design. Responses that jump (e.g. a maximum stress that moves from one place to another) fit
+poorly — the quality report says so.
 
 ### Topology
 For a **Static Structural** setup, **Topology** finds the stiffest layout using only a chosen
@@ -510,8 +530,8 @@ shape is exported as an STL (next to your project, or in `~/SimCraft/`). **Open 
 starts a new model from it so you can re-apply loads and verify the stresses, or import the STL into
 your CAD as a starting point.
 
-MCP tools: `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `topology_optimize`,
-`get_study`, `apply_design`.
+MCP tools: `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`,
+`fit_surrogate`, `predict_surrogate`, `topology_optimize`, `get_study`, `apply_design`.
 
 ---
 

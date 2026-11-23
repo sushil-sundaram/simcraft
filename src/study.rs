@@ -320,7 +320,7 @@ pub type StudyProg<'a> = &'a dyn Fn(f64, &str);
 /// Geometry is meshed with cubes, so dimensions effectively change in whole-element steps.
 fn snap_note(model: &Model, params: &[Parameter]) -> String {
     let geometric = params.iter().any(|p| !p.target.starts_with("load") && !p.target.eq_ignore_ascii_case("element_size"));
-    if !geometric {
+    if !geometric || model.mesh_fitted() {
         return String::new();
     }
     let h = model.element_size.unwrap_or_else(|| mesh::auto_size(&model.bodies, model.mesh_with_enclosure()));
@@ -548,6 +548,184 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
     };
     Ok(Study {
         kind: "optimization".into(),
+        parameters: params,
+        responses,
+        objective: Some(objective),
+        constraints,
+        runs,
+        best: best_idx,
+        message,
+        seconds: t0.elapsed().as_secs_f64(),
+        ..Default::default()
+    })
+}
+
+// ------------------------------------------------------------------ surrogates
+
+/// Gaussian-process response surfaces fitted to a study's solved designs.
+pub struct SurrogateSet {
+    pub parameters: Vec<Parameter>,
+    pub responses: Vec<String>,
+    /// one GP per response (None when fewer than 3 designs have that response)
+    pub gps: Vec<Option<crate::surrogate::Gp>>,
+    pub n_runs: usize,
+}
+
+fn norm_values(params: &[Parameter], v: &[f64]) -> Vec<f64> {
+    params.iter().zip(v).map(|(p, x)| (x - p.min) / (p.max - p.min)).collect()
+}
+
+pub fn fit_surrogates(st: &Study) -> Result<SurrogateSet> {
+    if st.kind == "topology" || st.parameters.is_empty() {
+        bail!("surrogates need a parameter study or optimization (run_parameter_study / optimize_design / surrogate_optimize) first");
+    }
+    let mut gps = Vec::new();
+    for ri in 0..st.responses.len() {
+        let pts: Vec<(Vec<f64>, f64)> = st
+            .runs
+            .iter()
+            .filter(|r| r.error.is_none())
+            .filter_map(|r| r.responses.get(ri).copied().flatten().map(|y| (norm_values(&st.parameters, &r.values), y)))
+            .filter(|(_, y)| y.is_finite())
+            .collect();
+        // drop duplicate designs (keep the first)
+        let mut x: Vec<Vec<f64>> = Vec::new();
+        let mut y = Vec::new();
+        for (u, v) in pts {
+            if !x.iter().any(|w| w.iter().zip(&u).all(|(a, b)| (a - b).abs() < 1e-9)) {
+                x.push(u);
+                y.push(v);
+            }
+        }
+        gps.push(if x.len() >= 3 { Some(crate::surrogate::Gp::fit(x, &y)?) } else { None });
+    }
+    Ok(SurrogateSet { parameters: st.parameters.clone(), responses: st.responses.clone(), gps, n_runs: st.runs.len() })
+}
+
+impl SurrogateSet {
+    /// (mean, std) per response for real parameter values.
+    pub fn predict(&self, values: &[f64]) -> Vec<Option<(f64, f64)>> {
+        let u = norm_values(&self.parameters, values);
+        self.gps.iter().map(|g| g.as_ref().map(|g| g.predict(&u))).collect()
+    }
+}
+
+/// Bayesian (surrogate-based) optimisation: Gaussian processes on the objective and every
+/// constraint, next design = argmax expected improvement × probability of feasibility, each
+/// proposal verified with a real solve. `prior` runs (same parameters) are reused.
+pub fn surrogate_optimize(model: &Model, params: Vec<Parameter>, objective: Objective, constraints: Vec<Constraint>, max_solves: usize, prior: Vec<Run>, prog: StudyProg) -> Result<Study> {
+    use crate::surrogate::{Gp, big_phi, expected_improvement, nelder_mead};
+    validate(model, &params)?;
+    for c in &constraints {
+        if !matches!(c.op.as_str(), "<=" | ">=" | "<" | ">") {
+            bail!("constraint operator must be <= or >=");
+        }
+    }
+    let sign = match objective.goal.as_str() {
+        "minimize" | "min" => 1.0,
+        "maximize" | "max" => -1.0,
+        g => bail!("goal must be minimize or maximize (got '{g}')"),
+    };
+    let t0 = std::time::Instant::now();
+    let n = params.len();
+    let mut responses = vec![objective.response.clone()];
+    responses.extend(constraints.iter().map(|c| c.response.clone()));
+    let budget = max_solves.clamp(2, 200);
+    let mut runs: Vec<Run> = prior;
+    let mut solved = 0usize;
+    let feasible = |r: &Run| r.error.is_none() && violation(&constraints, &r.responses, 1).is_some_and(|v| v <= 1e-9);
+    let solve = |u: &[f64], phase: &str, runs: &mut Vec<Run>, solved: &mut usize| {
+        prog(*solved as f64 / budget as f64, &format!("verifying design {}/{budget} with a real solve", *solved + 1));
+        let mut r = eval_run(model, &params, denorm(&params, u), &responses, phase);
+        r.feasible = feasible(&r);
+        runs.push(r);
+        *solved += 1;
+    };
+    // initial design if there is too little data
+    let ok_runs = |runs: &Vec<Run>| runs.iter().filter(|r| r.error.is_none()).count();
+    if ok_runs(&runs) < n + 2 {
+        let m0 = (2 * n + 2).min(budget.saturating_sub(1)).max(2);
+        for u in lhs(n, m0, 0xBA7E5) {
+            if solved >= budget {
+                break;
+            }
+            solve(&u, "doe", &mut runs, &mut solved);
+        }
+    }
+    let mut note = String::new();
+    while solved < budget {
+        // fit surrogates to every verified design
+        let data: Vec<&Run> = runs.iter().filter(|r| r.error.is_none() && r.responses.iter().all(|v| v.is_some())).collect();
+        if data.len() < 3 {
+            let u: Vec<f64> = lhs(n, 1, 0xF00D + solved as u64).remove(0);
+            solve(&u, "doe", &mut runs, &mut solved);
+            continue;
+        }
+        let x: Vec<Vec<f64>> = data.iter().map(|r| norm_values(&params, &r.values)).collect();
+        let fobj = Gp::fit(x.clone(), &data.iter().map(|r| sign * r.responses[0].unwrap()).collect::<Vec<_>>())?;
+        let fcon: Vec<Gp> = (0..constraints.len()).map(|k| Gp::fit(x.clone(), &data.iter().map(|r| r.responses[k + 1].unwrap()).collect::<Vec<_>>())).collect::<Result<_>>()?;
+        let best_feasible = data.iter().filter(|r| feasible(r)).map(|r| sign * r.responses[0].unwrap()).fold(f64::INFINITY, f64::min);
+        let acq = |u: &[f64]| -> f64 {
+            let mut pof = 1.0;
+            for (c, g) in constraints.iter().zip(&fcon) {
+                let (m, s) = g.predict(u);
+                let s = s.max(1e-12);
+                pof *= match c.op.as_str() {
+                    "<=" | "<" => big_phi((c.value - m) / s),
+                    _ => big_phi((m - c.value) / s),
+                };
+            }
+            if best_feasible.is_finite() {
+                let (m, s) = fobj.predict(u);
+                expected_improvement(m, s, best_feasible) * pof
+            } else {
+                pof
+            }
+        };
+        // candidates: space-filling set, then local refinement of the best few
+        let mut cands: Vec<(Vec<f64>, f64)> = lhs(n, 1500, 0xACE + solved as u64).into_iter().map(|u| {
+            let a = acq(&u);
+            (u, a)
+        }).collect();
+        cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut best = cands[0].clone();
+        for c in cands.iter().take(3) {
+            let (u, f) = nelder_mead(&|u: &[f64]| -acq(u), &c.0, 0.05, 0.0, 1.0, 120 * n);
+            if -f > best.1 {
+                best = (u, -f);
+            }
+        }
+        let scale = if best_feasible.is_finite() { best_feasible.abs().max(1e-12) } else { 1.0 };
+        if best_feasible.is_finite() && best.1 < 1e-7 * scale {
+            note = format!(" Converged: expected improvement below 1e-7 after {solved} solves.");
+            break;
+        }
+        // never re-solve (nearly) the same design
+        let dup = runs.iter().any(|r| norm_values(&params, &r.values).iter().zip(&best.0).all(|(a, b)| (a - b).abs() < 1e-3));
+        let u = if dup { cands.iter().find(|c| !runs.iter().any(|r| norm_values(&params, &r.values).iter().zip(&c.0).all(|(a, b)| (a - b).abs() < 1e-3))).map(|c| c.0.clone()).unwrap_or(best.0) } else { best.0 };
+        solve(&u, "search", &mut runs, &mut solved);
+    }
+    let best_idx = runs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.feasible)
+        .min_by(|a, b| (sign * a.1.responses[0].unwrap()).partial_cmp(&(sign * b.1.responses[0].unwrap())).unwrap())
+        .map(|(i, _)| i);
+    let message = match best_idx {
+        Some(i) => {
+            let vals: Vec<String> = params.iter().zip(&runs[i].values).map(|(p, v)| format!("{} = {}", p.target, crate::results::float(*v))).collect();
+            format!(
+                "Best verified design after {solved} real solves ({} designs in total): {} → {} = {}.{note}",
+                runs.len(),
+                vals.join(", "),
+                objective.response,
+                runs[i].responses[0].map(crate::results::float).map(|v| v.to_string()).unwrap_or("?".into())
+            ) + &snap_note(model, &params)
+        }
+        None => format!("No verified design met every constraint after {solved} solves; widen the ranges or relax the constraints.{note}"),
+    };
+    Ok(Study {
+        kind: "surrogate_optimization".into(),
         parameters: params,
         responses,
         objective: Some(objective),
