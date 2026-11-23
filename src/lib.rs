@@ -1,15 +1,28 @@
-//! SimCraft — finite-element simulation (structural, thermal, modal, thermal-stress) with a
+//! SimCraft — finite-element simulation (structural, thermal, electromagnetic, fluid) with a
 //! simple desktop UI and an MCP server for AI agents.
+pub mod assistant;
 pub mod bridge;
+pub mod cfd;
+pub mod dynamics;
+pub mod fatigue;
+pub mod fdtd;
 pub mod fem;
+pub mod fields;
 pub mod geometry;
+pub mod kicad;
+pub mod gpu;
 pub mod gui;
 pub mod material;
 pub mod mcp;
 pub mod mesh;
+pub mod multigrid;
 pub mod model;
 pub mod render;
+pub mod report;
 pub mod results;
 pub mod session;
 pub mod sparse;
+pub mod study;
+pub mod topo;
+pub mod vibration;
 pub mod vtk;

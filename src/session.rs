@@ -17,6 +17,7 @@ pub struct Session {
     pub model: Model,
     pub mesh: Option<Arc<Mesh>>,
     mesh_rev: u64,
+    mesh_mode: bool,
     pub geom_rev: u64,
     pub results: Option<Arc<Results>>,
     pub results_stale: bool,
@@ -29,6 +30,10 @@ pub struct Session {
     pub log: Vec<String>,
     pub project_path: Option<String>,
     pub last_error: Option<String>,
+    /// To-do list from the simulation planner.
+    pub plan: Option<crate::assistant::Plan>,
+    /// Last parameter study / optimization / topology run.
+    pub study: Option<crate::study::Study>,
 }
 
 impl Default for Session {
@@ -37,6 +42,7 @@ impl Default for Session {
             model: Model::default(),
             mesh: None,
             mesh_rev: u64::MAX,
+            mesh_mode: false,
             geom_rev: 0,
             results: None,
             results_stale: false,
@@ -47,6 +53,8 @@ impl Default for Session {
             log: vec!["SimCraft ready.".into()],
             project_path: None,
             last_error: None,
+            plan: None,
+            study: None,
         }
     }
 }
@@ -75,17 +83,51 @@ impl Session {
         self.revision += 1;
     }
     pub fn element_size(&self) -> f64 {
-        self.model.element_size.unwrap_or_else(|| mesh::auto_size(&self.model.bodies))
+        self.model.element_size.unwrap_or_else(|| {
+            let geo = mesh::auto_size(&self.model.bodies, self.model.mesh_with_enclosure());
+            // imported boards need ≥ 2 cells through their thickness
+            let pcb_t = self.model.bodies.iter().filter_map(|b| match &b.shape {
+                Shape::Pcb { data: Some(d), .. } => Some(d.thickness),
+                _ => None,
+            }).fold(f64::INFINITY, f64::min);
+            let geo = if pcb_t.is_finite() { geo.min(((pcb_t / 2.0) * 20.0).floor() / 20.0) } else { geo };
+            if !self.fdtd() {
+                return geo;
+            }
+            // full-wave: ≥ 10 cells per wavelength in the densest dielectric, ≤ ~8 M cells
+            let mats = self.model.materials();
+            let f = self.model.analysis.frequency_hz;
+            let eps = self
+                .model
+                .bodies
+                .iter()
+                .filter_map(|b| crate::material::find(&mats, &b.material))
+                .filter(|m| m.electrical_conductivity < 1e4)
+                .map(|m| m.relative_permittivity)
+                .fold(1.0, f64::max);
+            let lam = 299_792_458.0 / (f * eps.sqrt()) * 1e3;
+            let (lo, hi) = mesh::domain_bounds(&self.model.bodies, self.model.mesh_with_enclosure());
+            let vol = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
+            let floor = (vol / 8e6).cbrt();
+            let h = (lam / 10.0).max(floor);
+            (h * 10.0).floor() / 10.0
+        })
+    }
+    fn fdtd(&self) -> bool {
+        matches!(self.model.analysis.kind, AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating)
     }
     pub fn mesh_valid(&self) -> bool {
-        self.mesh.is_some() && self.mesh_rev == self.geom_rev
+        self.mesh.as_ref().is_some_and(|m| self.fdtd() || m.elems.len() <= mesh::MAX_CELLS) && self.mesh_rev == self.geom_rev && self.mesh_mode == self.model.mesh_with_enclosure()
     }
     pub fn ensure_mesh(&mut self) -> Result<Arc<Mesh>> {
         if self.mesh_valid() {
             return Ok(self.mesh.clone().unwrap());
         }
         let h = self.element_size();
-        let m = Arc::new(mesh::build_mesh(&self.model.bodies, h, &self.model.materials())?);
+        let mode = self.model.mesh_with_enclosure();
+        let limit = if self.fdtd() { mesh::MAX_CELLS_FDTD } else { mesh::MAX_CELLS };
+        let m = Arc::new(mesh::build_mesh_max(&self.model.bodies, h, &self.model.materials(), mode, limit)?);
+        self.mesh_mode = mode;
         self.mesh = Some(m.clone());
         self.mesh_rev = self.geom_rev;
         self.revision += 1;
@@ -104,6 +146,9 @@ impl Session {
         self.unique_name(&format!("{kind}{n}"))
     }
     pub fn add_body(&mut self, name: Option<&str>, kind: &str, shape: Shape, op: Op, material: Option<&str>) -> Result<String> {
+        self.add_body_role(name, kind, shape, op, material, Role::Solid)
+    }
+    pub fn add_body_role(&mut self, name: Option<&str>, kind: &str, shape: Shape, op: Op, material: Option<&str>, role: Role) -> Result<String> {
         shape.validate()?;
         let name = match name {
             Some(n) if !n.trim().is_empty() => self.unique_name(n),
@@ -116,11 +161,11 @@ impl Session {
                 .bodies
                 .iter()
                 .rev()
-                .find(|b| b.op == Op::Add)
+                .find(|b| b.op == Op::Add && b.role == Role::Solid)
                 .map(|b| b.material.clone())
                 .unwrap_or_else(default_material),
         };
-        self.model.bodies.push(Body { name: name.clone(), shape, op, material });
+        self.model.bodies.push(Body { name: name.clone(), shape, op, material, role });
         self.touch_geometry();
         self.log(format!("Added body '{name}' ({})", if op == Op::Add { "add" } else { "subtract" }));
         Ok(name)
@@ -136,6 +181,11 @@ impl Session {
         if !load.faces().is_empty() {
             let m = self.ensure_mesh()?;
             m.resolve_faces(load.faces())?;
+        }
+        if let Some(b) = load.body() {
+            if !self.model.bodies.iter().any(|x| x.name.eq_ignore_ascii_case(b) && x.role == Role::Solid) {
+                bail!("no solid body named '{b}' (bodies: {:?})", self.model.bodies.iter().map(|x| x.name.clone()).collect::<Vec<_>>());
+            }
         }
         let id = self.model.next_id.max(1);
         self.model.next_id = id + 1;
@@ -180,7 +230,7 @@ impl Session {
     }
 
     pub fn save(&self, path: &str) -> Result<()> {
-        let v = json!({"simcraft": 1, "model": self.model, "display": self.display});
+        let v = json!({"simcraft": 1, "model": self.model, "display": self.display, "plan": self.plan});
         std::fs::write(path, serde_json::to_string_pretty(&v)?)?;
         Ok(())
     }
@@ -192,13 +242,19 @@ impl Session {
             if let Shape::Stl { path, scale, offset, data } = &mut b.shape {
                 *data = Some(Arc::new(load_stl(path, *scale, *offset)?));
             }
+            if let Shape::Pcb { path, data, .. } = &mut b.shape {
+                *data = Some(Arc::new(crate::kicad::PcbData::load(path)?));
+            }
         }
         self.model = model;
         if let Some(d) = v.get("display") {
-            if let Ok(d) = serde_json::from_value(d.clone()) {
+            if let Ok(d) = serde_json::from_value::<Display>(d.clone()) {
+                let dark = self.display.dark;
                 self.display = d;
+                self.display.dark = dark; // keep the user's theme, not the one saved with the file
             }
         }
+        self.plan = v.get("plan").and_then(|p| serde_json::from_value(p.clone()).ok());
         self.mesh = None;
         self.touch_geometry();
         self.project_path = Some(path.to_string());
@@ -341,20 +397,37 @@ impl Core {
         if tool == "screenshot_gui" {
             return self.screenshot_gui();
         }
-        if self.is_busy() && !matches!(tool, "get_model" | "get_results" | "list_faces" | "list_materials" | "render_image" | "probe" | "get_status" | "set_display" | "get_selection") {
+        if matches!(tool, "run_parameter_study" | "optimize_design" | "topology_optimize") {
+            return self.study_job(tool, a);
+        }
+        if tool == "plan_simulation" {
+            return self.plan_simulation(a);
+        }
+        if tool == "list_local_models" {
+            let models = crate::assistant::list_models()?;
+            return Ok(Output::json(json!({"server": crate::assistant::base_url(), "models": models, "default": crate::assistant::default_model(&models)})));
+        }
+        if self.is_busy() && !matches!(tool, "get_model" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets") {
             bail!("a solve is running; wait for it to finish (use get_status)");
         }
         let mut guard = self.session.lock().unwrap();
         let s = &mut *guard;
         match tool {
             "get_model" => Ok(Output::json(s.model_json())),
+            "list_tools" => Ok(Output::json(json!(tool_defs()))),
             "get_status" => {
                 let p = self.progress.lock().unwrap().clone();
                 Ok(Output::json(json!({"solving": p.running, "progress": p.fraction, "message": p.message, "last_error": s.last_error, "recent_log": s.log.iter().rev().take(8).rev().collect::<Vec<_>>()})))
             }
             "new_model" => {
                 let rev = s.revision;
+                // the theme and edge display are user preferences, not part of the model
+                let (dark, show_mesh) = (s.display.dark, s.display.show_mesh);
+                let plan = s.plan.take();
                 *s = Session::default();
+                s.plan = plan;
+                s.display.dark = dark;
+                s.display.show_mesh = show_mesh;
                 s.revision = rev + 1;
                 s.geom_rev = rev + 1;
                 s.view_request = Some("fit".into());
@@ -392,6 +465,52 @@ impl Core {
                 s.view_request = Some("fit".into());
                 Ok(Output::text(format!("Imported '{path}' as body '{n}' ({ntri} triangles, {nseg} smooth faces). Use list_faces to see face names.")))
             }
+            "import_kicad" => {
+                let path = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path' (.kicad_pcb file)"))?.to_string();
+                let data = std::sync::Arc::new(crate::kicad::PcbData::load(&path)?);
+                let off = v3_or(a, "offset", [0.0; 3])?;
+                let bname = s.add_body(Some(opt_str(a, "name").unwrap_or("Board")), "Board", Shape::Pcb { path: path.clone(), offset: off, data: Some(data.clone()) }, Op::Add, Some(opt_str(a, "material").unwrap_or("FR-4 (PCB laminate)")))?;
+                let with_parts = a.get("components").and_then(|v| v.as_bool()).unwrap_or(true);
+                let h_default = opt_num(a, "component_height_mm").unwrap_or(1.0);
+                let min_area = opt_num(a, "min_component_area_mm2").unwrap_or(4.0);
+                let heights = a.get("heights").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                let powers = a.get("power").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                let mut created = Vec::new();
+                let mut skipped = 0usize;
+                let mut loads = Vec::new();
+                if with_parts {
+                    for fp in &data.footprints {
+                        let size = [fp.hi[0] - fp.lo[0], fp.hi[1] - fp.lo[1]];
+                        let listed = heights.contains_key(&fp.reference) || powers.contains_key(&fp.reference);
+                        if size[0] <= 0.0 || size[1] <= 0.0 || (!listed && size[0] * size[1] < min_area) {
+                            skipped += 1;
+                            continue;
+                        }
+                        let ht = heights.get(&fp.reference).and_then(|v| v.as_f64()).unwrap_or(h_default).max(0.05);
+                        let z = if fp.bottom { off[2] - ht } else { off[2] + data.thickness };
+                        let shape = Shape::Box { min: [off[0] + fp.lo[0], off[1] + fp.lo[1], z], size: [size[0], size[1], ht] };
+                        let n = s.add_body(Some(&fp.reference), "Part", shape, Op::Add, Some("IC Package (mold compound)"))?;
+                        if let Some(p) = powers.get(&fp.reference).and_then(|v| v.as_f64()) {
+                            let id = s.add_load(Load::HeatGeneration { value: 0.0, body: Some(n.clone()), power: Some(p) })?;
+                            loads.push(json!({"id": id, "body": n, "power_w": p}));
+                        }
+                        created.push(json!({"body": n, "value": fp.value, "footprint": fp.footprint, "side": if fp.bottom { "bottom" } else { "top" }, "size_mm": [crate::results::float(size[0]), crate::results::float(size[1]), ht]}));
+                    }
+                }
+                let missing: Vec<&String> = powers.keys().filter(|r| !data.footprints.iter().any(|f| &f.reference == *r)).collect();
+                s.view_request = Some("fit".into());
+                s.log(format!("Imported KiCad board '{path}' ({} components)", created.len()));
+                let mut out = data.summary();
+                out["board_body"] = json!(bname);
+                out["components"] = json!(created);
+                out["small_footprints_skipped"] = json!(skipped);
+                out["heat_loads"] = json!(loads);
+                if !missing.is_empty() {
+                    out["power_references_not_found"] = json!(missing);
+                }
+                out["note"] = json!(format!("Board faces: {bname}.top, {bname}.bottom, {bname}.edge. Copper is homogenised into orthotropic conductivity per cell — use an element size ≤ half the board thickness ({:.2} mm) through the board, e.g. set_mesh 0.8 for a 1.6 mm board. Thermal analyses (steady/transient thermal, conjugate heat transfer) use it; add_heat_generation with power on component bodies.", data.thickness / 2.0));
+                Ok(Output::json(out))
+            }
             "remove_body" => {
                 let name = opt_str(a, "name").ok_or_else(|| anyhow!("missing 'name'"))?;
                 let before = s.model.bodies.len();
@@ -425,6 +544,16 @@ impl Core {
                 set("thermal_conductivity", &mut m.thermal_conductivity);
                 set("thermal_expansion", &mut m.thermal_expansion);
                 set("specific_heat", &mut m.specific_heat);
+                set("fatigue_strength_coefficient_mpa", &mut m.fatigue_strength_coefficient_mpa);
+                set("fatigue_exponent", &mut m.fatigue_exponent);
+                set("endurance_limit_mpa", &mut m.endurance_limit_mpa);
+                set("relative_permittivity", &mut m.relative_permittivity);
+                set("electrical_conductivity", &mut m.electrical_conductivity);
+                set("relative_permeability", &mut m.relative_permeability);
+                set("loss_tangent", &mut m.loss_tangent);
+                if m.relative_permittivity < 1.0 || m.electrical_conductivity < 0.0 || m.relative_permeability <= 0.0 || m.loss_tangent < 0.0 {
+                    bail!("invalid electromagnetic properties: need εr ≥ 1, σ ≥ 0, μr > 0, tan δ ≥ 0");
+                }
                 if !(m.poisson_ratio > -1.0 && m.poisson_ratio < 0.5) || m.youngs_modulus_gpa <= 0.0 {
                     bail!("invalid material: need E > 0 and -1 < poisson < 0.5");
                 }
@@ -452,7 +581,83 @@ impl Core {
             }
             "set_analysis" => {
                 if let Some(t) = opt_str(a, "type") {
-                    s.model.analysis.kind = serde_json::from_value(json!(t)).map_err(|_| anyhow!("type must be static_structural, steady_thermal, modal or thermal_stress"))?;
+                    s.model.analysis.kind = serde_json::from_value(json!(t)).map_err(|_| anyhow!("type must be one of {:?}", AnalysisType::all().iter().map(|a| a.key()).collect::<Vec<_>>()))?;
+                }
+                let st = &mut s.model.analysis;
+                if let Some(v) = opt_num(a, "end_time") {
+                    st.end_time = v.max(1e-9);
+                }
+                if let Some(v) = opt_num(a, "time_steps") {
+                    st.time_steps = (v as usize).clamp(1, 5000);
+                }
+                if let Some(v) = opt_num(a, "initial_temperature") {
+                    st.initial_temperature = v;
+                }
+                if let Some(v) = opt_num(a, "damping_ratio") {
+                    st.damping_ratio = v.clamp(0.0, 1.0);
+                }
+                if let Some(v) = opt_num(a, "load_steps") {
+                    st.load_steps = (v as usize).clamp(1, 200);
+                }
+                if let Some(v) = opt_num(a, "max_iterations") {
+                    st.max_iterations = (v as usize).clamp(50, 100_000);
+                }
+                if let Some(v) = opt_num(a, "freq_min") {
+                    st.freq_min = if v > 0.0 { Some(v) } else { None };
+                }
+                if let Some(v) = opt_num(a, "freq_max") {
+                    st.freq_max = if v > 0.0 { Some(v) } else { None };
+                }
+                if let Some(v) = opt_num(a, "freq_steps") {
+                    st.freq_steps = (v as usize).clamp(20, 5000);
+                }
+                if let Some(t) = a.get("table") {
+                    let pts: Vec<[f64; 2]> = serde_json::from_value(t.clone()).map_err(|_| anyhow!("table must be [[frequency_hz, value], ...]"))?;
+                    if pts.iter().any(|p| p[0] <= 0.0 || p[1] < 0.0) {
+                        bail!("table frequencies must be > 0 and values ≥ 0");
+                    }
+                    st.table = pts;
+                }
+                if let Some(d) = opt_str(a, "direction") {
+                    st.direction = serde_json::from_value(json!(d.to_lowercase())).map_err(|_| anyhow!("direction must be x, y or z"))?;
+                }
+                if let Some(c) = opt_str(a, "combination") {
+                    if !matches!(c.to_lowercase().as_str(), "srss" | "cqc") {
+                        bail!("combination must be srss or cqc");
+                    }
+                    st.combination = c.to_lowercase();
+                }
+                if let Some(t) = opt_str(a, "turbulence") {
+                    let t = t.to_lowercase();
+                    if !matches!(t.as_str(), "laminar" | "lvel") {
+                        bail!("turbulence must be laminar or lvel");
+                    }
+                    st.turbulence = t;
+                }
+                if let Some(v) = opt_num(a, "frequency_hz") {
+                    if !(v > 0.0) {
+                        bail!("frequency_hz must be > 0");
+                    }
+                    st.frequency_hz = v;
+                }
+                if let Some(v) = opt_num(a, "frequency_ghz") {
+                    if !(v > 0.0) {
+                        bail!("frequency_ghz must be > 0");
+                    }
+                    st.frequency_hz = v * 1e9;
+                }
+                if let Some(b) = opt_str(a, "em_boundary") {
+                    let b = b.to_lowercase();
+                    if !matches!(b.as_str(), "pec" | "open") {
+                        bail!("em_boundary must be pec (closed metal cavity) or open (absorbing)");
+                    }
+                    st.em_boundary = b;
+                }
+                if let Some(v) = opt_num(a, "max_periods") {
+                    st.max_periods = (v as usize).clamp(24, 20_000);
+                }
+                if let Some(v) = opt_str(a, "compute") {
+                    st.compute = serde_json::from_value(json!(v)).map_err(|_| anyhow!("compute must be auto, cpu or gpu"))?;
                 }
                 if let Some(m) = opt_num(a, "modes") {
                     s.model.analysis.modes = (m as usize).clamp(1, 20);
@@ -465,7 +670,11 @@ impl Core {
                 s.display.show_results = false;
                 let l = s.model.analysis.kind.label();
                 s.log(format!("Analysis set to {l}"));
-                Ok(Output::text(format!("Analysis: {l}.")))
+                let mut note = String::new();
+                if s.model.analysis.kind.requires_enclosure() && !s.model.has_enclosure() {
+                    note = " It needs an enclosure (air/fluid box): call add_enclosure.".into();
+                }
+                Ok(Output::json(json!({"analysis": l, "settings": s.model.analysis, "note": note})))
             }
             "list_faces" => {
                 let m = s.ensure_mesh()?;
@@ -489,7 +698,89 @@ impl Core {
                 let l = Load::Convection { faces: faces(a)?, coefficient: num(a, "coefficient")?, ambient: opt_num(a, "ambient").unwrap_or(22.0) };
                 Ok(load_out(s.add_load(l)?))
             }
-            "add_heat_generation" => Ok(load_out(s.add_load(Load::HeatGeneration { value: num(a, "value")? })?)),
+            "add_heat_generation" => {
+                let power = opt_num(a, "power");
+                let value = match (opt_num(a, "value"), power) {
+                    (Some(v), _) => v,
+                    (None, Some(_)) => 0.0,
+                    (None, None) => bail!("give 'power' (W) or 'value' (W/m³)"),
+                };
+                if power.is_some_and(|p| p < 0.0) {
+                    bail!("power must be ≥ 0");
+                }
+                Ok(load_out(s.add_load(Load::HeatGeneration { value, body: opt_str(a, "body").filter(|b| !b.is_empty()).map(String::from), power })?))
+            }
+            "add_compression_only_support" => Ok(load_out(s.add_load(Load::CompressionOnly { faces: faces(a)? })?)),
+            "add_symmetry" => Ok(load_out(s.add_load(Load::Symmetry { faces: faces(a)? })?)),
+            "add_voltage" => Ok(load_out(s.add_load(Load::Voltage { faces: faces(a)?, value: num(a, "value")? })?)),
+            "add_current" => Ok(load_out(s.add_load(Load::Current { faces: faces(a)?, value: num(a, "value")? })?)),
+            "add_coil" => {
+                let mode = match opt_str(a, "mode").unwrap_or("circumferential") {
+                    "axial" => CoilMode::Axial,
+                    "circumferential" => CoilMode::Circumferential,
+                    o => bail!("mode must be 'axial' or 'circumferential', got '{o}'"),
+                };
+                let body = opt_str(a, "body").ok_or_else(|| anyhow!("missing 'body'"))?.to_string();
+                let center = if a.get("center").is_some_and(|v| !v.is_null()) { Some(v3(a, "center")?) } else { None };
+                Ok(load_out(s.add_load(Load::Coil { body, current_density: num(a, "current_density")?, axis: axis(a)?, mode, center })?))
+            }
+            "add_magnet" => {
+                let body = opt_str(a, "body").ok_or_else(|| anyhow!("missing 'body'"))?.to_string();
+                Ok(load_out(s.add_load(Load::Magnet { body, remanence: v3(a, "remanence")? })?))
+            }
+            "add_inlet" => Ok(load_out(s.add_load(Load::Inlet { faces: faces(a)?, velocity: num(a, "velocity")?, temperature: opt_num(a, "temperature") })?)),
+            "add_moving_wall" => Ok(load_out(s.add_load(Load::MovingWall { faces: faces(a)?, velocity: v3(a, "velocity")? })?)),
+            "add_port" => {
+                let power = num(a, "power")?;
+                if !(power > 0.0) {
+                    bail!("power must be > 0 W");
+                }
+                let pol = opt_str(a, "polarization").ok_or_else(|| anyhow!("missing 'polarization' (x, y or z: the E-field direction, lying in the port face)"))?;
+                let polarization = serde_json::from_value(json!(pol.to_lowercase())).map_err(|_| anyhow!("polarization must be x, y or z"))?;
+                let profile = opt_str(a, "profile").unwrap_or("te10").to_lowercase();
+                if !matches!(profile.as_str(), "te10" | "uniform") {
+                    bail!("profile must be te10 or uniform");
+                }
+                Ok(load_out(s.add_load(Load::Port { faces: faces(a)?, power, polarization, profile })?))
+            }
+            "add_outlet" => Ok(load_out(s.add_load(Load::Outlet { faces: faces(a)?, pressure: opt_num(a, "pressure").unwrap_or(0.0) })?)),
+            "add_enclosure" => {
+                let (lo, hi) = mesh::additive_bounds(&s.model.bodies);
+                if lo == hi && !a.get("size").is_some() {
+                    bail!("add the solid bodies first, or give min/size for the enclosure");
+                }
+                let shape = if a.get("size").is_some_and(|v| !v.is_null()) {
+                    Shape::Box { min: v3_or(a, "min", [0.0; 3])?, size: v3(a, "size")? }
+                } else {
+                    // padding as a fraction of the part size per side (default 50%), or explicit per-axis padding in mm
+                    let d = sub(hi, lo);
+                    let pad: [f64; 6] = match a.get("padding_mm").and_then(|v| v.as_array()) {
+                        Some(arr) if arr.len() == 6 => {
+                            let mut p = [0.0; 6];
+                            for i in 0..6 {
+                                p[i] = arr[i].as_f64().unwrap_or(0.0);
+                            }
+                            p
+                        }
+                        _ => {
+                            let f = opt_num(a, "padding").unwrap_or(0.5);
+                            let m = d[0].max(d[1]).max(d[2]) * f;
+                            [m; 6]
+                        }
+                    };
+                    let min = [lo[0] - pad[0], lo[1] - pad[2], lo[2] - pad[4]];
+                    let size = [d[0] + pad[0] + pad[1], d[1] + pad[2] + pad[3], d[2] + pad[4] + pad[5]];
+                    Shape::Box { min, size }
+                };
+                s.model.bodies.retain(|b| b.role != Role::Enclosure);
+                let mat = opt_str(a, "material").unwrap_or("Air");
+                let mat = s.resolve_material(mat)?.name;
+                let n = s.add_body_role(Some(opt_str(a, "name").unwrap_or("Enclosure")), "Enclosure", shape, Op::Add, Some(&mat), Role::Enclosure)?;
+                s.view_request = Some("fit".into());
+                Ok(Output::text(format!(
+                    "Added enclosure '{n}' ({mat}). Its outer faces are {n}.xmin … {n}.zmax (use them for inlets/outlets). It is only meshed for electrostatic, magnetostatic and fluid analyses."
+                )))
+            }
             "remove_load" => {
                 let id = num(a, "id")? as u32;
                 let before = s.model.loads.len();
@@ -564,6 +855,7 @@ impl Core {
                 if let Some(b) = a.get("dark_mode").and_then(|v| v.as_bool()) {
                     s.display.dark = b;
                 }
+                apply_section(&mut s.display, a)?;
                 if let Some(v) = opt_str(a, "view") {
                     if !render::VIEWS.contains(&v) && v != "fit" {
                         bail!("view must be one of {:?} or fit", render::VIEWS);
@@ -589,6 +881,7 @@ impl Core {
                 if let Some(x) = opt_num(a, "deformation_scale") {
                     d.deformation_scale = Some(x);
                 }
+                apply_section(&mut d, a)?;
                 let w = opt_num(a, "width").unwrap_or(900.0).clamp(200.0, 2000.0) as usize;
                 let h = opt_num(a, "height").unwrap_or(620.0).clamp(150.0, 2000.0) as usize;
                 let view = opt_str(a, "view").unwrap_or("iso");
@@ -604,14 +897,12 @@ impl Core {
                     (Some(r), true) => {
                         let f = if r.has(d.field) { d.field } else { r.available_fields()[0] };
                         let mut t = format!("{} [{}]", f.label(), f.unit());
-                        if r.analysis == AnalysisType::Modal {
-                            if let Some(m) = r.modes.get(d.mode) {
-                                t = format!("Mode {} — {:.2} Hz (shape normalised)", d.mode + 1, m.frequency_hz);
-                            }
+                        if r.n_steps() > 1 {
+                            t = format!("{t} — {}", r.step_label(d.mode));
                         }
                         (t, f.unit().to_string())
                     }
-                    _ => ("Model (blue = supports, red = forces, orange = pressure, pink = temperature, cyan = convection, yellow = heat flux)".to_string(), String::new()),
+                    _ => ("Model (blue = supports, red = forces, orange = pressure, pink = temperature, cyan = convection, yellow = heat flux, purple = voltage/current, green = inlet/outlet; enclosure drawn as the far walls)".to_string(), String::new()),
                 };
                 let png = render::render_png(&scene, &cam, w, h, d.show_mesh, &unit, d.dark)?;
                 let mut text = format!("{title}; view {view}");
@@ -646,13 +937,249 @@ impl Core {
                 Ok(Output::json(s.model_json()))
             }
             "get_selection" => Ok(Output::json(json!({"selected_faces": s.selection}))),
+            "list_parameter_targets" => {
+                let targets: Vec<Value> = crate::study::list_targets(&s.model).into_iter().map(|(t, v)| json!({"target": t, "current": crate::results::float(v)})).collect();
+                Ok(Output::json(json!({"parameters": targets, "responses": crate::study::suggested_responses(&s.model),
+                    "note": "responses: mass, volume, max:<field>, min:<field>, frequency:N, load_multiplier:N, reaction:<load id>[:x|y|z], quantity:<name>"})))
+            }
+            "make_report" => {
+                let mesh = s.ensure_mesh()?;
+                let checks: Vec<crate::study::Constraint> = serde_json::from_value(a.get("checks").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'checks': {e}"))?;
+                let title = opt_str(a, "title").map(String::from).unwrap_or_else(|| {
+                    let name = s.project_path.as_deref().and_then(|p| std::path::Path::new(p).file_stem()).map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| "SimCraft".into());
+                    format!("{name} — {} report", s.model.analysis.kind.label())
+                });
+                let html = crate::report::build_html(&crate::report::ReportInput {
+                    title,
+                    model: &s.model,
+                    mesh: &mesh,
+                    results: s.results.as_deref(),
+                    display: &s.display,
+                    study: s.study.as_ref(),
+                    plan: s.plan.as_ref(),
+                    checks,
+                    project: s.project_path.clone(),
+                    stale: s.results_stale,
+                })?;
+                let path = match opt_str(a, "path") {
+                    Some(p) => p.to_string(),
+                    None => {
+                        let dir = match &s.project_path {
+                            Some(p) => std::path::Path::new(p).parent().map(|d| d.to_path_buf()).unwrap_or_else(std::env::temp_dir),
+                            None => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("SimCraft"),
+                        };
+                        std::fs::create_dir_all(&dir)?;
+                        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        dir.join(format!("report-{stamp}.html")).to_string_lossy().to_string()
+                    }
+                };
+                std::fs::write(&path, &html)?;
+                s.log(format!("Report written to {path}"));
+                Ok(Output::text(format!("Report written to {path} ({} KB). Open it in a browser; print to PDF from there.", html.len() / 1024)))
+            }
+            "fatigue_life" => {
+                let mesh = s.ensure_mesh()?;
+                let res = s.results.clone().ok_or_else(|| anyhow!("no results yet; solve first"))?;
+                if s.results_stale {
+                    bail!("results are out of date; solve again before the fatigue evaluation");
+                }
+                let d = crate::fatigue::FatigueOptions::default();
+                let o = crate::fatigue::FatigueOptions {
+                    loading: opt_str(a, "loading").unwrap_or(&d.loading).to_string(),
+                    ratio: opt_num(a, "ratio").unwrap_or(d.ratio),
+                    correction: opt_str(a, "correction").unwrap_or(&d.correction).to_string(),
+                    scale: opt_num(a, "scale").unwrap_or(d.scale),
+                    design_life: opt_num(a, "design_life").unwrap_or(d.design_life),
+                    exposure_s: opt_num(a, "exposure_time_s").unwrap_or(d.exposure_s),
+                };
+                let o = crate::fatigue::FatigueOptions { loading: if a.get("ratio").is_some() && a.get("loading").is_none() { "ratio".into() } else { o.loading.clone() }, ..o };
+                let out = crate::fatigue::apply(&res, &mesh, &o)?;
+                let qs: Vec<Value> = out.quantities.iter().filter(|q| q.name.starts_with("Fatigue")).map(|q| json!({"name": q.name, "value": crate::results::float(q.value), "unit": q.unit})).collect();
+                let warns: Vec<String> = out.warnings.iter().filter(|w| w.starts_with("Fatigue")).cloned().collect();
+                s.results = Some(Arc::new(out));
+                s.display.field = Field::FatigueSafety;
+                s.display.show_results = true;
+                s.revision += 1;
+                s.log("Fatigue evaluated".to_string());
+                Ok(Output::json(json!({"quantities": qs, "warnings": warns, "fields": ["fatigue_life", "fatigue_damage", "fatigue_safety"]})))
+            }
+            "get_study" => match &s.study {
+                Some(st) => Ok(Output::json(study_json(st))),
+                None => Ok(Output::text("No study yet. Use run_parameter_study, optimize_design or topology_optimize.")),
+            },
+            "apply_design" => {
+                let st = s.study.clone().ok_or_else(|| anyhow!("no study yet"))?;
+                if st.kind == "topology" {
+                    bail!("for topology results use the exported STL (import_stl {:?})", st.stl_path);
+                }
+                let idx = match opt_num(a, "run") {
+                    Some(r) => (r as usize).checked_sub(1).ok_or_else(|| anyhow!("run numbers start at 1"))?,
+                    None => st.best.ok_or_else(|| anyhow!("this study has no best design; give 'run'"))?,
+                };
+                let run = st.runs.get(idx).ok_or_else(|| anyhow!("run must be 1..={}", st.runs.len()))?;
+                let m = crate::study::apply(&s.model, &st.parameters, &run.values)?;
+                s.model = m;
+                s.touch_geometry();
+                let desc: Vec<String> = st.parameters.iter().zip(&run.values).map(|(p, v)| format!("{} = {}", p.target, crate::results::float(*v))).collect();
+                s.log(format!("Applied design #{}: {}", idx + 1, desc.join(", ")));
+                Ok(Output::text(format!("Applied design #{} to the model: {}. Solve to see its full results.", idx + 1, desc.join(", "))))
+            }
+            "get_plan" => match &s.plan {
+                Some(p) => Ok(Output { text: format!("{}\n\n---\n{}", crate::assistant::to_markdown(p), serde_json::to_string(p)?), image_png: None }),
+                None => Ok(Output::text("No plan yet. Use plan_simulation with a goal, or the Planner in the app.")),
+            },
+            "set_plan_step" => {
+                let i = num(a, "index")? as usize;
+                let done = a.get("done").and_then(|v| v.as_bool()).unwrap_or(true);
+                let p = s.plan.as_mut().ok_or_else(|| anyhow!("no plan yet"))?;
+                let n = p.steps.len();
+                let st = p.steps.get_mut(i.wrapping_sub(1)).ok_or_else(|| anyhow!("step index must be 1..={n}"))?;
+                st.done = done;
+                s.revision += 1;
+                Ok(Output::text(format!("Step {i} marked {}.", if done { "done" } else { "not done" })))
+            }
             _ => bail!("unknown tool '{tool}'"),
         }
     }
 
+    /// Long-running optimization jobs: run on a copy of the model without holding the lock.
+    fn study_job(&self, tool: &str, a: &Value) -> Result<Output> {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            bail!("a solve or study is already running");
+        }
+        let r = self.study_inner(tool, a);
+        self.busy.store(false, Ordering::SeqCst);
+        self.progress.lock().unwrap().running = false;
+        r
+    }
+
+    fn study_inner(&self, tool: &str, a: &Value) -> Result<Output> {
+        let (model, mesh, project) = {
+            let mut s = self.session.lock().unwrap();
+            let mesh = if tool == "topology_optimize" { Some(s.ensure_mesh()?) } else { None };
+            (s.model.clone(), mesh, s.project_path.clone())
+        };
+        *self.progress.lock().unwrap() = Progress { running: true, fraction: 0.0, message: "starting study".into() };
+        self.changed();
+        let prog = |f: f64, msg: &str| {
+            {
+                let mut p = self.progress.lock().unwrap();
+                p.fraction = f;
+                p.message = msg.to_string();
+            }
+            self.changed();
+        };
+        let parse_params = || -> Result<Vec<crate::study::Parameter>> {
+            serde_json::from_value(a.get("parameters").cloned().ok_or_else(|| anyhow!("missing 'parameters' [{{target, min, max}}]"))?).map_err(|e| anyhow!("bad 'parameters': {e}"))
+        };
+        let t0 = std::time::Instant::now();
+        let study = match tool {
+            "run_parameter_study" => {
+                let responses: Vec<String> = serde_json::from_value(a.get("responses").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'responses': {e}"))?;
+                let samples = opt_num(a, "samples").map(|v| v as usize);
+                crate::study::parameter_study(&model, parse_params()?, responses, samples, &prog)?
+            }
+            "optimize_design" => {
+                let objective: crate::study::Objective = serde_json::from_value(a.get("objective").cloned().ok_or_else(|| anyhow!("missing 'objective' {{response, goal}}"))?).map_err(|e| anyhow!("bad 'objective': {e}"))?;
+                let constraints: Vec<crate::study::Constraint> = serde_json::from_value(a.get("constraints").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'constraints': {e}"))?;
+                let budget = opt_num(a, "max_evaluations").unwrap_or(30.0) as usize;
+                crate::study::optimize(&model, parse_params()?, objective, constraints, budget, &prog)?
+            }
+            _ => {
+                let mesh = mesh.unwrap();
+                let settings = crate::topo::TopoSettings {
+                    volume_fraction: opt_num(a, "volume_fraction").unwrap_or(0.4),
+                    iterations: opt_num(a, "iterations").unwrap_or(40.0) as usize,
+                    filter_radius_mm: opt_num(a, "filter_radius_mm"),
+                    penal: 3.0,
+                };
+                let tr = crate::topo::run(&model, &mesh, &settings, &prog)?;
+                let path = match opt_str(a, "export_path") {
+                    Some(p) => p.to_string(),
+                    None => {
+                        let dir = match &project {
+                            Some(p) => std::path::Path::new(p).parent().map(|d| d.to_path_buf()).unwrap_or_else(std::env::temp_dir),
+                            None => {
+                                let d = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("SimCraft");
+                                std::fs::create_dir_all(&d)?;
+                                d
+                            }
+                        };
+                        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        dir.join(format!("optimized-{stamp}.stl")).to_string_lossy().to_string()
+                    }
+                };
+                let ntri = crate::topo::write_stl(&mesh, &tr.density, 0.5, &path)?;
+                let mut s = self.session.lock().unwrap();
+                s.results = Some(Arc::new(tr.results));
+                s.results_stale = false;
+                s.display.field = Field::Density;
+                s.display.show_results = true;
+                s.display.deformation_scale = Some(0.0);
+                s.revision += 1;
+                s.log(format!("Topology optimization: kept {} of {} elements, shape saved to {path}", tr.kept_elements, mesh.elems.len()));
+                drop(s);
+                crate::study::Study {
+                    kind: "topology".into(),
+                    message: format!(
+                        "Kept {} of {} elements ({:.0}%). Compliance {:.4e} → {:.4e} J. Shape exported ({ntri} triangles) to {path}",
+                        tr.kept_elements,
+                        mesh.elems.len(),
+                        tr.kept_elements as f64 / mesh.elems.len() as f64 * 100.0,
+                        tr.history.first().map(|h| h.1).unwrap_or(0.0),
+                        tr.history.last().map(|h| h.1).unwrap_or(0.0)
+                    ),
+                    stl_path: Some(path),
+                    history: tr.history,
+                    seconds: t0.elapsed().as_secs_f64(),
+                    ..Default::default()
+                }
+            }
+        };
+        let out = study_json(&study);
+        let mut s = self.session.lock().unwrap();
+        s.log(study.message.clone());
+        s.study = Some(study);
+        s.revision += 1;
+        Ok(Output::json(out))
+    }
+
+    fn plan_simulation(&self, a: &Value) -> Result<Output> {
+        let goal = opt_str(a, "goal").ok_or_else(|| anyhow!("missing 'goal' (what you want to simulate)"))?.to_string();
+        let model = match opt_str(a, "model") {
+            Some(m) => m.to_string(),
+            None => {
+                let models = crate::assistant::list_models()?;
+                crate::assistant::default_model(&models).ok_or_else(|| anyhow!("no local models installed; run `ollama pull qwen2.5:7b`"))?
+            }
+        };
+        *self.progress.lock().unwrap() = Progress { running: true, fraction: 0.0, message: format!("Planning with {model}…") };
+        self.changed();
+        let r = crate::assistant::plan(&goal, &model);
+        self.progress.lock().unwrap().running = false;
+        let p = r?;
+        let md = crate::assistant::to_markdown(&p);
+        {
+            let mut s = self.session.lock().unwrap();
+            s.plan = Some(p);
+            s.revision += 1;
+            s.log(format!("Planner: drafted a to-do list with {model}"));
+        }
+        Ok(Output::text(md))
+    }
+
     fn screenshot_gui(&self) -> Result<Output> {
         use eframe::egui;
-        let ctx = self.gui_ctx.lock().unwrap().clone().ok_or_else(|| anyhow!("the SimCraft window is not open (use launch_gui first); render_image works headless"))?;
+        // the bridge comes up slightly before the window finishes opening: wait for it
+        let mut ctx = None;
+        for _ in 0..50 {
+            ctx = self.gui_ctx.lock().unwrap().clone();
+            if ctx.is_some() || self.notify.lock().unwrap().is_none() && !crate::bridge::gui_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let ctx = ctx.ok_or_else(|| anyhow!("the SimCraft window is not open (use launch_gui first); render_image works headless"))?;
         let (tx, rx) = std::sync::mpsc::channel();
         let mut img = None;
         for _attempt in 0..6 {
@@ -716,16 +1243,27 @@ impl Core {
             bail!("geometry changed during the solve; solve again");
         }
         let summary = res.summary(&mesh);
+        use AnalysisType::*;
         s.display.field = match res.analysis {
-            AnalysisType::SteadyThermal => Field::Temperature,
-            AnalysisType::Modal => Field::TotalDeformation,
-            _ => if s.display.field == Field::Temperature || !res.has(s.display.field) { Field::VonMises } else { s.display.field },
+            SteadyThermal | TransientThermal | ThermalElectric => Field::Temperature,
+            Modal | LinearBuckling | TransientStructural => Field::TotalDeformation,
+            NonlinearStructural => Field::VonMises,
+            Electrostatic | FullWaveEm => Field::ElectricField,
+            MicrowaveHeating => Field::Temperature,
+            CurrentFlow => Field::CurrentDensity,
+            Magnetostatic => Field::MagneticFluxDensity,
+            Fluid => Field::Velocity,
+            _ => if !res.has(s.display.field) || !s.display.field.is_deformation() && s.display.field != Field::VonMises { Field::VonMises } else { s.display.field },
         };
+        if res.analysis.uses_enclosure() && res.analysis != AnalysisType::MicrowaveHeating && mesh.with_enclosure && s.display.section.is_none() {
+            s.display.section = Some(render::Section { axis: 1, position: 0.5 });
+            s.view_request = Some("front".into());
+        }
         if !res.has(s.display.field) {
             s.display.field = res.available_fields()[0];
         }
         s.display.show_results = true;
-        s.display.mode = 0;
+        s.display.mode = if res.frames.is_empty() { 0 } else { res.frames.len() - 1 };
         let info = res.info.clone();
         s.results = Some(Arc::new(res));
         s.results_stale = false;
@@ -756,12 +1294,13 @@ pub fn tool_defs() -> Vec<Value> {
         t("add_box", "Add a rectangular block (mm). Faces: <name>.xmin/xmax/ymin/ymax/zmin/zmax.", json!({"name": name, "min": v3s("Min corner [x,y,z] mm (default origin)"), "size": v3s("Size [dx,dy,dz] mm"), "operation": op, "material": mat}), &["size"]),
         t("add_cylinder", "Add a cylinder (mm) or, with operation=subtract, drill a hole. Faces: <name>.side/bottom/top.", json!({"name": name, "base": v3s("Centre of the bottom cap [x,y,z] mm"), "axis": {"type": "string", "enum": ["x", "y", "z"]}, "radius": {"type": "number"}, "height": {"type": "number", "description": "Length along the axis from base"}, "operation": op, "material": mat}), &["radius", "height"]),
         t("add_sphere", "Add a sphere (mm). Face: <name>.surface.", json!({"name": name, "center": v3s("Centre mm"), "radius": {"type": "number"}, "operation": op, "material": mat}), &["radius"]),
+        t("import_kicad", "Import a KiCad PCB (.kicad_pcb, KiCad 5–10): board outline and stack-up become a 'Board' body whose copper (tracks, pads, filled zones, vias) is homogenised per cell into orthotropic thermal conductivity; footprints larger than min_component_area_mm2 become component boxes named by reference (U1, Q2…). 'power' {reference: watts} adds heat sources. Then add convection/temperature boundaries (thermal) or an air enclosure + inlet (conjugate_heat_transfer). Board lies in XY, z from 0 to the thickness; top parts above, bottom parts below. Save the board in KiCad with zones filled.", json!({"path": {"type": "string"}, "name": {"type": "string", "description": "board body name (default Board)"}, "power": {"type": "object", "additionalProperties": {"type": "number"}, "description": "e.g. {\"U1\": 1.5, \"Q1\": 0.8} watts"}, "heights": {"type": "object", "additionalProperties": {"type": "number"}, "description": "component heights in mm by reference"}, "components": {"type": "boolean", "description": "create component boxes (default true)"}, "component_height_mm": {"type": "number", "description": "default component height (1 mm)"}, "min_component_area_mm2": {"type": "number", "description": "skip footprints smaller than this unless listed in power/heights (default 4)"}, "offset": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "material": {"type": "string", "description": "laminate (default FR-4)"}}), &["path"]),
         t("import_stl", "Import a closed STL solid (e.g. exported from SolidCraft / Fusion 360). Smooth regions become faces <name>.face0, face1 …", json!({"path": {"type": "string", "description": "Absolute path to .stl"}, "scale": {"type": "number", "description": "Multiply coordinates (use 1000 if the STL is in metres)"}, "offset": v3s("Translation mm"), "name": name, "operation": op, "material": mat}), &["path"]),
         t("remove_body", "Delete a body by name.", json!({"name": {"type": "string"}}), &["name"]),
         t("list_materials", "List the engineering materials library with properties.", json!({}), &[]),
-        t("define_material", "Create or overwrite a custom material. Unspecified properties come from 'based_on' (default Structural Steel).", json!({"name": {"type": "string"}, "based_on": {"type": "string"}, "youngs_modulus_gpa": {"type": "number"}, "poisson_ratio": {"type": "number"}, "density": {"type": "number", "description": "kg/m³"}, "yield_strength_mpa": {"type": "number"}, "ultimate_strength_mpa": {"type": "number"}, "thermal_conductivity": {"type": "number", "description": "W/(m·K)"}, "thermal_expansion": {"type": "number", "description": "1/K"}, "specific_heat": {"type": "number"}}), &["name"]),
+        t("define_material", "Create or overwrite a custom material. Unspecified properties come from 'based_on' (default Structural Steel).", json!({"name": {"type": "string"}, "based_on": {"type": "string"}, "fatigue_strength_coefficient_mpa": {"type": "number", "description": "Basquin σf' (0 = estimate)"}, "fatigue_exponent": {"type": "number", "description": "Basquin b, negative (e.g. -0.09)"}, "endurance_limit_mpa": {"type": "number"}, "relative_permittivity": {"type": "number", "description": "εr"}, "electrical_conductivity": {"type": "number", "description": "S/m"}, "relative_permeability": {"type": "number", "description": "μr"}, "loss_tangent": {"type": "number", "description": "dielectric tan δ at the RF frequency (full-wave EM)"}, "youngs_modulus_gpa": {"type": "number"}, "poisson_ratio": {"type": "number"}, "density": {"type": "number", "description": "kg/m³"}, "yield_strength_mpa": {"type": "number"}, "ultimate_strength_mpa": {"type": "number"}, "thermal_conductivity": {"type": "number", "description": "W/(m·K)"}, "thermal_expansion": {"type": "number", "description": "1/K"}, "specific_heat": {"type": "number"}}), &["name"]),
         t("set_material", "Assign a material to bodies (all bodies if 'bodies' omitted).", json!({"material": {"type": "string"}, "bodies": {"type": "array", "items": {"type": "string"}}}), &["material"]),
-        t("set_analysis", "Choose the analysis system.", json!({"type": {"type": "string", "enum": ["static_structural", "steady_thermal", "modal", "thermal_stress"]}, "modes": {"type": "integer", "description": "Number of modes for modal (1-20, default 6)"}, "reference_temperature": {"type": "number", "description": "Stress-free temperature °C (default 22)"}}), &[]),
+        t("set_analysis", "Choose the analysis system and its settings. Structural: static_structural, modal, linear_buckling, transient_structural, nonlinear_structural (plasticity), harmonic_response (forces/pressures are amplitudes), response_spectrum and random_vibration (base excitation; supports only, give 'table' and 'direction'). Follow with fatigue_life for S-N fatigue. Thermal: steady_thermal, transient_thermal, thermal_stress. Electromagnetic: electrostatic, current_flow, thermal_electric, magnetostatic (needs enclosure). Full-wave EM: full_wave_em (FDTD at one frequency: E field, absorbed power, SAR; needs an enclosure = the cavity or air box, and an RF port via add_port) and microwave_heating (full_wave_em + transient heating of the solids over end_time). Fluids: fluid (needs enclosure) and conjugate_heat_transfer (flow + temperature in fluid and solids: electronics cooling, heat sinks; add_heat_generation in the parts, add_inlet with temperature, add_gravity for natural convection/buoyancy).", json!({"type": {"type": "string", "enum": AnalysisType::all().iter().map(|a| a.key()).collect::<Vec<_>>()}, "modes": {"type": "integer", "description": "Number of modes for modal / buckling (default 6)"}, "reference_temperature": {"type": "number", "description": "Stress-free temperature °C (default 22)"}, "end_time": {"type": "number", "description": "Transient end time [s] (default 1)"}, "time_steps": {"type": "integer", "description": "Transient time steps (default 50)"}, "initial_temperature": {"type": "number", "description": "Transient thermal start temperature °C"}, "damping_ratio": {"type": "number", "description": "Transient structural damping ratio (default 0.02)"}, "load_steps": {"type": "integer", "description": "Nonlinear load steps (default 10)"}, "max_iterations": {"type": "integer", "description": "CFD pseudo-time iterations (default 3000)"}, "turbulence": {"type": "string", "enum": ["laminar", "lvel"], "description": "CFD turbulence model: laminar (default) or lvel (algebraic wall-distance model, good for electronics enclosures)"}, "freq_min": {"type": "number", "description": "Harmonic sweep start [Hz] (default 0.5·f1)"}, "freq_max": {"type": "number", "description": "Harmonic sweep end [Hz] (default 1.5·highest mode used)"}, "freq_steps": {"type": "integer", "description": "Harmonic frequency points (default 300; resonances are refined automatically)"}, "table": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}, "description": "[[Hz, value], ...] — response spectrum: acceleration in g; random vibration: acceleration PSD in g²/Hz (log-log interpolated)"}, "direction": {"type": "string", "enum": ["x", "y", "z"], "description": "Base-excitation direction for response spectrum / random vibration"}, "combination": {"type": "string", "enum": ["srss", "cqc"], "description": "Response spectrum modal combination (default srss)"}, "frequency_ghz": {"type": "number", "description": "Full-wave EM / microwave heating excitation frequency in GHz (default 2.45)"}, "em_boundary": {"type": "string", "enum": ["pec", "open"], "description": "Full-wave EM outer boundary: pec = the enclosure is a closed metal cavity (oven), open = absorbing (radiation, EMI)"}, "max_periods": {"type": "integer", "description": "Full-wave EM: max RF periods to reach steady state (default 400)"}, "compute": {"type": "string", "enum": ["auto", "cpu", "gpu"], "description": "Where linear solves run: auto = CPU direct for small models, GPU for large iterative solves; cpu; gpu = always GPU (falls back to CPU if unavailable)"}}), &[]),
         t("list_faces", "Mesh the geometry if needed and list selectable faces with area, centroid and outward normal. Call this before adding supports or loads.", json!({}), &[]),
         t("add_fixed_support", "Fix faces in all directions.", json!({"faces": faces}), &["faces"]),
         t("add_displacement", "Prescribe displacement (mm) on faces; omit a component to leave it free (e.g. z=0 for a roller).", json!({"faces": faces, "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}), &["faces"]),
@@ -771,19 +1310,96 @@ pub fn tool_defs() -> Vec<Value> {
         t("add_temperature", "Fixed temperature (°C) on faces. Thermal / thermal-stress analyses.", json!({"faces": faces, "value": {"type": "number"}}), &["faces", "value"]),
         t("add_heat_flux", "Heat flux into the faces, W/m².", json!({"faces": faces, "value": {"type": "number"}}), &["faces", "value"]),
         t("add_convection", "Convection film coefficient W/(m²·K) with ambient temperature °C.", json!({"faces": faces, "coefficient": {"type": "number"}, "ambient": {"type": "number"}}), &["faces", "coefficient"]),
-        t("add_heat_generation", "Internal heat generation in W/m³ for the whole part.", json!({"value": {"type": "number"}}), &["value"]),
+        t("add_heat_generation", "Internal heat generation in one body (a chip, a resistor, the food, a coil) or in all solids when 'body' is omitted. Give either 'power' in W (spread over the body; exact on any mesh — easiest for electronics) or 'value' in W/m³ (power = value × body volume).", json!({"power": {"type": "number", "description": "total heat [W]"}, "value": {"type": "number", "description": "power density [W/m³]"}, "body": {"type": "string", "description": "solid body name; omit for the whole model"}}), &[]),
+        t("add_compression_only_support", "Frictionless contact with a rigid surface on these faces: blocks motion into the surface, allows lift-off (static structural).", json!({"faces": faces}), &["faces"]),
+        t("add_symmetry", "Symmetry plane: zero normal displacement (structural) or free-slip wall (fluid).", json!({"faces": faces}), &["faces"]),
+        t("add_voltage", "Fixed electric potential [V] on faces (electrostatic, current flow, thermal-electric).", json!({"faces": faces, "value": {"type": "number"}}), &["faces", "value"]),
+        t("add_current", "Total DC current [A] entering the body through faces (current flow / thermal-electric). Needs a Voltage (ground) elsewhere.", json!({"faces": faces, "value": {"type": "number"}}), &["faces", "value"]),
+        t("add_coil", "Coil current density [A/mm²] in a solid body (magnetostatic). mode=circumferential for a winding around the axis, axial for a straight conductor.", json!({"body": {"type": "string"}, "current_density": {"type": "number"}, "axis": {"type": "string", "enum": ["x", "y", "z"]}, "mode": {"type": "string", "enum": ["circumferential", "axial"]}, "center": v3s("Point on the coil axis mm (default body centre)")}), &["body", "current_density"]),
+        t("add_magnet", "Permanent magnet: remanent flux density vector [T] in a body (e.g. [0,0,1.3] for N42 magnetised along +Z). Use material 'NdFeB Magnet (N42)'.", json!({"body": {"type": "string"}, "remanence": v3s("[Brx, Bry, Brz] T")}), &["body", "remanence"]),
+        t("add_inlet", "Fluid velocity inlet [m/s] flowing into the domain through faces (usually Enclosure.xmin). For conjugate heat transfer, 'temperature' is the inflow temperature (default: reference temperature, 22 °C).", json!({"faces": faces, "velocity": {"type": "number"}, "temperature": {"type": "number", "description": "°C"}}), &["faces", "velocity"]),
+        t("add_moving_wall", "No-slip wall sliding tangentially with the given velocity [m/s] (lid-driven cavity, conveyor belt). Fluid and conjugate heat transfer analyses.", json!({"faces": faces, "velocity": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "m/s"}}), &["faces", "velocity"]),
+        t("add_port", "RF / microwave feed for full_wave_em and microwave_heating: a current sheet on the faces (e.g. a waveguide opening on the cavity wall, usually an Enclosure face) delivering 'power' watts with the electric field along 'polarization'. profile te10 (default) = half-sine across the face like a rectangular waveguide's TE10 mode; uniform = constant.", json!({"faces": faces, "power": {"type": "number", "description": "delivered power [W], e.g. 800 for a domestic oven"}, "polarization": {"type": "string", "enum": ["x", "y", "z"], "description": "E-field direction; must lie in the face (for a WR-340 feed: along the short side)"}, "profile": {"type": "string", "enum": ["te10", "uniform"]}}), &["faces", "power", "polarization"]),
+        t("add_outlet", "Fluid pressure outlet [Pa] (usually Enclosure.xmax, 0 Pa).", json!({"faces": faces, "pressure": {"type": "number"}}), &["faces"]),
+        t("add_enclosure", "Add the surrounding air/fluid box used by electrostatic, magnetostatic and CFD analyses. By default it pads the parts by 50% of their size on every side; give padding (fraction), padding_mm [xmin,xmax,ymin,ymax,zmin,zmax] or explicit min/size. Its faces are Enclosure.xmin … Enclosure.zmax.", json!({"material": {"type": "string", "description": "Air (default), Water or Engine Oil"}, "padding": {"type": "number"}, "padding_mm": {"type": "array", "items": {"type": "number"}, "minItems": 6, "maxItems": 6}, "min": v3s("Explicit min corner mm"), "size": v3s("Explicit size mm"), "name": {"type": "string"}}), &[]),
         t("remove_load", "Remove a support/load by id (ids are shown in get_model).", json!({"id": {"type": "integer"}}), &["id"]),
         t("clear_loads", "Remove all supports and loads.", json!({}), &[]),
         t("set_mesh", "Set the element size in mm (omit for automatic) and generate the mesh.", json!({"element_size_mm": {"type": "number"}}), &[]),
         t("solve", "Mesh (if needed) and solve the current analysis. Returns min/max of every result, reactions and modal frequencies.", json!({}), &[]),
         t("get_results", "Summary of the last solution: min/max with locations, reaction forces / heat flows, natural frequencies.", json!({}), &[]),
         t("probe", "Result values at the node nearest to a point (mm).", json!({"point": v3s("[x,y,z] mm"), "mode": {"type": "integer", "description": "1-based mode number for modal"}}), &["point"]),
-        t("set_display", "Change what the GUI viewport shows.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean"}, "mode": {"type": "integer"}, "deformation_scale": {"description": "number, or \"auto\"; 0 = undeformed, 1 = true scale"}, "show_mesh": {"type": "boolean"}, "dark_mode": {"type": "boolean", "description": "Dark UI and viewport theme"}, "view": {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top", "bottom", "iso_back", "fit"]}}), &[]),
-        t("render_image", "Render a PNG picture of the model or of a result contour so you can see it.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean", "description": "false = show geometry with supports/loads"}, "mode": {"type": "integer"}, "view": {"type": "string", "enum": render::VIEWS}, "deformation_scale": {"type": "number"}, "width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
+        t("set_display", "Change what the GUI viewport shows.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean"}, "mode": {"type": "integer"}, "deformation_scale": {"description": "number, or \"auto\"; 0 = undeformed, 1 = true scale"}, "show_mesh": {"type": "boolean"}, "dark_mode": {"type": "boolean", "description": "Dark UI and viewport theme"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"], "description": "Cut-plane view through the domain (great for fields in air and fluid flow)"}, "section_position": {"type": "number", "description": "0..1 across the domain (default 0.5)"}, "view": {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top", "bottom", "iso_back", "fit"]}}), &[]),
+        t("render_image", "Render a PNG picture of the model or of a result contour so you can see it.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean", "description": "false = show geometry with supports/loads"}, "mode": {"type": "integer"}, "view": {"type": "string", "enum": render::VIEWS}, "deformation_scale": {"type": "number"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"]}, "section_position": {"type": "number"}, "width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
         t("export_vtk", "Write mesh + results to a legacy .vtk file for ParaView.", json!({"path": {"type": "string"}}), &["path"]),
         t("save_project", "Save the project (.simcraft JSON).", json!({"path": {"type": "string"}}), &[]),
         t("open_project", "Open a .simcraft project.", json!({"path": {"type": "string"}}), &["path"]),
         t("screenshot_gui", "Screenshot of the whole SimCraft window (ribbon, browser, viewport) when the GUI is open.", json!({}), &[]),
+        t("list_parameter_targets", "Numbers in the current model that studies can vary (e.g. Bracket.size.z, Hole.radius, load2.vector.z, element_size) with current values, plus suggested responses.", json!({}), &[]),
+        t("run_parameter_study", "Sweep parameters (full grid, or Latin hypercube with 'samples') and tabulate responses such as mass, max:von_mises, min:safety_factor, frequency:1.", json!({"parameters": {"type": "array", "items": {"type": "object", "properties": {"target": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}, "steps": {"type": "integer"}}, "required": ["target", "min", "max"]}}, "responses": {"type": "array", "items": {"type": "string"}}, "samples": {"type": "integer", "description": "Latin-hypercube sample count instead of a grid"}}), &["parameters", "responses"]),
+        t("optimize_design", "Find parameter values that minimise or maximise a response subject to constraints, e.g. minimise mass with min:safety_factor >= 2. Latin-hypercube exploration + bounded Nelder-Mead. Use apply_design to adopt the result.", json!({"parameters": {"type": "array", "items": {"type": "object", "properties": {"target": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}}, "required": ["target", "min", "max"]}}, "objective": {"type": "object", "properties": {"response": {"type": "string"}, "goal": {"type": "string", "enum": ["minimize", "maximize"]}}, "required": ["response"]}, "constraints": {"type": "array", "items": {"type": "object", "properties": {"response": {"type": "string"}, "op": {"type": "string", "enum": ["<=", ">="]}, "value": {"type": "number"}}, "required": ["response", "op", "value"]}}, "max_evaluations": {"type": "integer", "description": "default 30"}}), &["parameters", "objective"]),
+        t("topology_optimize", "SIMP topology optimization of the current Static Structural setup: keeps the stiffest material layout at the given volume fraction; regions under loads/supports stay solid. Shows the density field and exports the shape as an STL.", json!({"volume_fraction": {"type": "number", "description": "fraction of material to keep (default 0.4)"}, "iterations": {"type": "integer", "description": "default 40"}, "filter_radius_mm": {"type": "number", "description": "default 1.6 × element size"}, "export_path": {"type": "string"}}), &[]),
+        t("fatigue_life", "Stress-life (S-N) fatigue of the current stress result: adds Fatigue Life [cycles], Fatigue Damage and Fatigue Safety Factor fields. Static results: the solved load is cycled (fully_reversed, zero_based or stress ratio R) with a mean-stress correction. Harmonic / response spectrum results are amplitudes (fully reversed). Random vibration uses Steinberg's 3-band method over exposure_time_s. S-N data comes from the material (σf', b, endurance limit) or is estimated from the ultimate strength.", json!({"loading": {"type": "string", "enum": ["fully_reversed", "zero_based", "ratio"]}, "ratio": {"type": "number", "description": "stress ratio σmin/σmax for loading=ratio (e.g. 0.1)"}, "correction": {"type": "string", "enum": ["goodman", "gerber", "soderberg", "none"], "description": "mean-stress correction (default goodman)"}, "scale": {"type": "number", "description": "multiplier on the solved stresses (default 1)"}, "design_life": {"type": "number", "description": "required cycles for the safety factor (default 1e6)"}, "exposure_time_s": {"type": "number", "description": "random vibration exposure time in seconds (default 3600)"}}), &[]),
+        t("make_report", "Write a self-contained HTML report (model, materials, loads, mesh, rendered views, results, pass/fail checks, study tables and charts). Default check: yield safety factor >= 1.", json!({"path": {"type": "string", "description": "default: next to the project, or ~/SimCraft/report-<time>.html"}, "title": {"type": "string"}, "checks": {"type": "array", "items": {"type": "object", "properties": {"response": {"type": "string"}, "op": {"type": "string", "enum": ["<=", ">="]}, "value": {"type": "number"}}, "required": ["response", "op", "value"]}, "description": "e.g. [{response: 'max:von_mises', op: '<=', value: 150}]"}}), &[]),
+        t("get_study", "Results of the last parameter study / optimization / topology run.", json!({}), &[]),
+        t("apply_design", "Apply a study design to the model (default: the optimizer's best; or 'run' = 1-based row).", json!({"run": {"type": "integer"}}), &[]),
+        t("plan_simulation", "Draft a step-by-step to-do list for simulating something in SimCraft (e.g. 'EMI on my PCB', 'food heating in a microwave') using a LOCAL model via Ollama. Marks each step ready / workaround / missing-in-SimCraft and lists inputs and missing capabilities. Takes 10-120 s.", json!({"goal": {"type": "string"}, "model": {"type": "string", "description": "Ollama model name (default: best installed)"}}), &["goal"]),
+        t("get_plan", "The current simulation to-do list (markdown + JSON), including which steps are done.", json!({}), &[]),
+        t("set_plan_step", "Tick (or untick) a to-do step by its 1-based index.", json!({"index": {"type": "integer"}, "done": {"type": "boolean"}}), &["index"]),
+        t("list_local_models", "List the local LLMs available to the planner (Ollama).", json!({}), &[]),
         t("get_selection", "Faces the user has currently picked in the GUI viewport.", json!({}), &[]),
     ]
+}
+
+fn apply_section(d: &mut Display, a: &Value) -> Result<()> {
+    if let Some(sec) = opt_str(a, "section") {
+        d.section = match sec {
+            "off" | "none" => None,
+            "x" => Some(render::Section { axis: 0, position: 0.5 }),
+            "y" => Some(render::Section { axis: 1, position: 0.5 }),
+            "z" => Some(render::Section { axis: 2, position: 0.5 }),
+            o => bail!("section must be off, x, y or z (got '{o}')"),
+        };
+    }
+    if let (Some(p), Some(sec)) = (opt_num(a, "section_position"), d.section.as_mut()) {
+        sec.position = p.clamp(0.0, 1.0);
+    }
+    Ok(())
+}
+
+fn study_json(st: &crate::study::Study) -> Value {
+    let rows: Vec<Value> = st
+        .runs
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut o = serde_json::Map::new();
+            o.insert("run".into(), json!(i + 1));
+            for (p, v) in st.parameters.iter().zip(&r.values) {
+                o.insert(p.target.clone(), json!(crate::results::float(*v)));
+            }
+            for (k, v) in st.responses.iter().zip(&r.responses) {
+                o.insert(k.clone(), json!(v.map(crate::results::float)));
+            }
+            if st.kind == "optimization" {
+                o.insert("feasible".into(), json!(r.feasible));
+            }
+            if let Some(e) = &r.error {
+                o.insert("error".into(), json!(e));
+            }
+            Value::Object(o)
+        })
+        .collect();
+    let mut v = json!({"kind": st.kind, "message": st.message, "seconds": crate::results::float(st.seconds)});
+    if !rows.is_empty() {
+        v["runs"] = json!(rows);
+    }
+    if let Some(b) = st.best {
+        v["best_run"] = json!(b + 1);
+    }
+    if let Some(p) = &st.stl_path {
+        v["stl_path"] = json!(p);
+        let stride = (st.history.len() / 12).max(1);
+        v["history"] = json!(st.history.iter().step_by(stride).map(|(i, c, f)| json!({"iteration": i, "compliance_j": crate::results::float(*c), "volume_fraction": crate::results::float(*f)})).collect::<Vec<_>>());
+    }
+    v
 }

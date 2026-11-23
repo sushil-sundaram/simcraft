@@ -5,8 +5,9 @@ use crate::mesh::Mesh;
 use crate::model::AnalysisType;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Field {
     #[default]
@@ -18,56 +19,167 @@ pub enum Field {
     MaxPrincipal,
     MinPrincipal,
     SafetyFactor,
+    PlasticStrain,
     Temperature,
     HeatFlux,
+    ElectricPotential,
+    ElectricField,
+    CurrentDensity,
+    JouleHeat,
+    MagneticFluxDensity,
+    MagneticFieldIntensity,
+    Velocity,
+    FluidPressure,
+    Density,
+    FatigueLife,
+    FatigueDamage,
+    FatigueSafety,
+    AbsorbedPower,
+    Sar,
+    VelocityX,
+    VelocityY,
+    VelocityZ,
 }
 
 impl Field {
-    pub fn all() -> [Field; 10] {
+    pub fn all() -> [Field; 28] {
         use Field::*;
-        [TotalDeformation, DeformationX, DeformationY, DeformationZ, VonMises, MaxPrincipal, MinPrincipal, SafetyFactor, Temperature, HeatFlux]
+        [
+            TotalDeformation,
+            DeformationX,
+            DeformationY,
+            DeformationZ,
+            VonMises,
+            MaxPrincipal,
+            MinPrincipal,
+            SafetyFactor,
+            PlasticStrain,
+            Temperature,
+            HeatFlux,
+            ElectricPotential,
+            ElectricField,
+            CurrentDensity,
+            JouleHeat,
+            MagneticFluxDensity,
+            MagneticFieldIntensity,
+            Velocity,
+            FluidPressure,
+            Density,
+            FatigueLife,
+            FatigueDamage,
+            FatigueSafety,
+            AbsorbedPower,
+            Sar,
+            VelocityX,
+            VelocityY,
+            VelocityZ,
+        ]
     }
     pub fn label(self) -> &'static str {
+        use Field::*;
         match self {
-            Field::TotalDeformation => "Total Deformation",
-            Field::DeformationX => "Directional Deformation X",
-            Field::DeformationY => "Directional Deformation Y",
-            Field::DeformationZ => "Directional Deformation Z",
-            Field::VonMises => "Equivalent (von Mises) Stress",
-            Field::MaxPrincipal => "Maximum Principal Stress",
-            Field::MinPrincipal => "Minimum Principal Stress",
-            Field::SafetyFactor => "Safety Factor",
-            Field::Temperature => "Temperature",
-            Field::HeatFlux => "Total Heat Flux",
+            TotalDeformation => "Total Deformation",
+            DeformationX => "Directional Deformation X",
+            DeformationY => "Directional Deformation Y",
+            DeformationZ => "Directional Deformation Z",
+            VonMises => "Equivalent (von Mises) Stress",
+            MaxPrincipal => "Maximum Principal Stress",
+            MinPrincipal => "Minimum Principal Stress",
+            SafetyFactor => "Safety Factor",
+            PlasticStrain => "Equivalent Plastic Strain",
+            Temperature => "Temperature",
+            HeatFlux => "Total Heat Flux",
+            ElectricPotential => "Electric Potential",
+            ElectricField => "Electric Field",
+            CurrentDensity => "Current Density",
+            JouleHeat => "Joule Heat",
+            MagneticFluxDensity => "Magnetic Flux Density",
+            MagneticFieldIntensity => "Magnetic Field Intensity",
+            Velocity => "Velocity",
+            FluidPressure => "Pressure",
+            Density => "Topology Density",
+            FatigueLife => "Fatigue Life",
+            FatigueDamage => "Fatigue Damage",
+            FatigueSafety => "Fatigue Safety Factor",
+            AbsorbedPower => "Absorbed Power Density",
+            Sar => "Specific Absorption Rate",
+            VelocityX => "Velocity X",
+            VelocityY => "Velocity Y",
+            VelocityZ => "Velocity Z",
         }
     }
     pub fn unit(self) -> &'static str {
+        use Field::*;
         match self {
-            Field::TotalDeformation | Field::DeformationX | Field::DeformationY | Field::DeformationZ => "mm",
-            Field::VonMises | Field::MaxPrincipal | Field::MinPrincipal => "MPa",
-            Field::SafetyFactor => "",
-            Field::Temperature => "°C",
-            Field::HeatFlux => "W/m²",
+            TotalDeformation | DeformationX | DeformationY | DeformationZ => "mm",
+            VonMises | MaxPrincipal | MinPrincipal => "MPa",
+            SafetyFactor => "",
+            PlasticStrain => "mm/mm",
+            Temperature => "°C",
+            HeatFlux => "W/m²",
+            ElectricPotential => "V",
+            ElectricField => "V/m",
+            CurrentDensity => "A/mm²",
+            JouleHeat => "W/m³",
+            MagneticFluxDensity => "T",
+            MagneticFieldIntensity => "A/m",
+            Velocity => "m/s",
+            FluidPressure => "Pa",
+            Density => "",
+            FatigueLife => "cycles",
+            FatigueDamage => "",
+            FatigueSafety => "",
+            AbsorbedPower => "W/m³",
+            Sar => "W/kg",
+            VelocityX | VelocityY | VelocityZ => "m/s",
         }
     }
     pub fn key(self) -> String {
         serde_json::to_value(self).unwrap().as_str().unwrap().to_string()
+    }
+    /// Fields where low values are critical: drawn with the colour scale reversed (low = red).
+    pub fn reversed_scale(self) -> bool {
+        matches!(self, Field::SafetyFactor | Field::FatigueSafety | Field::FatigueLife)
+    }
+
+    pub fn is_deformation(self) -> bool {
+        matches!(self, Field::TotalDeformation | Field::DeformationX | Field::DeformationY | Field::DeformationZ)
     }
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Mode {
     pub frequency_hz: f64,
+    /// Buckling load multiplier (critical load = multiplier × applied load).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_multiplier: Option<f64>,
     #[serde(skip)]
     pub shape: Vec<V3>,
+}
+
+/// One saved time point of a transient analysis.
+#[derive(Clone, Debug, Default)]
+pub struct TimeFrame {
+    pub time: f64,
+    pub disp: Option<Vec<V3>>,
+    pub temp: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Reaction {
     pub load_id: u32,
     pub label: String,
-    /// Reaction force [N] (structural) or [heat W, 0, 0] (thermal).
+    /// Reaction force [N] (structural), [heat W, 0, 0] (thermal), [charge C, 0, 0] (electrostatic),
+    /// [current A, 0, 0] (current flow), [flow m³/s, mean pressure Pa, 0] (fluid).
     pub value: V3,
+}
+
+/// A named scalar result such as capacitance, resistance or drag.
+#[derive(Clone, Debug, Serialize)]
+pub struct Quantity {
+    pub name: String,
+    pub value: f64,
+    pub unit: String,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -80,6 +192,8 @@ pub struct SolveInfo {
     pub mass_kg: f64,
     pub element_size_mm: f64,
     pub solver: String,
+    /// Wall time spent in linear solves (factorisation, CG, GPU).
+    pub linear_solve_seconds: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -93,59 +207,147 @@ pub struct Results {
     pub safety: Option<Vec<f64>>,
     pub temp: Option<Vec<f64>>,
     pub flux: Option<Vec<V3>>,
+    /// Other nodal scalar fields (electric, magnetic, fluid, plastic strain…).
+    pub extra: BTreeMap<Field, Vec<f64>>,
     pub modes: Vec<Mode>,
+    pub frames: Vec<TimeFrame>,
+    /// (time [s], value) history of the main response for transient analyses.
+    pub history: Vec<(f64, f64)>,
+    pub history_label: String,
+    /// x-axis of `history` ("time [s]", "frequency [Hz]", "load factor"…).
+    #[allow(dead_code)]
+    pub history_x: String,
+    /// What the displayed fields mean (e.g. "1σ RMS", "at 812 Hz", "SRSS combined").
+    pub note: String,
     pub reactions: Vec<Reaction>,
+    pub quantities: Vec<Quantity>,
     pub info: SolveInfo,
     pub warnings: Vec<String>,
 }
 
-fn mag(v: &V3) -> f64 {
+pub fn mag(v: &V3) -> f64 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
 
 impl Results {
+    pub fn new(analysis: AnalysisType) -> Self {
+        Results {
+            analysis,
+            disp: None,
+            stress: None,
+            vm: None,
+            s1: None,
+            s3: None,
+            safety: None,
+            temp: None,
+            flux: None,
+            extra: BTreeMap::new(),
+            modes: vec![],
+            frames: vec![],
+            history: vec![],
+            history_label: String::new(),
+            history_x: String::new(),
+            note: String::new(),
+            reactions: vec![],
+            quantities: vec![],
+            info: SolveInfo::default(),
+            warnings: vec![],
+        }
+    }
+
+    pub fn quantity(&mut self, name: &str, value: f64, unit: &str) {
+        self.quantities.push(Quantity { name: name.into(), value: float(value), unit: unit.into() });
+    }
+
+    /// Number of selectable "steps": modes, time frames, or 1.
+    pub fn n_steps(&self) -> usize {
+        if !self.modes.is_empty() {
+            self.modes.len()
+        } else if !self.frames.is_empty() {
+            self.frames.len()
+        } else {
+            1
+        }
+    }
+    pub fn step_label(&self, i: usize) -> String {
+        if let Some(m) = self.modes.get(i) {
+            return match m.load_multiplier {
+                Some(l) => format!("Mode {} — load ×{:.4}", i + 1, l),
+                None => format!("Mode {} — {:.2} Hz", i + 1, m.frequency_hz),
+            };
+        }
+        if let Some(f) = self.frames.get(i) {
+            return format!("t = {:.4} s", f.time);
+        }
+        "Final".into()
+    }
+
     pub fn available_fields(&self) -> Vec<Field> {
         Field::all().into_iter().filter(|f| self.has(*f)).collect()
     }
     pub fn has(&self, f: Field) -> bool {
         use Field::*;
+        if self.extra.contains_key(&f) {
+            return true;
+        }
         match f {
             TotalDeformation | DeformationX | DeformationY | DeformationZ => self.disp.is_some() || !self.modes.is_empty(),
             VonMises | MaxPrincipal | MinPrincipal | SafetyFactor => self.vm.is_some(),
             Temperature => self.temp.is_some(),
             HeatFlux => self.flux.is_some(),
+            _ => false,
         }
     }
-    /// Displacement field to show the deformed shape: static result or mode shape.
-    pub fn deformation(&self, mode: usize) -> Option<&[V3]> {
-        if self.analysis == AnalysisType::Modal {
-            return self.modes.get(mode).map(|m| m.shape.as_slice());
+    /// Displacement field for the deformed shape: static result, mode shape or time frame.
+    pub fn deformation(&self, step: usize) -> Option<&[V3]> {
+        if !self.modes.is_empty() {
+            return self.modes.get(step.min(self.modes.len() - 1)).map(|m| m.shape.as_slice());
+        }
+        if !self.frames.is_empty() {
+            if let Some(d) = &self.frames[step.min(self.frames.len() - 1)].disp {
+                return Some(d.as_slice());
+            }
         }
         self.disp.as_deref()
     }
-    pub fn scalar(&self, f: Field, mode: usize) -> Option<Vec<f64>> {
+    pub fn scalar(&self, f: Field, step: usize) -> Option<Vec<f64>> {
         use Field::*;
+        if let Some(v) = self.extra.get(&f) {
+            return Some(v.clone());
+        }
         match f {
-            TotalDeformation => self.deformation(mode).map(|d| d.iter().map(mag).collect()),
-            DeformationX => self.deformation(mode).map(|d| d.iter().map(|v| v[0]).collect()),
-            DeformationY => self.deformation(mode).map(|d| d.iter().map(|v| v[1]).collect()),
-            DeformationZ => self.deformation(mode).map(|d| d.iter().map(|v| v[2]).collect()),
+            TotalDeformation => self.deformation(step).map(|d| d.iter().map(mag).collect()),
+            DeformationX => self.deformation(step).map(|d| d.iter().map(|v| v[0]).collect()),
+            DeformationY => self.deformation(step).map(|d| d.iter().map(|v| v[1]).collect()),
+            DeformationZ => self.deformation(step).map(|d| d.iter().map(|v| v[2]).collect()),
             VonMises => self.vm.clone(),
             MaxPrincipal => self.s1.clone(),
             MinPrincipal => self.s3.clone(),
             SafetyFactor => self.safety.clone(),
-            Temperature => self.temp.clone(),
+            Temperature => {
+                if !self.frames.is_empty() {
+                    if let Some(t) = &self.frames[step.min(self.frames.len() - 1)].temp {
+                        return Some(t.clone());
+                    }
+                }
+                self.temp.clone()
+            }
             HeatFlux => self.flux.as_ref().map(|d| d.iter().map(mag).collect()),
+            _ => None,
         }
     }
 
     pub fn summary(&self, mesh: &Mesh) -> Value {
         let mut fields = serde_json::Map::new();
+        let last = self.n_steps().saturating_sub(1);
         for f in self.available_fields() {
-            if self.analysis == AnalysisType::Modal {
+            if !self.modes.is_empty() && f.is_deformation() {
                 continue;
             }
-            let Some(v) = self.scalar(f, 0) else { continue };
+            let Some(v) = self.scalar(f, last) else { continue };
+            if v.is_empty() {
+                continue;
+            }
             let (mut imin, mut imax) = (0, 0);
             for i in 0..v.len() {
                 if v[i] < v[imin] {
@@ -155,38 +357,53 @@ impl Results {
                     imax = i;
                 }
             }
-            let r = |x: f64| float(x);
             let p = |i: usize| mesh.nodes[i].map(|c| (c * 1000.0).round() / 1000.0);
-            fields.insert(
-                f.key(),
-                json!({"label": f.label(), "unit": f.unit(), "min": r(v[imin]), "min_at_mm": p(imin), "max": r(v[imax]), "max_at_mm": p(imax)}),
-            );
+            fields.insert(f.key(), json!({"label": f.label(), "unit": f.unit(), "min": float(v[imin]), "min_at_mm": p(imin), "max": float(v[imax]), "max_at_mm": p(imax)}));
         }
         let modes: Vec<Value> = self
             .modes
             .iter()
             .enumerate()
-            .map(|(i, m)| json!({"mode": i + 1, "frequency_hz": float(m.frequency_hz)}))
+            .map(|(i, m)| match m.load_multiplier {
+                Some(l) => json!({"mode": i + 1, "load_multiplier": float(l)}),
+                None => json!({"mode": i + 1, "frequency_hz": float(m.frequency_hz)}),
+            })
             .collect();
         let reactions: Vec<Value> = self
             .reactions
             .iter()
-            .map(|r| {
-                if self.analysis == AnalysisType::SteadyThermal {
-                    json!({"load_id": r.load_id, "label": r.label, "heat_flow_w": float(r.value[0])})
-                } else {
-                    json!({"load_id": r.load_id, "label": r.label, "force_n": r.value.map(float), "magnitude_n": float(mag(&r.value))})
-                }
+            .map(|r| match self.analysis {
+                AnalysisType::SteadyThermal | AnalysisType::TransientThermal => json!({"load_id": r.load_id, "label": r.label, "heat_flow_w": float(r.value[0])}),
+                AnalysisType::Electrostatic => json!({"load_id": r.load_id, "label": r.label, "charge_c": float(r.value[0])}),
+                AnalysisType::CurrentFlow | AnalysisType::ThermalElectric => json!({"load_id": r.load_id, "label": r.label, "current_a": float(r.value[0])}),
+                AnalysisType::Fluid => json!({"load_id": r.load_id, "label": r.label, "flow_rate_m3_s": float(r.value[0]), "mean_pressure_pa": float(r.value[1])}),
+                _ => json!({"load_id": r.load_id, "label": r.label, "force_n": r.value.map(float), "magnitude_n": float(mag(&r.value))}),
             })
             .collect();
-        json!({
+        let mut out = json!({
             "analysis": self.analysis.label(),
+            "note": self.note,
             "fields": fields,
-            "modes": modes,
             "reactions": reactions,
             "info": self.info,
             "warnings": self.warnings,
-        })
+        });
+        if !modes.is_empty() {
+            out["modes"] = json!(modes);
+        }
+        if !self.quantities.is_empty() {
+            out["quantities"] = json!(self.quantities);
+        }
+        if !self.frames.is_empty() {
+            out["time_points"] = json!(self.frames.len());
+            out["end_time_s"] = json!(self.frames.last().map(|f| f.time));
+        }
+        if !self.history.is_empty() {
+            let stride = (self.history.len() / 25).max(1);
+            let h: Vec<[f64; 2]> = self.history.iter().step_by(stride).map(|(t, v)| [float(*t), float(*v)]).collect();
+            out["history"] = json!({"quantity": self.history_label, "x": self.history_x, "samples": h});
+        }
+        out
     }
 }
 

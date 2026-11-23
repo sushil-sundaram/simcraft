@@ -119,12 +119,15 @@ enum Tab {
     Mesh,
     Solve,
     Results,
+    Optimize,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum LoadKind {
     Fixed,
     Displacement,
+    CompressionOnly,
+    Symmetry,
     Force,
     Pressure,
     Gravity,
@@ -132,12 +135,26 @@ enum LoadKind {
     HeatFlux,
     Convection,
     HeatGen,
+    Voltage,
+    Current,
+    Coil,
+    Magnet,
+    Inlet,
+    Outlet,
+    Port,
+    MovingWall,
 }
 impl LoadKind {
+    const STRUCTURAL: [LoadKind; 7] = [LoadKind::Fixed, LoadKind::Displacement, LoadKind::CompressionOnly, LoadKind::Symmetry, LoadKind::Force, LoadKind::Pressure, LoadKind::Gravity];
+    const THERMAL: [LoadKind; 4] = [LoadKind::Temperature, LoadKind::HeatFlux, LoadKind::Convection, LoadKind::HeatGen];
+    const ELECTRO: [LoadKind; 5] = [LoadKind::Voltage, LoadKind::Current, LoadKind::Coil, LoadKind::Magnet, LoadKind::Port];
+    const FLUID: [LoadKind; 5] = [LoadKind::Inlet, LoadKind::Outlet, LoadKind::Symmetry, LoadKind::MovingWall, LoadKind::Gravity];
     fn label(self) -> &'static str {
         match self {
             LoadKind::Fixed => "Fixed",
             LoadKind::Displacement => "Displacement",
+            LoadKind::CompressionOnly => "Contact",
+            LoadKind::Symmetry => "Symmetry",
             LoadKind::Force => "Force",
             LoadKind::Pressure => "Pressure",
             LoadKind::Gravity => "Gravity",
@@ -145,19 +162,25 @@ impl LoadKind {
             LoadKind::HeatFlux => "Heat Flux",
             LoadKind::Convection => "Convection",
             LoadKind::HeatGen => "Heat Gen.",
+            LoadKind::Voltage => "Voltage",
+            LoadKind::Current => "Current",
+            LoadKind::Coil => "Coil",
+            LoadKind::Magnet => "Magnet",
+            LoadKind::Inlet => "Inlet",
+            LoadKind::Outlet => "Outlet",
+            LoadKind::Port => "RF Port",
+            LoadKind::MovingWall => "Moving Wall",
         }
     }
     fn title(self) -> &'static str {
-        match self {
-            LoadKind::Fixed => "Fixed Support",
-            LoadKind::HeatGen => "Internal Heat Generation",
-            k => k.label(),
-        }
+        self.sample().label()
     }
     fn icon(self) -> &'static str {
         match self {
             LoadKind::Fixed => "📌",
             LoadKind::Displacement => "↔",
+            LoadKind::CompressionOnly => "⏏",
+            LoadKind::Symmetry => "◫",
             LoadKind::Force => "➡",
             LoadKind::Pressure => "⬇",
             LoadKind::Gravity => "🌍",
@@ -165,25 +188,56 @@ impl LoadKind {
             LoadKind::HeatFlux => "☀",
             LoadKind::Convection => "💨",
             LoadKind::HeatGen => "🔥",
+            LoadKind::Voltage => "⚡",
+            LoadKind::Current => "🔌",
+            LoadKind::Coil => "🌀",
+            LoadKind::Magnet => "🧲",
+            LoadKind::Inlet => "⇥",
+            LoadKind::Outlet => "⇤",
+            LoadKind::Port => "📡",
+            LoadKind::MovingWall => "⏩",
+        }
+    }
+    fn sample(self) -> Load {
+        let f = vec![];
+        match self {
+            LoadKind::Fixed => Load::FixedSupport { faces: f },
+            LoadKind::Displacement => Load::Displacement { faces: f, x: None, y: None, z: None },
+            LoadKind::CompressionOnly => Load::CompressionOnly { faces: f },
+            LoadKind::Symmetry => Load::Symmetry { faces: f },
+            LoadKind::Force => Load::Force { faces: f, vector: [0.0; 3] },
+            LoadKind::Pressure => Load::Pressure { faces: f, value_mpa: 0.0 },
+            LoadKind::Gravity => Load::Gravity { acceleration: [0.0; 3] },
+            LoadKind::Temperature => Load::Temperature { faces: f, value: 0.0 },
+            LoadKind::HeatFlux => Load::HeatFlux { faces: f, value: 0.0 },
+            LoadKind::Convection => Load::Convection { faces: f, coefficient: 0.0, ambient: 0.0 },
+            LoadKind::HeatGen => Load::HeatGeneration { value: 0.0, body: None, power: None },
+            LoadKind::Voltage => Load::Voltage { faces: f, value: 0.0 },
+            LoadKind::Current => Load::Current { faces: f, value: 0.0 },
+            LoadKind::Coil => Load::Coil { body: String::new(), current_density: 0.0, axis: Default::default(), mode: Default::default(), center: None },
+            LoadKind::Magnet => Load::Magnet { body: String::new(), remanence: [0.0; 3] },
+            LoadKind::Inlet => Load::Inlet { faces: f, velocity: 0.0, temperature: None },
+            LoadKind::Outlet => Load::Outlet { faces: f, pressure: 0.0 },
+            LoadKind::MovingWall => Load::MovingWall { faces: f, velocity: [0.0; 3] },
+            LoadKind::Port => Load::Port { faces: f, power: 0.0, polarization: Default::default(), profile: "te10".into() },
         }
     }
     fn color(self) -> Color32 {
-        let l = match self {
-            LoadKind::Fixed => Load::FixedSupport { faces: vec![] },
-            LoadKind::Displacement => Load::Displacement { faces: vec![], x: None, y: None, z: None },
-            LoadKind::Force => Load::Force { faces: vec![], vector: [0.0; 3] },
-            LoadKind::Pressure => Load::Pressure { faces: vec![], value_mpa: 0.0 },
-            LoadKind::Temperature => Load::Temperature { faces: vec![], value: 0.0 },
-            LoadKind::HeatFlux => Load::HeatFlux { faces: vec![], value: 0.0 },
-            LoadKind::Convection => Load::Convection { faces: vec![], coefficient: 0.0, ambient: 0.0 },
-            LoadKind::Gravity => return Color32::from_rgb(70, 150, 90),
-            LoadKind::HeatGen => return Color32::from_rgb(235, 90, 40),
+        let c = match self {
+            LoadKind::Gravity => [70, 150, 90],
+            LoadKind::HeatGen => [235, 90, 40],
+            k => render::load_color(&k.sample()),
         };
-        let c = render::load_color(&l);
         Color32::from_rgb(c[0], c[1], c[2])
     }
     fn needs_faces(self) -> bool {
-        !matches!(self, LoadKind::Gravity | LoadKind::HeatGen)
+        !matches!(self, LoadKind::Gravity | LoadKind::HeatGen | LoadKind::Coil | LoadKind::Magnet)
+    }
+    fn needs_body(self) -> bool {
+        matches!(self, LoadKind::Coil | LoadKind::Magnet)
+    }
+    fn applies(self, kind: AnalysisType) -> bool {
+        self.sample().applies_to(kind)
     }
 }
 
@@ -193,6 +247,10 @@ enum Form {
     Box,
     Cylinder,
     Sphere,
+    Enclosure,
+    Study,
+    Optimize,
+    Topology,
     Load(LoadKind),
 }
 
@@ -215,6 +273,32 @@ struct Forms {
     grav: [f64; 3],
     material: String,
     mesh_size: f64,
+    body: String,
+    coil_axis: usize,
+    coil_axial: bool,
+    remanence: [f64; 3],
+    velocity: f64,
+    outlet_p: f64,
+    padding: f64,
+    fluid: String,
+    /// Body for heat generation ("" = whole model).
+    heat_body: String,
+    /// Spectrum / PSD table being edited ("Hz value" per line) and the model table it came from.
+    table_text: String,
+    table_src: Vec<[f64; 2]>,
+    fat_open: bool,
+    fat_loading: String,
+    fat_ratio: f64,
+    fat_correction: String,
+    fat_scale: f64,
+    fat_life: f64,
+    fat_exposure_h: f64,
+    port_power: f64,
+    heat_watts: bool,
+    heat_power: f64,
+    wall_v: [f64; 3],
+    port_pol: usize,
+    port_te10: bool,
 }
 
 impl Default for Forms {
@@ -238,6 +322,30 @@ impl Default for Forms {
             grav: [0.0, 0.0, -9.80665],
             material: "Structural Steel".into(),
             mesh_size: 2.0,
+            body: String::new(),
+            coil_axis: 2,
+            coil_axial: false,
+            remanence: [0.0, 0.0, 1.3],
+            velocity: 1.0,
+            outlet_p: 0.0,
+            padding: 0.5,
+            fluid: "Air".into(),
+            heat_body: String::new(),
+            table_text: String::new(),
+            table_src: Vec::new(),
+            fat_open: false,
+            fat_loading: "fully_reversed".into(),
+            fat_ratio: 0.1,
+            fat_correction: "goodman".into(),
+            fat_scale: 1.0,
+            fat_life: 1e6,
+            fat_exposure_h: 1.0,
+            port_power: 800.0,
+            heat_watts: true,
+            heat_power: 5.0,
+            wall_v: [0.1, 0.0, 0.0],
+            port_pol: 2,
+            port_te10: true,
         }
     }
 }
@@ -276,9 +384,74 @@ pub struct SimApp {
     legend: Option<((f64, f64), f64)>,
     dark: bool,
     p: Pal,
+    show_mcp: bool,
+    planner: Planner,
+    opt: OptUi,
+    copied: Option<(&'static str, f64)>,
+}
+
+/// State of the OPTIMIZE tab forms and the study results window.
+#[derive(Default)]
+struct OptUi {
+    /// (target, min, max, steps)
+    params: Vec<(String, f64, f64, usize)>,
+    responses: Vec<String>,
+    objective: String,
+    maximize: bool,
+    /// (response, is "<=", value)
+    constraints: Vec<(String, bool, f64)>,
+    max_evals: usize,
+    vf: f64,
+    iters: usize,
+    show_results: bool,
+    job: Option<Arc<std::sync::Mutex<Option<Result<(), String>>>>>,
+    error: Option<String>,
+    /// Signature of the last study shown, so new results (from the GUI or an AI agent) pop up.
+    seen: String,
+}
+
+/// State of the local-model simulation planner window.
+#[derive(Default)]
+struct Planner {
+    open: bool,
+    goal: String,
+    models: Option<Result<Vec<String>, String>>,
+    model: String,
+    job: Option<Arc<std::sync::Mutex<Option<Result<(), String>>>>>,
+    error: Option<String>,
+    copied_at: f64,
 }
 
 // ---------------------------------------------------------------- widgets
+
+/// The SimCraft logo (assets/simcraft-64.png), drawn as an image.
+fn logo(ui: &mut egui::Ui, size: f32) {
+    let id = egui::Id::new("simcraft-logo-tex");
+    let tex = ui.ctx().data_mut(|d| d.get_temp::<egui::TextureHandle>(id)).unwrap_or_else(|| {
+        let img = decode_png(include_bytes!("../assets/simcraft-64.png")).unwrap_or_else(|| egui::ColorImage::filled([1, 1], Color32::TRANSPARENT));
+        let t = ui.ctx().load_texture("simcraft-logo", img, egui::TextureOptions::LINEAR);
+        ui.ctx().data_mut(|d| d.insert_temp(id, t.clone()));
+        t
+    });
+    let (r, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    ui.painter().image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+}
+
+fn decode_png(bytes: &[u8]) -> Option<egui::ColorImage> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(bytes));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => buf[..w * h * 4].to_vec(),
+        png::ColorType::Rgb => buf[..w * h * 3].chunks(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => buf[..w * h * 2].chunks(2).flat_map(|c| [c[0], c[0], c[0], c[1]]).collect(),
+        _ => buf[..w * h].iter().flat_map(|&g| [g, g, g, 255]).collect(),
+    };
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba))
+}
 
 /// Flat ribbon tool button: big icon above a short label.
 fn tool(ui: &mut egui::Ui, p: &Pal, icon: &str, label: &str, color: Option<Color32>, enabled: bool) -> bool {
@@ -362,6 +535,10 @@ impl SimApp {
             legend: None,
             dark,
             p: pal(dark),
+            show_mcp: std::env::var_os("SIMCRAFT_OPEN_CONNECT").is_some(),
+            opt: OptUi { max_evals: 30, vf: 0.4, iters: 40, objective: "mass".into(), ..Default::default() },
+            planner: Planner { open: std::env::var_os("SIMCRAFT_OPEN_PLANNER").is_some(), ..Default::default() },
+            copied: None,
         }
     }
 
@@ -419,7 +596,7 @@ impl SimApp {
     fn header(&mut self, ui: &mut egui::Ui) {
         let p = self.p;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("◆").size(18.0).color(p.accent));
+            logo(ui, 24.0);
             ui.label(RichText::new("SimCraft").size(15.0).strong().color(p.text));
             ui.add_space(10.0);
             egui::MenuBar::new().ui(ui, |ui| {
@@ -437,8 +614,43 @@ impl SimApp {
                         ui.close();
                         self.example_fork();
                     }
+                    if ui.button("🏛  Column buckling").clicked() {
+                        ui.close();
+                        self.example_buckling();
+                    }
+                    ui.separator();
+                    if ui.button("⚡  Parallel-plate capacitor (electrostatic)").clicked() {
+                        ui.close();
+                        self.example_capacitor();
+                    }
+                    if ui.button("🔌  Bus bar Joule heating (thermal-electric)").clicked() {
+                        ui.close();
+                        self.example_busbar();
+                    }
+                    if ui.button("🌀  Coil with iron core (magnetostatic)").clicked() {
+                        ui.close();
+                        self.example_coil();
+                    }
+                    if ui.button("📡  Microwave oven heating (full-wave EM)").clicked() {
+                        ui.close();
+                        self.example_microwave();
+                    }
+                    ui.separator();
+                    if ui.button("🔥  Heat sink in a duct (conjugate heat transfer)").clicked() {
+                        ui.close();
+                        self.example_heatsink_cht();
+                    }
+                    if ui.button("💨  Flow past a cylinder (CFD)").clicked() {
+                        ui.close();
+                        self.example_cfd();
+                    }
                 });
-                ui.menu_button("MCP", |ui| self.mcp_menu(ui));
+                if ui.button("Connect AI").on_hover_text("Control SimCraft from Claude Code, Antigravity or any MCP client").clicked() {
+                    self.show_mcp = true;
+                }
+                if ui.button("✨ Planner").on_hover_text("Describe what you want to simulate and get a to-do list from a local AI model").clicked() {
+                    self.planner.open = true;
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let icon = if self.dark { "☀" } else { "🌙" };
@@ -449,7 +661,9 @@ impl SimApp {
                 }
                 let ok = self.bridge.starts_with("MCP bridge listening");
                 let (c, t) = if ok { (p.ok, "● MCP ready") } else { (p.warn, "○ MCP bridge off") };
-                ui.label(RichText::new(t).size(11.5).color(c)).on_hover_text(&self.bridge);
+                if ui.add(egui::Label::new(RichText::new(t).size(11.5).color(c)).sense(Sense::click())).on_hover_text("Connect an AI agent").clicked() {
+                    self.show_mcp = true;
+                }
                 let name = self.core.session.lock().unwrap().project_path.clone();
                 if let Some(n) = name {
                     let f = std::path::Path::new(&n).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or(n);
@@ -490,10 +704,20 @@ impl SimApp {
             ui.close();
             self.import_stl();
         }
+        if ui.button("Import KiCad board…").clicked() {
+            ui.close();
+            self.import_kicad();
+        }
         if ui.button("Export results (VTK)…").clicked() {
             ui.close();
             if let Some(p) = rfd::FileDialog::new().add_filter("VTK", &["vtk"]).set_file_name("results.vtk").save_file() {
                 self.run("export_vtk", json!({"path": p.to_string_lossy()}));
+            }
+        }
+        if ui.button("Export report (HTML)…").clicked() {
+            ui.close();
+            if let Some(p) = rfd::FileDialog::new().add_filter("HTML report", &["html"]).set_file_name("simcraft-report.html").save_file() {
+                self.run("make_report", json!({"path": p.to_string_lossy()}));
             }
         }
         if ui.button("Save image (PNG)…").clicked() {
@@ -516,25 +740,539 @@ impl SimApp {
         }
     }
 
-    fn mcp_menu(&mut self, ui: &mut egui::Ui) {
-        ui.set_min_width(380.0);
-        ui.label(RichText::new(&self.bridge).small());
-        ui.separator();
-        let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or("simcraft".into());
-        let cmd = format!("claude mcp add simcraft -- {exe} mcp");
-        ui.label("Claude Code");
-        ui.code(&cmd);
-        if ui.button("📋  Copy Claude Code command").clicked() {
-            ui.ctx().copy_text(cmd.clone());
-            ui.close();
+    fn start_job(&mut self, tool: &str, args: Value) {
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let (core, out, tool) = (self.core.clone(), slot.clone(), tool.to_string());
+        std::thread::spawn(move || {
+            let r = core.call(&tool, &args).map(|_| ()).map_err(|e| format!("{e:#}"));
+            *out.lock().unwrap() = Some(r);
+        });
+        self.opt.job = Some(slot);
+        self.opt.error = None;
+    }
+
+    /// Forms for parameter studies, optimization and topology optimization.
+    fn opt_form(&mut self, ui: &mut egui::Ui, form: Form) {
+        let p = self.p;
+        let model = self.core.session.lock().unwrap().model.clone();
+        let targets = crate::study::list_targets(&model);
+        let mut responses = crate::study::suggested_responses(&model);
+        for r in self.opt.responses.iter().chain(std::iter::once(&self.opt.objective)) {
+            if !r.is_empty() && !responses.contains(r) {
+                responses.push(r.clone());
+            }
         }
-        ui.add_space(4.0);
-        ui.label("Antigravity / Cursor / other MCP clients (mcp_config.json)");
+        let busy = self.opt.job.is_some() || self.core.is_busy();
+        let title = match form {
+            Form::Study => "📊 Parameter study",
+            Form::Optimize => "🎯 Optimize design",
+            _ => "🦴 Topology optimization",
+        };
+        ui.heading(title);
+        let response_combo = |ui: &mut egui::Ui, id: String, value: &mut String| {
+            egui::ComboBox::from_id_salt(id).width(190.0).selected_text(value.clone()).show_ui(ui, |ui| {
+                for r in &responses {
+                    ui.selectable_value(value, r.clone(), r);
+                }
+            });
+        };
+        if form != Form::Topology {
+            card(ui, &p, |ui| {
+                ui.label(RichText::new("Parameters (what to vary)").strong());
+                let mut remove = None;
+                for (i, (t, lo, hi, steps)) in self.opt.params.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt(("ptarget", i)).width(150.0).selected_text(t.clone()).show_ui(ui, |ui| {
+                            for (name, cur) in &targets {
+                                ui.selectable_value(t, name.clone(), format!("{name}  ({})", render::fmt_val(*cur)));
+                            }
+                        });
+                        if ui.small_button("✖").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("from").small());
+                        ui.add(egui::DragValue::new(lo).speed(0.1));
+                        ui.label(RichText::new("to").small());
+                        ui.add(egui::DragValue::new(hi).speed(0.1));
+                        if form == Form::Study {
+                            ui.label(RichText::new("steps").small());
+                            ui.add(egui::DragValue::new(steps).range(2..=20));
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.opt.params.remove(i);
+                }
+                if ui.button("＋ Add parameter").clicked() {
+                    if let Some((t, cur)) = targets.iter().find(|(t, _)| !self.opt.params.iter().any(|q| &q.0 == t)) {
+                        let (lo, hi) = if *cur > 0.0 { (cur * 0.5, cur * 1.5) } else if *cur < 0.0 { (cur * 1.5, cur * 0.5) } else { (-1.0, 1.0) };
+                        self.opt.params.push((t.clone(), lo, hi, 4));
+                    }
+                }
+            });
+            ui.add_space(6.0);
+        }
+        match form {
+            Form::Study => {
+                card(ui, &p, |ui| {
+                    ui.label(RichText::new("Responses (what to record)").strong());
+                    for r in &responses {
+                        let mut on = self.opt.responses.contains(r);
+                        if ui.checkbox(&mut on, r).changed() {
+                            if on {
+                                self.opt.responses.push(r.clone());
+                            } else {
+                                self.opt.responses.retain(|x| x != r);
+                            }
+                        }
+                    }
+                });
+                let n: usize = self.opt.params.iter().map(|q| q.3.max(2)).product();
+                ui.label(RichText::new(format!("{n} designs will be solved")).small().color(p.weak));
+                let ready = !busy && !self.opt.params.is_empty() && !self.opt.responses.is_empty();
+                if ui.add_enabled(ready, primary(&p, "Run study")).clicked() {
+                    let params: Vec<Value> = self.opt.params.iter().map(|(t, lo, hi, st)| json!({"target": t, "min": lo, "max": hi, "steps": st})).collect();
+                    self.start_job("run_parameter_study", json!({"parameters": params, "responses": self.opt.responses}));
+                }
+            }
+            Form::Optimize => {
+                card(ui, &p, |ui| {
+                    ui.label(RichText::new("Objective").strong());
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.opt.maximize, false, "Minimize");
+                        ui.selectable_value(&mut self.opt.maximize, true, "Maximize");
+                    });
+                    response_combo(ui, "objective".into(), &mut self.opt.objective);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Constraints").strong());
+                    let mut remove = None;
+                    for (i, (r, le, v)) in self.opt.constraints.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            response_combo(ui, format!("con{i}"), r);
+                            ui.selectable_value(le, true, "≤");
+                            ui.selectable_value(le, false, "≥");
+                            ui.add(egui::DragValue::new(v).speed(0.1));
+                            if ui.small_button("✖").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        self.opt.constraints.remove(i);
+                    }
+                    if ui.button("＋ Add constraint").clicked() {
+                        self.opt.constraints.push(("min:safety_factor".into(), false, 2.0));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Max evaluations");
+                        ui.add(egui::DragValue::new(&mut self.opt.max_evals).range(5..=400));
+                    });
+                });
+                let ready = !busy && !self.opt.params.is_empty() && !self.opt.objective.is_empty();
+                if ui.add_enabled(ready, primary(&p, "Optimize")).clicked() {
+                    let params: Vec<Value> = self.opt.params.iter().map(|(t, lo, hi, _)| json!({"target": t, "min": lo, "max": hi})).collect();
+                    let cons: Vec<Value> = self.opt.constraints.iter().map(|(r, le, v)| json!({"response": r, "op": if *le { "<=" } else { ">=" }, "value": v})).collect();
+                    self.start_job(
+                        "optimize_design",
+                        json!({"parameters": params, "objective": {"response": self.opt.objective, "goal": if self.opt.maximize { "maximize" } else { "minimize" }}, "constraints": cons, "max_evaluations": self.opt.max_evals}),
+                    );
+                }
+            }
+            _ => {
+                card(ui, &p, |ui| {
+                    ui.label(RichText::new("Keeps the stiffest layout of material for your supports and loads. Regions under loads and supports stay solid.").color(p.weak));
+                    ui.horizontal(|ui| {
+                        ui.label("Keep");
+                        ui.add(egui::Slider::new(&mut self.opt.vf, 0.1..=0.8).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                        ui.label("of the material");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Iterations");
+                        ui.add(egui::DragValue::new(&mut self.opt.iters).range(5..=200));
+                    });
+                });
+                if ui.add_enabled(!busy, primary(&p, "Run topology")).clicked() {
+                    self.start_job("topology_optimize", json!({"volume_fraction": self.opt.vf, "iterations": self.opt.iters}));
+                }
+            }
+        }
+        if busy {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.label(RichText::new("Running — progress in the status bar").color(p.weak));
+            });
+        }
+        if let Some(e) = &self.opt.error {
+            ui.label(RichText::new(format!("✖ {e}")).color(p.err));
+        }
+    }
+
+    /// Table of study runs with the best design highlighted.
+    fn study_window(&mut self, ctx: &egui::Context) {
+        let finished = self.opt.job.as_ref().map(|job| job.lock().unwrap().take());
+        match finished {
+            Some(Some(r)) => {
+                self.opt.error = r.err();
+                self.opt.show_results = self.opt.error.is_none();
+                self.opt.job = None;
+            }
+            Some(None) => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
+            None => {}
+        }
+        let Some(st) = self.core.session.lock().unwrap().study.clone() else { return };
+        let sig = format!("{}|{}|{}", st.kind, st.message, st.seconds);
+        if sig != self.opt.seen {
+            self.opt.seen = sig;
+            self.opt.show_results = true;
+        }
+        if !self.opt.show_results {
+            return;
+        }
+        let p = self.p;
+        let mut open = true;
+        let mut actions: Vec<(String, Value)> = Vec::new();
+        let title = match st.kind.as_str() {
+            "optimization" => "🎯 Optimization results",
+            "topology" => "🦴 Topology optimization",
+            _ => "📊 Parameter study",
+        };
+        egui::Window::new(RichText::new(title).strong())
+            .open(&mut open)
+            .resizable(true)
+            .default_size(vec2(720.0, 420.0))
+            .frame(egui::Frame::window(&ctx.global_style()).fill(p.card).inner_margin(14))
+            .show(ctx, |ui| {
+                ui.label(RichText::new(&st.message).strong());
+                ui.label(RichText::new(format!("{:.1} s", st.seconds)).small().color(p.weak));
+                ui.add_space(6.0);
+                if st.kind == "topology" {
+                    egui::Grid::new("topohist").striped(true).num_columns(3).show(ui, |ui| {
+                        ui.label(RichText::new("Iteration").strong());
+                        ui.label(RichText::new("Compliance (J)").strong());
+                        ui.label(RichText::new("Volume").strong());
+                        ui.end_row();
+                        let stride = (st.history.len() / 10).max(1);
+                        for (i, c, v) in st.history.iter().step_by(stride) {
+                            ui.label(i.to_string());
+                            ui.label(render::fmt_val(*c));
+                            ui.label(format!("{:.0}%", v * 100.0));
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Show density").clicked() {
+                            actions.push(("set_display".into(), json!({"field": "density", "show_results": true})));
+                        }
+                        if let Some(path) = &st.stl_path {
+                            if ui.add(primary(&p, "Open optimized shape")).on_hover_text(path).clicked() {
+                                let mat = self.core.session.lock().unwrap().model.bodies.iter().find(|b| b.role == crate::geometry::Role::Solid).map(|b| b.material.clone()).unwrap_or_default();
+                                actions.push(("new_model".into(), json!({})));
+                                actions.push(("import_stl".into(), json!({"path": path, "name": "Optimized"})));
+                                if !mat.is_empty() {
+                                    actions.push(("set_material".into(), json!({"material": mat})));
+                                }
+                            }
+                            ui.label(RichText::new(path).small().color(p.weak));
+                        }
+                    });
+                    return;
+                }
+                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                    egui::Grid::new("studytable").striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("#").strong());
+                        for q in &st.parameters {
+                            ui.label(RichText::new(&q.target).strong().color(p.accent));
+                        }
+                        for r in &st.responses {
+                            ui.label(RichText::new(r).strong());
+                        }
+                        ui.label("");
+                        ui.end_row();
+                        for (i, run) in st.runs.iter().enumerate() {
+                            let best = st.best == Some(i);
+                            let mark = |t: String| if best { RichText::new(t).strong().color(p.ok) } else { RichText::new(t) };
+                            ui.label(mark(format!("{}{}", i + 1, if best { " ★" } else { "" })));
+                            for v in &run.values {
+                                ui.label(mark(render::fmt_val(*v)));
+                            }
+                            for v in &run.responses {
+                                ui.label(mark(v.map(render::fmt_val).unwrap_or_else(|| "—".into())));
+                            }
+                            ui.horizontal(|ui| {
+                                if st.kind == "optimization" && !run.feasible {
+                                    ui.label(RichText::new("violates").small().color(p.warn));
+                                }
+                                if let Some(e) = &run.error {
+                                    ui.label(RichText::new("failed").small().color(p.err)).on_hover_text(e);
+                                } else if ui.small_button("Apply").clicked() {
+                                    actions.push(("apply_design".into(), json!({"run": i + 1})));
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+        for (t, a) in actions {
+            self.run(&t, a);
+            if t == "import_stl" {
+                self.need_fit = true;
+            }
+        }
+        if !open {
+            self.opt.show_results = false;
+        }
+    }
+
+    /// Simulation planner: goal → to-do list from a local model (Ollama).
+    fn planner_window(&mut self, ctx: &egui::Context) {
+        if !self.planner.open {
+            return;
+        }
+        let p = self.p;
+        if self.planner.models.is_none() {
+            self.planner.models = Some(crate::assistant::list_models().map_err(|e| format!("{e:#}")));
+            if let Some(Ok(m)) = &self.planner.models {
+                self.planner.model = crate::assistant::default_model(m).unwrap_or_default();
+            }
+        }
+        // finished job?
+        let mut finished = None;
+        if let Some(job) = &self.planner.job {
+            if let Some(r) = job.lock().unwrap().take() {
+                finished = Some(r);
+            }
+        }
+        if let Some(r) = finished {
+            self.planner.job = None;
+            self.planner.error = r.err();
+        }
+        let busy = self.planner.job.is_some();
+        if busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        let plan = self.core.session.lock().unwrap().plan.clone();
+        let now = ctx.input(|i| i.time);
+        let mut open = true;
+        let mut actions: Vec<(String, Value)> = Vec::new();
+        egui::Window::new(RichText::new("✨ Simulation Planner").strong())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(vec2(620.0, 640.0))
+            .default_pos(ctx.content_rect().center() - vec2(310.0, 320.0))
+            .frame(egui::Frame::window(&ctx.global_style()).fill(p.card).inner_margin(16))
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Describe what you want to simulate. A local AI model (running on this computer through Ollama) drafts a to-do list and flags anything SimCraft cannot do yet.").color(p.weak));
+                ui.add_space(8.0);
+                ui.add(egui::TextEdit::multiline(&mut self.planner.goal).hint_text("e.g. simulate EMI on my PCB · how hot does food get in a microwave · will this bracket bend under 2 kN").desired_rows(3).desired_width(f32::INFINITY));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    match &self.planner.models {
+                        Some(Ok(models)) if !models.is_empty() => {
+                            ui.label("Model");
+                            egui::ComboBox::from_id_salt("planner-model").width(220.0).selected_text(&self.planner.model).show_ui(ui, |ui| {
+                                for m in models {
+                                    ui.selectable_value(&mut self.planner.model, m.clone(), m);
+                                }
+                            });
+                        }
+                        Some(Ok(_)) => {
+                            ui.label(RichText::new("No local models installed — run: ollama pull qwen2.5:7b").color(p.warn));
+                        }
+                        Some(Err(e)) => {
+                            ui.label(RichText::new(format!("⚠ {e}")).small().color(p.warn));
+                        }
+                        None => {}
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let ready = !busy && !self.planner.goal.trim().is_empty() && !self.planner.model.is_empty();
+                        if ui.add_enabled(ready, primary(&p, "Draft to-do list")).clicked() {
+                            let slot = Arc::new(std::sync::Mutex::new(None));
+                            let (core, goal, model, out) = (self.core.clone(), self.planner.goal.clone(), self.planner.model.clone(), slot.clone());
+                            std::thread::spawn(move || {
+                                let r = core.call("plan_simulation", &json!({"goal": goal, "model": model})).map(|_| ()).map_err(|e| format!("{e:#}"));
+                                *out.lock().unwrap() = Some(r);
+                            });
+                            self.planner.job = Some(slot);
+                            self.planner.error = None;
+                        }
+                        if busy {
+                            ui.add(egui::Spinner::new());
+                            ui.label(RichText::new(format!("Thinking locally with {}…", self.planner.model)).color(p.weak));
+                        }
+                    });
+                });
+                if let Some(e) = &self.planner.error {
+                    ui.label(RichText::new(format!("✖ {e}")).color(p.err));
+                }
+                ui.add_space(10.0);
+                let Some(plan) = plan else {
+                    return;
+                };
+                ui.separator();
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&plan.title).size(16.0).strong());
+                        let (txt, col) = match plan.feasibility.as_str() {
+                            "supported" => ("Fully supported", p.ok),
+                            "partial" => ("Partly supported", p.warn),
+                            _ => ("Not supported yet", p.err),
+                        };
+                        ui.label(RichText::new(format!(" {txt} ")).small().strong().color(Color32::WHITE).background_color(col));
+                    });
+                    ui.label(RichText::new(&plan.summary).color(p.weak));
+                    if !plan.physics.is_empty() {
+                        ui.label(RichText::new(format!("Physics: {}", plan.physics.join(" · "))).small().color(p.weak));
+                    }
+                    if let Some(a) = AnalysisType::all().into_iter().find(|a| a.key() == plan.analysis) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Start with: {}", a.label())).strong());
+                            if ui.small_button("Set up this analysis").clicked() {
+                                actions.push(("set_analysis".into(), json!({"type": a.key()})));
+                            }
+                        });
+                    }
+                    ui.add_space(8.0);
+                    let done = plan.steps.iter().filter(|s| s.done).count();
+                    ui.label(RichText::new(format!("TO-DO  ·  {done}/{} done", plan.steps.len())).size(11.0).strong().color(p.weak));
+                    for (i, st) in plan.steps.iter().enumerate() {
+                        card(ui, &p, |ui| {
+                            ui.horizontal(|ui| {
+                                let mut d = st.done;
+                                if ui.checkbox(&mut d, "").changed() {
+                                    actions.push(("set_plan_step".into(), json!({"index": i + 1, "done": d})));
+                                }
+                                let mut t = RichText::new(format!("{}. {}", i + 1, st.task)).strong();
+                                if st.done {
+                                    t = t.strikethrough().color(p.weak);
+                                }
+                                ui.add(egui::Label::new(t).wrap());
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let (b, c) = match st.status.as_str() {
+                                        "workaround" => ("workaround", p.warn),
+                                        "missing" => ("missing in SimCraft", p.err),
+                                        _ => ("ready", p.ok),
+                                    };
+                                    ui.label(RichText::new(b).small().strong().color(c));
+                                });
+                            });
+                            if !st.detail.is_empty() {
+                                ui.label(RichText::new(&st.detail).small().color(p.weak));
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                    if !plan.inputs_needed.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("YOU WILL NEED").size(11.0).strong().color(p.weak));
+                        for x in &plan.inputs_needed {
+                            ui.label(format!("• {x}"));
+                        }
+                    }
+                    if !plan.missing_capabilities.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("NOT YET IN SIMCRAFT").size(11.0).strong().color(p.err));
+                        for x in &plan.missing_capabilities {
+                            ui.label(RichText::new(format!("• {x}")).small());
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let copied = now - self.planner.copied_at < 1.8;
+                        if ui.button(if copied { "✔ Copied" } else { "📋 Copy as Markdown" }).clicked() {
+                            ui.ctx().copy_text(crate::assistant::to_markdown(&plan));
+                            self.planner.copied_at = now;
+                        }
+                        ui.label(RichText::new(format!("Drafted by {} — check the steps; small local models can be wrong.", plan.model)).small().italics().color(p.weak));
+                    });
+                });
+            });
+        for (t, a) in actions {
+            self.run(&t, a);
+        }
+        if !open {
+            self.planner.open = false;
+        }
+    }
+
+    /// "Connect an AI agent" dialog: bridge status plus copy-ready setup for MCP clients.
+    fn mcp_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_mcp {
+            return;
+        }
+        let p = self.p;
+        let exe = std::env::current_exe().map(|x| x.to_string_lossy().to_string()).unwrap_or("simcraft".into());
+        let cmd = format!("claude mcp add --scope user simcraft -- {exe} mcp");
         let js = format!("{{\n  \"mcpServers\": {{\n    \"simcraft\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"mcp\"]\n    }}\n  }}\n}}");
-        ui.code(&js);
-        if ui.button("📋  Copy JSON config").clicked() {
-            ui.ctx().copy_text(js);
-            ui.close();
+        let ok = self.bridge.starts_with("MCP bridge listening");
+        let now = ctx.input(|i| i.time);
+        let mut open = true;
+        let mut copy: Option<(&'static str, String)> = None;
+        egui::Window::new(RichText::new("Connect an AI agent").strong())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .frame(egui::Frame::window(&ctx.global_style()).fill(p.card).inner_margin(18))
+            .show(ctx, |ui| {
+                ui.set_width(560.0);
+                ui.label(RichText::new("Let Claude Code, Antigravity or any MCP client build models, run solves and look at results in this window.").color(p.weak));
+                ui.add_space(10.0);
+                // status
+                egui::Frame::new().fill(if ok { p.ok.gamma_multiply(0.12) } else { p.warn.gamma_multiply(0.12) }).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(if ok { "●" } else { "○" }).color(if ok { p.ok } else { p.warn }));
+                        ui.label(RichText::new(if ok { "Ready — agents connected to SimCraft drive this window live" } else { "Bridge offline — another SimCraft window may already be using the port" }).strong());
+                    });
+                    ui.label(RichText::new(&self.bridge).small().color(p.weak));
+                });
+                ui.add_space(14.0);
+                let mut block = |ui: &mut egui::Ui, step: &str, title: &str, hint: &str, text: &str, key: &'static str, multiline: bool| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(step).strong().color(p.accent));
+                        ui.label(RichText::new(title).strong());
+                    });
+                    ui.label(RichText::new(hint).small().color(p.weak));
+                    ui.add_space(4.0);
+                    egui::Frame::new().fill(if p.dark { Color32::from_rgb(22, 24, 28) } else { Color32::from_rgb(244, 245, 248) }).stroke(Stroke::new(1.0, p.border)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_top(|ui| {
+                            let copied = self.copied.is_some_and(|(k, t)| k == key && now - t < 1.8);
+                            let label = if copied { "✔ Copied" } else { "📋 Copy" };
+                            let btn = ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                let b = ui.add(egui::Button::new(RichText::new(label).small()).min_size(vec2(78.0, 24.0)));
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                                    let _ = multiline;
+                                    egui::ScrollArea::horizontal().id_salt(key).show(ui, |ui| {
+                                        ui.add(egui::Label::new(RichText::new(text).monospace().size(12.0)).extend());
+                                    });
+                                });
+                                b
+                            });
+                            if btn.inner.clicked() {
+                                copy = Some((key, text.to_string()));
+                            }
+                        });
+                    });
+                    ui.add_space(14.0);
+                };
+                block(ui, "1", "Claude Code", "Run once in a terminal; SimCraft is then available in every Claude Code session.", &cmd, "claude", false);
+                block(ui, "2", "Antigravity, Cursor and other MCP clients", "Paste into the client's MCP config (Antigravity: Agent panel ▸ ⋯ ▸ MCP Servers ▸ Manage ▸ View raw config).", &js, "json", true);
+                ui.label(RichText::new("Try asking: “In SimCraft, make an aluminium bracket with a hole, fix one end, load the other and show me the stress.”").small().italics().color(p.weak));
+            });
+        if let Some((k, t)) = copy {
+            ctx.copy_text(t);
+            self.copied = Some((k, now));
+            ctx.request_repaint_after(std::time::Duration::from_millis(1900));
+        }
+        if !open {
+            self.show_mcp = false;
         }
     }
 
@@ -543,7 +1281,7 @@ impl SimApp {
         let p = self.p;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 18.0;
-            for (t, name) in [(Tab::Geometry, "GEOMETRY"), (Tab::Material, "MATERIAL"), (Tab::Setup, "SETUP"), (Tab::Mesh, "MESH"), (Tab::Solve, "SOLVE"), (Tab::Results, "RESULTS")] {
+            for (t, name) in [(Tab::Geometry, "GEOMETRY"), (Tab::Material, "MATERIAL"), (Tab::Setup, "SETUP"), (Tab::Mesh, "MESH"), (Tab::Solve, "SOLVE"), (Tab::Results, "RESULTS"), (Tab::Optimize, "OPTIMIZE")] {
                 let on = self.tab == t;
                 let r = ui.add(egui::Label::new(RichText::new(name).size(12.0).strong().color(if on { p.accent } else { p.weak })).sense(Sense::click()));
                 if on {
@@ -587,6 +1325,12 @@ impl SimApp {
                     if tool(ui, &p, "📂", "Import STL", Some(p.weak), true) {
                         self.import_stl();
                     }
+                    if tool(ui, &p, "🟩", "KiCad PCB", Some(Color32::from_rgb(70, 160, 90)), true) {
+                        self.import_kicad();
+                    }
+                    if tool(ui, &p, "⬚", "Enclosure", Some(Color32::from_rgb(90, 170, 230)), true) {
+                        self.form = Form::Enclosure;
+                    }
                 });
             }
             Tab::Material => {
@@ -629,35 +1373,44 @@ impl SimApp {
                     ui.vertical(|ui| {
                         ui.add_space(12.0);
                         let mut k = kind;
-                        egui::ComboBox::from_id_salt("analysis").width(180.0).selected_text(k.label()).show_ui(ui, |ui| {
+                        egui::ComboBox::from_id_salt("analysis").width(230.0).selected_text(k.label()).height(520.0).show_ui(ui, |ui| {
+                            let mut last = "";
                             for a in AnalysisType::all() {
+                                if a.group() != last {
+                                    last = a.group();
+                                    ui.label(RichText::new(last.to_uppercase()).size(10.0).strong().color(p.weak));
+                                }
                                 ui.selectable_value(&mut k, a, a.label());
                             }
                         });
                         if k != kind {
-                            self.run("set_analysis", json!({"type": serde_json::to_value(k).unwrap()}));
+                            self.run("set_analysis", json!({"type": k.key()}));
                         }
                     });
                 });
-                group(ui, &p, "STRUCTURAL", |ui| {
-                    for lk in [LoadKind::Fixed, LoadKind::Displacement, LoadKind::Force, LoadKind::Pressure, LoadKind::Gravity] {
-                        let en = match kind {
-                            AnalysisType::SteadyThermal => false,
-                            AnalysisType::Modal => matches!(lk, LoadKind::Fixed | LoadKind::Displacement),
-                            _ => true,
-                        };
-                        if tool(ui, &p, lk.icon(), lk.label(), Some(lk.color()), en) {
-                            self.form = Form::Load(lk);
-                        }
+                for (name, kinds) in [("STRUCTURAL", &LoadKind::STRUCTURAL[..]), ("THERMAL", &LoadKind::THERMAL[..]), ("ELECTROMAGNETIC", &LoadKind::ELECTRO[..]), ("FLUID", &LoadKind::FLUID[..])] {
+                    let usable: Vec<LoadKind> = kinds.iter().copied().filter(|k| k.applies(kind)).collect();
+                    let cfd = matches!(kind, AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer);
+                    if usable.is_empty() || name == "FLUID" && !cfd || name == "STRUCTURAL" && cfd {
+                        continue;
                     }
-                });
-                group(ui, &p, "THERMAL", |ui| {
-                    for lk in [LoadKind::Temperature, LoadKind::HeatFlux, LoadKind::Convection, LoadKind::HeatGen] {
-                        if tool(ui, &p, lk.icon(), lk.label(), Some(lk.color()), kind.thermal()) {
-                            self.form = Form::Load(lk);
+                    group(ui, &p, name, |ui| {
+                        for lk in usable {
+                            if tool(ui, &p, lk.icon(), lk.label(), Some(lk.color()), true) {
+                                self.form = Form::Load(lk);
+                            }
                         }
-                    }
-                });
+                    });
+                }
+                if kind.requires_enclosure() && !self.core.session.lock().unwrap().model.has_enclosure() {
+                    ui.vertical(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(RichText::new("⚠ This analysis needs an enclosure").color(p.warn));
+                        if ui.button("⬚  Add enclosure").clicked() {
+                            self.form = Form::Enclosure;
+                        }
+                    });
+                }
             }
             Tab::Mesh => {
                 group(ui, &p, "ELEMENT SIZE", |ui| {
@@ -699,6 +1452,72 @@ impl SimApp {
                     ui.vertical(|ui| {
                         ui.add_space(4.0);
                         ui.label(RichText::new(kind.label()).strong());
+                        let st = self.core.session.lock().unwrap().model.analysis.clone();
+                        let num = |ui: &mut egui::Ui, label: &str, v: f64, key: &str, speed: f64, suffix: &str, run: &mut Vec<(String, f64)>| {
+                            let mut x = v;
+                            ui.horizontal(|ui| {
+                                ui.label(label);
+                                if ui.add(egui::DragValue::new(&mut x).speed(speed).suffix(suffix.to_string())).changed() {
+                                    run.push((key.to_string(), x));
+                                }
+                            });
+                        };
+                        let mut changes: Vec<(String, f64)> = Vec::new();
+                        if kind.transient() {
+                            num(ui, "End time", st.end_time, "end_time", st.end_time * 0.02, " s", &mut changes);
+                            num(ui, "Time steps", st.time_steps as f64, "time_steps", 1.0, "", &mut changes);
+                        }
+                        if matches!(kind, AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating) {
+                            num(ui, "Frequency", st.frequency_hz / 1e9, "frequency_ghz", 0.01, " GHz", &mut changes);
+                            num(ui, "Max RF periods", st.max_periods as f64, "max_periods", 10.0, "", &mut changes);
+                        }
+                        if matches!(kind, AnalysisType::TransientThermal | AnalysisType::MicrowaveHeating) {
+                            num(ui, "Initial temp.", st.initial_temperature, "initial_temperature", 0.5, " °C", &mut changes);
+                        }
+                        if matches!(kind, AnalysisType::TransientStructural | AnalysisType::HarmonicResponse | AnalysisType::ResponseSpectrum | AnalysisType::RandomVibration) {
+                            num(ui, "Damping ratio", st.damping_ratio, "damping_ratio", 0.005, "", &mut changes);
+                        }
+                        if kind == AnalysisType::NonlinearStructural {
+                            num(ui, "Load steps", st.load_steps as f64, "load_steps", 1.0, "", &mut changes);
+                        }
+                        if matches!(kind, AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer) {
+                            ui.horizontal(|ui| {
+                                ui.label("Turbulence");
+                                for (t, l, tip) in [("laminar", "Laminar", "Low speeds, small gaps (Re below ~2000)"), ("lvel", "LVEL", "Algebraic turbulence model for electronics enclosures, fans and ducts")] {
+                                    if ui.selectable_label(st.turbulence == t, l).on_hover_text(tip).clicked() && st.turbulence != t {
+                                        self.run("set_analysis", json!({"turbulence": t}));
+                                    }
+                                }
+                            });
+                        }
+                        if matches!(kind, AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer) {
+                            num(ui, "Max iterations", st.max_iterations as f64, "max_iterations", 50.0, "", &mut changes);
+                        }
+                        if kind == AnalysisType::LinearBuckling {
+                            num(ui, "Buckling modes", st.modes as f64, "modes", 1.0, "", &mut changes);
+                        }
+                        if kind == AnalysisType::HarmonicResponse {
+                            num(ui, "From (0 = auto)", st.freq_min.unwrap_or(0.0), "freq_min", 1.0, " Hz", &mut changes);
+                            num(ui, "To (0 = auto)", st.freq_max.unwrap_or(0.0), "freq_max", 10.0, " Hz", &mut changes);
+                            num(ui, "Frequency points", st.freq_steps as f64, "freq_steps", 5.0, "", &mut changes);
+                        }
+                        for (k, v) in changes {
+                            self.run("set_analysis", json!({ k: v }));
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Compute");
+                            let cur = st.compute;
+                            for (m, label, tip) in [
+                                (crate::gpu::ComputeMode::Auto, "Auto", "CPU direct solver for small/medium models, GPU for large iterative solves"),
+                                (crate::gpu::ComputeMode::Cpu, "CPU", "Never use the GPU"),
+                                (crate::gpu::ComputeMode::Gpu, "GPU", "Run every linear solve on the GPU (falls back to CPU if unavailable)"),
+                            ] {
+                                if ui.selectable_label(cur == m, label).on_hover_text(tip).clicked() && cur != m {
+                                    let key = serde_json::to_value(m).unwrap();
+                                    self.run("set_analysis", json!({"compute": key}));
+                                }
+                            }
+                        });
                         if kind == AnalysisType::Modal {
                             let mut m = self.core.session.lock().unwrap().model.analysis.modes as u32;
                             ui.horizontal(|ui| {
@@ -707,6 +1526,37 @@ impl SimApp {
                                     self.run("set_analysis", json!({"modes": m}));
                                 }
                             });
+                        }
+                        if matches!(kind, AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating) {
+                            ui.horizontal(|ui| {
+                                ui.label("Outer boundary");
+                                for (b, l, tip) in [("pec", "Metal cavity", "The enclosure walls are metal (microwave oven, shielded box)"), ("open", "Open", "Absorbing boundary: waves leave the enclosure (antennas, radiated emissions)")] {
+                                    if ui.selectable_label(st.em_boundary == b, l).on_hover_text(tip).clicked() && st.em_boundary != b {
+                                        self.run("set_analysis", json!({"em_boundary": b}));
+                                    }
+                                }
+                            });
+                        }
+                        if matches!(kind, AnalysisType::ResponseSpectrum | AnalysisType::RandomVibration) {
+                            let dir = serde_json::to_value(st.direction).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+                            ui.horizontal(|ui| {
+                                ui.label("Base direction");
+                                for d in ["x", "y", "z"] {
+                                    if ui.selectable_label(dir == d, d.to_uppercase()).clicked() && dir != d {
+                                        self.run("set_analysis", json!({"direction": d}));
+                                    }
+                                }
+                            });
+                            if kind == AnalysisType::ResponseSpectrum {
+                                ui.horizontal(|ui| {
+                                    ui.label("Combination");
+                                    for (c, tip) in [("srss", "Square root of sum of squares (well-separated modes)"), ("cqc", "Complete quadratic combination (closely spaced modes)")] {
+                                        if ui.selectable_label(st.combination == c, c.to_uppercase()).on_hover_text(tip).clicked() && st.combination != c {
+                                            self.run("set_analysis", json!({"combination": c}));
+                                        }
+                                    }
+                                });
+                            }
                         }
                         if kind == AnalysisType::ThermalStress {
                             let mut t = self.core.session.lock().unwrap().model.analysis.reference_temperature;
@@ -719,9 +1569,144 @@ impl SimApp {
                         }
                     });
                 });
+                if matches!(kind, AnalysisType::ResponseSpectrum | AnalysisType::RandomVibration) {
+                    let (st_table, spectrum) = (self.core.session.lock().unwrap().model.analysis.table.clone(), kind == AnalysisType::ResponseSpectrum);
+                    if st_table != self.f.table_src {
+                        self.f.table_text = st_table.iter().map(|r| format!("{} {}", r[0], r[1])).collect::<Vec<_>>().join("\n");
+                        self.f.table_src = st_table;
+                    }
+                    group(ui, &p, if spectrum { "SPECTRUM (Hz  g)" } else { "PSD (Hz  g²/Hz)" }, |ui| {
+                        ui.horizontal(|ui| {
+                            egui::ScrollArea::vertical().id_salt("table").max_height(62.0).show(ui, |ui| {
+                                ui.add(egui::TextEdit::multiline(&mut self.f.table_text).desired_width(150.0).desired_rows(3).font(egui::TextStyle::Monospace).hint_text("10 0.01\n2000 0.01"));
+                            });
+                            ui.vertical(|ui| {
+                                if ui.button("Apply").on_hover_text("One 'frequency value' pair per line; log-log interpolated").clicked() {
+                                    let pts: Result<Vec<[f64; 2]>, String> = self
+                                        .f
+                                        .table_text
+                                        .lines()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .map(|l| {
+                                            let v: Vec<f64> = l.split(|c: char| c == ',' || c.is_whitespace()).filter(|x| !x.is_empty()).map(|x| x.parse::<f64>()).collect::<Result<_, _>>().map_err(|_| format!("bad number in '{l}'"))?;
+                                            if v.len() != 2 { Err(format!("'{l}': need frequency and value")) } else { Ok([v[0], v[1]]) }
+                                        })
+                                        .collect();
+                                    match pts {
+                                        Ok(pts) => {
+                                            self.run("set_analysis", json!({"table": pts}));
+                                        }
+                                        Err(e) => self.toast = Some((e, true, 6.0)),
+                                    }
+                                }
+                                if ui.button("Example").on_hover_text(if spectrum { "Flat 1 g spectrum" } else { "NAVMAT-style 6 Grms profile" }).clicked() {
+                                    let ex = if spectrum { json!([[1, 1.0], [10000, 1.0]]) } else { json!([[20, 0.01], [80, 0.04], [350, 0.04], [2000, 0.007]]) };
+                                    self.run("set_analysis", json!({"table": ex}));
+                                }
+                            });
+                        });
+                    });
+                }
             }
             Tab::Results => self.results_ribbon(ui),
+            Tab::Optimize => {
+                let kind = self.core.session.lock().unwrap().model.analysis.kind;
+                group(ui, &p, "STUDIES", |ui| {
+                    if tool(ui, &p, "📊", "Parameters", None, true) {
+                        self.form = Form::Study;
+                    }
+                    if tool(ui, &p, "🎯", "Optimize", None, true) {
+                        self.form = Form::Optimize;
+                    }
+                });
+                group(ui, &p, "SHAPE", |ui| {
+                    if tool(ui, &p, "🦴", "Topology", Some(Color32::from_rgb(120, 170, 255)), kind == AnalysisType::StaticStructural) {
+                        self.form = Form::Topology;
+                    }
+                });
+                group(ui, &p, "RESULTS", |ui| {
+                    let has = self.core.session.lock().unwrap().study.is_some();
+                    if tool(ui, &p, "📋", "Study results", Some(p.weak), has) {
+                        self.opt.show_results = true;
+                    }
+                });
+            }
         });
+    }
+
+    fn fatigue_window(&mut self, ctx: &egui::Context) {
+        if !self.f.fat_open {
+            return;
+        }
+        let kind = self.core.session.lock().unwrap().results.as_ref().map(|r| r.analysis);
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new("Fatigue (stress-life)").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            let f = &mut self.f;
+            match kind {
+                Some(AnalysisType::RandomVibration) => {
+                    ui.label("Random vibration: Steinberg 3-band method (1σ / 2σ / 3σ).");
+                    ui.horizontal(|ui| {
+                        ui.label("Exposure time");
+                        ui.add(egui::DragValue::new(&mut f.fat_exposure_h).speed(0.1).range(0.001..=1e6).suffix(" h"));
+                    });
+                }
+                Some(AnalysisType::HarmonicResponse | AnalysisType::ResponseSpectrum) => {
+                    ui.label("Stresses are amplitudes: treated as fully reversed cycles.");
+                    ui.horizontal(|ui| {
+                        ui.label("Design life");
+                        let sp = f.fat_life * 0.01;
+                        ui.add(egui::DragValue::new(&mut f.fat_life).speed(sp).range(1.0..=1e12).suffix(" cycles"));
+                    });
+                }
+                _ => {
+                    ui.label("The solved load is applied cyclically.");
+                    ui.horizontal(|ui| {
+                        ui.label("Loading");
+                        for (k, l) in [("fully_reversed", "Fully reversed"), ("zero_based", "Zero-based"), ("ratio", "Ratio R")] {
+                            ui.selectable_value(&mut f.fat_loading, k.to_string(), l);
+                        }
+                    });
+                    if f.fat_loading == "ratio" {
+                        ui.horizontal(|ui| {
+                            ui.label("R = σmin/σmax");
+                            ui.add(egui::DragValue::new(&mut f.fat_ratio).speed(0.01).range(-5.0..=0.99));
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Mean stress");
+                        for k in ["goodman", "gerber", "soderberg", "none"] {
+                            let l = format!("{}{}", k[..1].to_uppercase(), &k[1..]);
+                            ui.selectable_value(&mut f.fat_correction, k.to_string(), l);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Design life");
+                        let sp = f.fat_life * 0.01;
+                        ui.add(egui::DragValue::new(&mut f.fat_life).speed(sp).range(1.0..=1e12).suffix(" cycles"));
+                    });
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("Load scale");
+                ui.add(egui::DragValue::new(&mut f.fat_scale).speed(0.01).range(0.001..=1000.0).prefix("× "));
+            });
+            ui.label(RichText::new("S-N data comes from the material (σf', b, endurance limit); missing values are estimated from the ultimate strength.").small().weak());
+            ui.add_space(4.0);
+            go = ui.button("Evaluate fatigue").clicked();
+        });
+        if go {
+            let f = &self.f;
+            let ok = self.run(
+                "fatigue_life",
+                json!({"loading": f.fat_loading, "ratio": f.fat_ratio, "correction": f.fat_correction, "scale": f.fat_scale, "design_life": f.fat_life, "exposure_time_s": f.fat_exposure_h * 3600.0}),
+            );
+            if ok {
+                self.toast = Some(("Fatigue evaluated — showing the fatigue safety factor".into(), false, 3.5));
+                open = false;
+            }
+        }
+        self.f.fat_open = open && self.f.fat_open;
     }
 
     fn results_ribbon(&mut self, ui: &mut egui::Ui) {
@@ -735,10 +1720,14 @@ impl SimApp {
             ui.label(RichText::new("No results yet — open SOLVE and press Solve.").color(p.weak));
             return;
         };
-        let groups: [(&str, &[(Field, &str, &str)]); 3] = [
+        let groups: [(&str, &[(Field, &str, &str)]); 7] = [
             ("DEFORMATION", &[(Field::TotalDeformation, "📐", "Total"), (Field::DeformationX, "X", "Dir. X"), (Field::DeformationY, "Y", "Dir. Y"), (Field::DeformationZ, "Z", "Dir. Z")]),
-            ("STRESS", &[(Field::VonMises, "🔶", "Von Mises"), (Field::MaxPrincipal, "⬆", "Max Princ."), (Field::MinPrincipal, "⬇", "Min Princ."), (Field::SafetyFactor, "🛡", "Safety")]),
+            ("STRESS", &[(Field::VonMises, "🔶", "Von Mises"), (Field::MaxPrincipal, "⬆", "Max Princ."), (Field::MinPrincipal, "⬇", "Min Princ."), (Field::SafetyFactor, "🛡", "Safety"), (Field::PlasticStrain, "〰", "Plastic ε")]),
             ("THERMAL", &[(Field::Temperature, "🌡", "Temperature"), (Field::HeatFlux, "☀", "Heat Flux")]),
+            ("ELECTRIC", &[(Field::ElectricPotential, "⚡", "Potential"), (Field::ElectricField, "↯", "E-Field"), (Field::CurrentDensity, "🔌", "Current"), (Field::JouleHeat, "🔥", "Joule Heat")]),
+            ("RF", &[(Field::AbsorbedPower, "♨", "Absorbed"), (Field::Sar, "🩺", "SAR")]),
+            ("MAGNETIC", &[(Field::MagneticFluxDensity, "🧲", "B Field"), (Field::MagneticFieldIntensity, "🌀", "H Field")]),
+            ("FLUID", &[(Field::Velocity, "💨", "Velocity"), (Field::VelocityX, "X", "Vx"), (Field::VelocityY, "Y", "Vy"), (Field::VelocityZ, "Z", "Vz"), (Field::FluidPressure, "⏲", "Pressure")]),
         ];
         for (g, fields) in groups {
             if !fields.iter().any(|f| r.has(f.0)) {
@@ -754,13 +1743,63 @@ impl SimApp {
                 }
             });
         }
+        if r.stress.is_some() {
+            group(ui, &p, "FATIGUE", |ui| {
+                for (f, icon, label) in [(Field::FatigueSafety, "🛡", "Safety"), (Field::FatigueLife, "⏳", "Life"), (Field::FatigueDamage, "💥", "Damage")] {
+                    if r.has(f) {
+                        let on = disp.field == f && disp.show_results;
+                        if tool(ui, &p, icon, label, Some(if on { p.accent } else { p.weak }), true) {
+                            self.run("set_display", json!({"field": f.key(), "show_results": true}));
+                        }
+                    }
+                }
+                if tool(ui, &p, "🔁", "Evaluate", None, true) {
+                    self.f.fat_open = true;
+                }
+            });
+        }
+        group(ui, &p, "EXPORT", |ui| {
+            if tool(ui, &p, "📄", "Report", None, true) {
+                if let Some(path) = rfd::FileDialog::new().add_filter("HTML report", &["html"]).set_file_name("simcraft-report.html").save_file() {
+                    self.run("make_report", json!({"path": path.to_string_lossy()}));
+                }
+            }
+        });
         group(ui, &p, "VIEW", |ui| {
             ui.vertical(|ui| {
-                if r.analysis == AnalysisType::Modal {
-                    egui::ComboBox::from_id_salt("mode").width(160.0).selected_text(format!("Mode {} — {:.2} Hz", disp.mode + 1, r.modes.get(disp.mode).map(|m| m.frequency_hz).unwrap_or(0.0))).show_ui(ui, |ui| {
-                        for (i, m) in r.modes.iter().enumerate() {
-                            if ui.selectable_label(disp.mode == i, format!("Mode {} — {:.2} Hz", i + 1, m.frequency_hz)).clicked() {
+                let steps = r.n_steps();
+                if !r.modes.is_empty() {
+                    egui::ComboBox::from_id_salt("mode").width(190.0).selected_text(r.step_label(disp.mode)).show_ui(ui, |ui| {
+                        for i in 0..steps {
+                            if ui.selectable_label(disp.mode == i, r.step_label(i)).clicked() {
                                 self.run("set_display", json!({"mode": i + 1}));
+                            }
+                        }
+                    });
+                } else if steps > 1 {
+                    let mut i = disp.mode.min(steps - 1);
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Slider::new(&mut i, 0..=steps - 1).show_value(false)).changed() {
+                            self.run("set_display", json!({"mode": i + 1}));
+                        }
+                        ui.label(RichText::new(r.step_label(i)).small());
+                    });
+                }
+                if self.core.session.lock().unwrap().mesh.as_ref().is_some_and(|m| m.with_enclosure) || disp.section.is_some() {
+                    ui.horizontal(|ui| {
+                        let mut on = disp.section.is_some();
+                        if ui.checkbox(&mut on, "Cut plane").changed() {
+                            self.run("set_display", json!({"section": if on { "y" } else { "off" }}));
+                        }
+                        if let Some(sec) = disp.section {
+                            for (ax, name) in ["x", "y", "z"].iter().enumerate() {
+                                if ui.selectable_label(sec.axis == ax, name.to_uppercase()).clicked() {
+                                    self.run("set_display", json!({"section": name, "section_position": sec.position}));
+                                }
+                            }
+                            let mut pos = sec.position;
+                            if ui.add(egui::Slider::new(&mut pos, 0.0..=1.0).show_value(false)).changed() {
+                                self.run("set_display", json!({"section_position": pos}));
                             }
                         }
                     });
@@ -797,6 +1836,28 @@ impl SimApp {
         }
     }
 
+    fn import_kicad(&mut self) {
+        if let Some(p) = rfd::FileDialog::new().add_filter("KiCad board", &["kicad_pcb"]).pick_file() {
+            let path = p.to_string_lossy().to_string();
+            match self.core.call("import_kicad", &json!({"path": path})) {
+                Ok(o) => {
+                    let v: Value = serde_json::from_str(&o.text).unwrap_or(Value::Null);
+                    let parts = v["components"].as_array().map(|a| a.len()).unwrap_or(0);
+                    let warn = v["warnings"].as_array().and_then(|w| w.first()).and_then(|w| w.as_str()).map(|w| format!(" ⚠ {w}")).unwrap_or_default();
+                    self.toast = Some((format!("Imported {} × {} mm board with {parts} components. Add Heat Generation (W) on the parts and a convection or airflow boundary.{warn}", v["size_mm"][0], v["size_mm"][1]), !warn.is_empty(), 8.0));
+                    // the copper must be resolved through the thickness: suggest ≤ half the board
+                    let t = v["thickness_mm"].as_f64().unwrap_or(1.6);
+                    let cur = self.core.session.lock().unwrap().model.element_size;
+                    if cur.is_none_or(|h| h > t / 2.0) {
+                        self.run("set_mesh", json!({"element_size_mm": (t / 2.0 * 10.0).floor() / 10.0}));
+                        self.f.mesh_size = (t / 2.0 * 10.0).floor() / 10.0;
+                    }
+                }
+                Err(e) => self.toast = Some((format!("{e:#}"), true, 8.0)),
+            }
+            self.need_fit = true;
+        }
+    }
     fn import_stl(&mut self) {
         if let Some(p) = rfd::FileDialog::new().add_filter("STL", &["stl", "STL"]).pick_file() {
             self.run("import_stl", json!({"path": p.to_string_lossy()}));
@@ -918,16 +1979,25 @@ impl SimApp {
                             });
                         }
                     }
-                    for (i, md) in r.modes.iter().enumerate() {
-                        if ui.link(format!("Mode {} — {:.2} Hz", i + 1, md.frequency_hz)).clicked() {
+                    for i in 0..r.modes.len() {
+                        if ui.link(r.step_label(i)).clicked() {
                             self.run("set_display", json!({"mode": i + 1, "show_results": true}));
                         }
                     }
+                    for qn in &r.quantities {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(RichText::new(&qn.name).small()).truncate());
+                            ui.label(RichText::new(format!("{} {}", render::fmt_val(qn.value), qn.unit)).small().strong());
+                        });
+                    }
                     for rc in &r.reactions {
-                        let t = if r.analysis == AnalysisType::SteadyThermal {
-                            format!("#{} heat flow {:.4} W", rc.load_id, rc.value[0])
-                        } else {
-                            format!("#{} reaction ({:.1}, {:.1}, {:.1}) N", rc.load_id, rc.value[0], rc.value[1], rc.value[2])
+                        use AnalysisType::*;
+                        let t = match r.analysis {
+                            SteadyThermal | TransientThermal => format!("#{} heat flow {:.4} W", rc.load_id, rc.value[0]),
+                            Electrostatic => format!("#{} charge {} C", rc.load_id, render::fmt_val(rc.value[0])),
+                            CurrentFlow | ThermalElectric => format!("#{} current {} A", rc.load_id, render::fmt_val(rc.value[0])),
+                            Fluid => format!("#{} flow {} m³/s, p̄ {} Pa", rc.load_id, render::fmt_val(rc.value[0]), render::fmt_val(rc.value[1])),
+                            _ => format!("#{} reaction ({:.1}, {:.1}, {:.1}) N", rc.load_id, rc.value[0], rc.value[1], rc.value[2]),
                         };
                         ui.label(RichText::new(t).small().color(p.weak));
                     }
@@ -1067,6 +2137,30 @@ impl SimApp {
                 }
             }
             Form::Load(k) => self.load_form(ui, k, mesh.as_ref()),
+            Form::Study | Form::Optimize | Form::Topology => {
+                let f = self.form;
+                self.opt_form(ui, f);
+            }
+            Form::Enclosure => {
+                ui.heading("Enclosure");
+                card(ui, &p, |ui| {
+                    ui.label(RichText::new("The air or fluid region around your parts, used by electrostatic, magnetostatic and fluid-flow analyses.").color(p.weak));
+                    ui.horizontal(|ui| {
+                        ui.label("Fluid");
+                        for f in ["Air", "Water", "Engine Oil (SAE 30)"] {
+                            ui.selectable_value(&mut self.f.fluid, f.to_string(), f.split(' ').next().unwrap());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Padding");
+                        ui.add(egui::Slider::new(&mut self.f.padding, 0.1..=3.0).suffix("× part size"));
+                    });
+                });
+                ui.add_space(8.0);
+                if ui.add(primary(&p, "Create")).clicked() && self.run("add_enclosure", json!({"material": self.f.fluid, "padding": self.f.padding})) {
+                    self.need_fit = true;
+                }
+            }
         }
         if self.form != Form::None {
             ui.add_space(4.0);
@@ -1083,6 +2177,21 @@ impl SimApp {
             ui.heading(k.title());
         });
         let sel = self.selected_names(mesh);
+        if k.needs_body() {
+            let bodies: Vec<String> = self.core.session.lock().unwrap().model.bodies.iter().filter(|b| b.role == crate::geometry::Role::Solid && b.op == Op::Add).map(|b| b.name.clone()).collect();
+            if !bodies.contains(&self.f.body) {
+                self.f.body = bodies.first().cloned().unwrap_or_default();
+            }
+            card(ui, &p, |ui| {
+                ui.label(RichText::new("Body").strong());
+                egui::ComboBox::from_id_salt("loadbody").width(200.0).selected_text(&self.f.body).show_ui(ui, |ui| {
+                    for b in &bodies {
+                        ui.selectable_value(&mut self.f.body, b.clone(), b);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+        }
         if k.needs_faces() {
             card(ui, &p, |ui| {
                 ui.label(RichText::new("Scope").strong());
@@ -1148,12 +2257,90 @@ impl SimApp {
                     });
                 }
                 LoadKind::HeatGen => {
-                    ui.add(egui::DragValue::new(&mut self.f.value).speed(1000.0).suffix(" W/m³"));
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.f.heat_watts, true, "Total power");
+                        ui.selectable_value(&mut self.f.heat_watts, false, "Power density");
+                    });
+                    if self.f.heat_watts {
+                        ui.add(egui::DragValue::new(&mut self.f.heat_power).speed(0.1).range(0.0..=1e9).suffix(" W"));
+                    } else {
+                        ui.add(egui::DragValue::new(&mut self.f.value).speed(1000.0).suffix(" W/m³"));
+                    }
+                    let bodies: Vec<String> = self.core.session.lock().unwrap().model.bodies.iter().filter(|b| b.role == crate::geometry::Role::Solid && b.op == Op::Add).map(|b| b.name.clone()).collect();
+                    ui.horizontal(|ui| {
+                        ui.label("In");
+                        let shown = if self.f.heat_body.is_empty() { "Whole model".to_string() } else { self.f.heat_body.clone() };
+                        egui::ComboBox::from_id_salt("heatbody").width(170.0).selected_text(shown).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.f.heat_body, String::new(), "Whole model");
+                            for b in &bodies {
+                                ui.selectable_value(&mut self.f.heat_body, b.clone(), b);
+                            }
+                        });
+                    });
+                    ui.label(RichText::new(if self.f.heat_watts { "Spread evenly over the body's volume." } else { "Power [W] = value × volume (e.g. 2 W in a 10×10×2 mm chip = 10⁷ W/m³)." }).small().color(p.weak));
+                }
+                LoadKind::CompressionOnly => {
+                    ui.label(RichText::new("Rests on a rigid surface: pushes are resisted, pulling lifts off (frictionless).").color(p.weak));
+                }
+                LoadKind::Symmetry => {
+                    ui.label(RichText::new("Structural: zero normal motion. Fluid: free-slip wall.").color(p.weak));
+                }
+                LoadKind::Voltage => {
+                    ui.add(egui::DragValue::new(&mut self.f.value).speed(0.1).suffix(" V"));
+                }
+                LoadKind::Current => {
+                    ui.add(egui::DragValue::new(&mut self.f.value).speed(0.1).suffix(" A"));
+                    ui.label(RichText::new("Enters the body through the faces; ground another face with 0 V.").small().color(p.weak));
+                }
+                LoadKind::Coil => {
+                    ui.add(egui::DragValue::new(&mut self.f.value).speed(0.1).suffix(" A/mm²"));
+                    ui.horizontal(|ui| {
+                        ui.label("Axis");
+                        for (i, a) in ["X", "Y", "Z"].iter().enumerate() {
+                            ui.selectable_value(&mut self.f.coil_axis, i, *a);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.f.coil_axial, false, "Around axis (winding)");
+                        ui.selectable_value(&mut self.f.coil_axial, true, "Along axis (bar)");
+                    });
+                }
+                LoadKind::Magnet => {
+                    ui.label(RichText::new("Remanence Br (T)").small().color(p.weak));
+                    xyz(ui, "br", &mut self.f.remanence, "", 0.05);
+                }
+                LoadKind::Inlet => {
+                    ui.add(egui::DragValue::new(&mut self.f.velocity).speed(0.01).suffix(" m/s"));
+                    ui.label(RichText::new("Uniform velocity into the domain.").small().color(p.weak));
+                    if self.core.session.lock().unwrap().model.analysis.kind == AnalysisType::ConjugateHeatTransfer {
+                        ui.horizontal(|ui| {
+                            ui.label("Inflow temperature");
+                            ui.add(egui::DragValue::new(&mut self.f.ambient).speed(0.5).suffix(" °C"));
+                        });
+                    }
+                }
+                LoadKind::MovingWall => {
+                    ui.label(RichText::new("Wall velocity (m/s), tangential to the faces").small().color(p.weak));
+                    xyz(ui, "mw", &mut self.f.wall_v, " m/s", 0.01);
+                }
+                LoadKind::Outlet => {
+                    ui.add(egui::DragValue::new(&mut self.f.outlet_p).speed(1.0).suffix(" Pa"));
+                }
+                LoadKind::Port => {
+                    ui.add(egui::DragValue::new(&mut self.f.port_power).speed(5.0).range(0.001..=1e7).suffix(" W"));
+                    ui.horizontal(|ui| {
+                        ui.label("E-field along");
+                        for (i, a) in ["X", "Y", "Z"].iter().enumerate() {
+                            ui.selectable_value(&mut self.f.port_pol, i, *a);
+                        }
+                    });
+                    ui.checkbox(&mut self.f.port_te10, "Waveguide (TE10) profile");
+                    ui.label(RichText::new("Pick the feed opening, usually an Enclosure wall face. The E-field direction must lie in the face (WR-340: along its short side).").small().color(p.weak));
                 }
             }
         });
         ui.add_space(8.0);
-        let ready = !k.needs_faces() || !sel.is_empty();
+        let ready = (!k.needs_faces() || !sel.is_empty()) && (!k.needs_body() || !self.f.body.is_empty());
         if ui.add_enabled(ready, primary(&p, "Apply")).clicked() {
             let fa = json!(sel);
             let (tool, args) = match k {
@@ -1173,7 +2360,29 @@ impl SimApp {
                 LoadKind::Temperature => ("add_temperature", json!({"faces": fa, "value": self.f.value})),
                 LoadKind::HeatFlux => ("add_heat_flux", json!({"faces": fa, "value": self.f.value})),
                 LoadKind::Convection => ("add_convection", json!({"faces": fa, "coefficient": self.f.coef, "ambient": self.f.ambient})),
-                LoadKind::HeatGen => ("add_heat_generation", json!({"value": self.f.value})),
+                LoadKind::HeatGen => {
+                    if self.f.heat_watts {
+                        ("add_heat_generation", json!({"power": self.f.heat_power, "body": self.f.heat_body}))
+                    } else {
+                        ("add_heat_generation", json!({"value": self.f.value, "body": self.f.heat_body}))
+                    }
+                }
+                LoadKind::CompressionOnly => ("add_compression_only_support", json!({"faces": fa})),
+                LoadKind::Symmetry => ("add_symmetry", json!({"faces": fa})),
+                LoadKind::Voltage => ("add_voltage", json!({"faces": fa, "value": self.f.value})),
+                LoadKind::Current => ("add_current", json!({"faces": fa, "value": self.f.value})),
+                LoadKind::Coil => ("add_coil", json!({"body": self.f.body, "current_density": self.f.value, "axis": (["x", "y", "z"])[self.f.coil_axis], "mode": (if self.f.coil_axial { "axial" } else { "circumferential" })})),
+                LoadKind::Magnet => ("add_magnet", json!({"body": self.f.body, "remanence": self.f.remanence})),
+                LoadKind::Inlet => {
+                    let mut a = json!({"faces": fa, "velocity": self.f.velocity});
+                    if self.core.session.lock().unwrap().model.analysis.kind == AnalysisType::ConjugateHeatTransfer {
+                        a["temperature"] = json!(self.f.ambient);
+                    }
+                    ("add_inlet", a)
+                }
+                LoadKind::MovingWall => ("add_moving_wall", json!({"faces": fa, "velocity": self.f.wall_v})),
+                LoadKind::Outlet => ("add_outlet", json!({"faces": fa, "pressure": self.f.outlet_p})),
+                LoadKind::Port => ("add_port", json!({"faces": fa, "power": self.f.port_power, "polarization": (["x", "y", "z"])[self.f.port_pol], "profile": if self.f.port_te10 { "te10" } else { "uniform" }})),
             };
             if self.run(tool, args) {
                 self.selected.clear();
@@ -1358,11 +2567,13 @@ impl SimApp {
                 let f = if r.has(display.field) { display.field } else { r.available_fields()[0] };
                 let mut title = f.label().to_string();
                 let mut unit = f.unit().to_string();
-                if r.analysis == AnalysisType::Modal {
-                    if let Some(m) = r.modes.get(display.mode) {
-                        title = format!("Mode {} · {:.2} Hz", display.mode + 1, m.frequency_hz);
+                if !r.modes.is_empty() {
+                    title = r.step_label(display.mode);
+                    if f.is_deformation() {
                         unit = "normalised".into();
                     }
+                } else if r.n_steps() > 1 {
+                    title = format!("{title} · {}", r.step_label(display.mode));
                 }
                 let mut sub = model.analysis.kind.label().to_string();
                 if sc > 0.0 {
@@ -1380,7 +2591,7 @@ impl SimApp {
                 }
                 let top = i + vec2(0.0, 52.0);
                 for b in 0..9 {
-                    let c = render::BANDS[8 - b];
+                    let c = render::BANDS[if f.reversed_scale() { b } else { 8 - b }];
                     let rr = Rect::from_min_size(top + vec2(0.0, b as f32 * bh), vec2(16.0, bh));
                     painter.rect_filled(rr, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
                 }
@@ -1420,7 +2631,10 @@ impl SimApp {
 
         // ---- view toolbar (top right)
         let views = [("⛶", "fit", "Fit all"), ("◩", "iso", "Isometric"), ("▣", "front", "Front"), ("⬒", "top", "Top"), ("◨", "right", "Right"), ("◧", "left", "Left")];
-        let tb = Rect::from_min_size(pos2(rect.right() - 14.0 - views.len() as f32 * 30.0 - 8.0, rect.top() + 14.0), vec2(views.len() as f32 * 30.0 + 8.0, 34.0));
+        let tbw = views.len() as f32 * 30.0 + 8.0;
+        // top-right normally; bottom-right when the viewport is too narrow to share the top with the legend
+        let tby = if rect.width() < 640.0 { rect.bottom() - 48.0 } else { rect.top() + 14.0 };
+        let tb = Rect::from_min_size(pos2(rect.right() - 14.0 - tbw, tby), vec2(tbw, 34.0));
         painter.rect(tb, 10.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
         for (i, (icon, view, tip)) in views.iter().enumerate() {
             let br = Rect::from_min_size(tb.min + vec2(4.0 + i as f32 * 30.0, 4.0), vec2(28.0, 26.0));
@@ -1497,6 +2711,97 @@ impl SimApp {
         ]);
         self.script(&steps);
     }
+    fn example_buckling(&mut self) {
+        self.script(&[
+            ("new_model", json!({})),
+            ("add_box", json!({"name": "Column", "min": [0, 0, 0], "size": [10, 10, 200]})),
+            ("set_mesh", json!({"element_size_mm": 2})),
+            ("set_analysis", json!({"type": "linear_buckling", "modes": 3})),
+            ("add_fixed_support", json!({"faces": ["Column.zmin"]})),
+            ("add_force", json!({"faces": ["Column.zmax"], "vector": [0, 0, -1000]})),
+        ]);
+    }
+    fn example_capacitor(&mut self) {
+        self.script(&[
+            ("new_model", json!({})),
+            ("add_box", json!({"name": "TopPlate", "min": [0, 0, 6], "size": [40, 40, 2], "material": "Copper"})),
+            ("add_box", json!({"name": "BottomPlate", "min": [0, 0, 0], "size": [40, 40, 2], "material": "Copper"})),
+            ("add_box", json!({"name": "Dielectric", "min": [0, 0, 2], "size": [40, 40, 4], "material": "FR-4"})),
+            ("add_enclosure", json!({"material": "Air", "padding": 0.4})),
+            ("set_analysis", json!({"type": "electrostatic"})),
+            ("set_mesh", json!({"element_size_mm": 1})),
+            ("add_voltage", json!({"faces": ["TopPlate"], "value": 100})),
+            ("add_voltage", json!({"faces": ["BottomPlate"], "value": 0})),
+        ]);
+    }
+    fn example_busbar(&mut self) {
+        self.script(&[
+            ("new_model", json!({})),
+            ("add_box", json!({"name": "BusBar", "min": [0, 0, 0], "size": [150, 20, 5], "material": "Copper"})),
+            ("add_cylinder", json!({"name": "BoltA", "base": [12, 10, 0], "radius": 4, "height": 5, "operation": "subtract"})),
+            ("add_cylinder", json!({"name": "BoltB", "base": [138, 10, 0], "radius": 4, "height": 5, "operation": "subtract"})),
+            ("set_mesh", json!({"element_size_mm": 1})),
+            ("set_analysis", json!({"type": "thermal_electric"})),
+            ("add_current", json!({"faces": ["BoltA.side"], "value": 400})),
+            ("add_voltage", json!({"faces": ["BoltB.side"], "value": 0})),
+            ("add_convection", json!({"faces": ["all"], "coefficient": 15, "ambient": 25})),
+        ]);
+    }
+    fn example_coil(&mut self) {
+        self.script(&[
+            ("new_model", json!({})),
+            ("add_cylinder", json!({"name": "Coil", "base": [0, 0, -15], "radius": 22, "height": 30, "material": "Copper"})),
+            ("add_cylinder", json!({"name": "Bore", "base": [0, 0, -15], "radius": 14, "height": 30, "operation": "subtract"})),
+            ("add_cylinder", json!({"name": "Core", "base": [0, 0, -25], "radius": 10, "height": 50, "material": "Electrical Steel (M19)"})),
+            ("add_enclosure", json!({"material": "Air", "padding": 0.6})),
+            ("set_analysis", json!({"type": "magnetostatic"})),
+            ("set_mesh", json!({"element_size_mm": 2.5})),
+            ("add_coil", json!({"body": "Coil", "current_density": 3, "axis": "z", "mode": "circumferential"})),
+        ]);
+    }
+    fn example_microwave(&mut self) {
+        self.script(&[
+            ("new_model", json!({})),
+            ("add_box", json!({"name": "Tray", "min": [30, 30, 12], "size": [180, 180, 6], "material": "Microwave Glass Tray"})),
+            ("add_box", json!({"name": "Food", "min": [80, 85, 18], "size": [80, 70, 40], "material": "Food (water-rich, 2.45 GHz)"})),
+            ("add_enclosure", json!({"material": "Air", "min": [0, 0, 0], "size": [240, 240, 160]})),
+            ("set_analysis", json!({"type": "microwave_heating", "frequency_ghz": 2.45, "em_boundary": "pec", "end_time": 30, "time_steps": 30, "initial_temperature": 5})),
+            ("set_mesh", json!({"element_size_mm": 1.6})),
+            ("add_port", json!({"faces": ["Enclosure.xmin"], "power": 800, "polarization": "z", "profile": "te10"})),
+        ]);
+    }
+    fn example_heatsink_cht(&mut self) {
+        let mut calls: Vec<(&str, Value)> = vec![
+            ("new_model", json!({})),
+            ("add_box", json!({"name": "Chip", "min": [12.5, 12.5, 0], "size": [15, 15, 2], "material": "Copper C101"})),
+            ("add_box", json!({"name": "Base", "min": [0, 0, 2], "size": [40, 40, 4], "material": "Aluminum 6061-T6"})),
+        ];
+        let fins: Vec<(String, f64)> = (0..6).map(|i| (format!("Fin{}", i + 1), 1.0 + i as f64 * 7.2)).collect();
+        for (name, y) in &fins {
+            calls.push(("add_box", json!({"name": name, "min": [0, y, 6], "size": [40, 2, 25], "material": "Aluminum 6061-T6"})));
+        }
+        calls.extend([
+            ("add_enclosure", json!({"material": "Air", "min": [-40, -10, 0], "size": [160, 60, 45]})),
+            ("set_analysis", json!({"type": "conjugate_heat_transfer", "turbulence": "lvel", "reference_temperature": 25, "max_iterations": 6000})),
+            ("set_mesh", json!({"element_size_mm": 2})),
+            ("add_inlet", json!({"faces": ["Enclosure.xmin"], "velocity": 2.0, "temperature": 25})),
+            ("add_outlet", json!({"faces": ["Enclosure.xmax"], "pressure": 0})),
+            ("add_heat_generation", json!({"body": "Chip", "power": 10.0})),
+        ]);
+        self.script(&calls);
+    }
+    fn example_cfd(&mut self) {
+        self.script(&[
+            ("new_model", json!({})),
+            ("add_cylinder", json!({"name": "Cylinder", "base": [0, 0, 0], "axis": "y", "radius": 10, "height": 20, "material": "Aluminum 6061-T6"})),
+            ("add_enclosure", json!({"material": "Water", "padding_mm": [40, 120, 0, 0, 40, 40]})),
+            ("set_analysis", json!({"type": "fluid", "max_iterations": 3000})),
+            ("set_mesh", json!({"element_size_mm": 2})),
+            ("add_inlet", json!({"faces": ["Enclosure.xmin"], "velocity": 0.002})),
+            ("add_outlet", json!({"faces": ["Enclosure.xmax"], "pressure": 0})),
+            ("add_symmetry", json!({"faces": ["Enclosure.ymin", "Enclosure.ymax", "Enclosure.zmin", "Enclosure.zmax"]})),
+        ]);
+    }
     fn example_fork(&mut self) {
         self.script(&[
             ("new_model", json!({})),
@@ -1526,6 +2831,11 @@ impl eframe::App for SimApp {
         });
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| self.viewport(ui));
 
+        let ctx = ui.ctx().clone();
+        self.mcp_dialog(&ctx);
+        self.planner_window(&ctx);
+        self.study_window(&ctx);
+        self.fatigue_window(&ctx);
         if let Some((msg, err, ttl)) = &mut self.toast {
             *ttl -= (ui.input(|i| i.stable_dt) as f64).min(0.1);
             let ctx = ui.ctx().clone();
@@ -1556,7 +2866,13 @@ pub fn run(core: Shared, open: Option<String>) -> eframe::Result<()> {
         let _ = core.call("open_project", &json!({"path": p}));
     }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("SimCraft").with_app_id("simcraft").with_inner_size([1440.0, 880.0]).with_min_inner_size([960.0, 600.0]),
+        viewport: {
+            let mut v = egui::ViewportBuilder::default().with_title("SimCraft").with_app_id("simcraft").with_inner_size([1440.0, 880.0]).with_min_inner_size([960.0, 600.0]);
+            if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/simcraft-256.png")) {
+                v = v.with_icon(Arc::new(icon));
+            }
+            v
+        },
         ..Default::default()
     };
     eframe::run_native("SimCraft", opts, Box::new(move |cc| Ok(Box::new(SimApp::new(cc, core, bridge)))))
