@@ -362,6 +362,168 @@ struct RenderKey {
     dark: bool,
 }
 
+/// Material fields editable in the app (the ones define_material accepts).
+const MAT_KEYS: &[&str] = &[
+    "youngs_modulus_gpa", "poisson_ratio", "density", "yield_strength_mpa", "ultimate_strength_mpa", "thermal_conductivity", "thermal_expansion", "specific_heat",
+    "relative_permittivity", "electrical_conductivity", "relative_permeability", "loss_tangent", "fatigue_strength_coefficient_mpa", "fatigue_exponent", "endurance_limit_mpa",
+];
+
+/// Edit the fields of a JSON object in place: numbers, [x,y,z] vectors, text, face lists, switches.
+/// Returns true when something changed. `mats` feeds the material picker.
+fn json_editor(ui: &mut egui::Ui, v: &mut Value, mats: &[String], id: &str) -> bool {
+    let mut changed = false;
+    let Some(obj) = v.as_object_mut() else { return false };
+    // identity fields first, then the rest alphabetically
+    let mut keys: Vec<String> = obj.keys().cloned().collect();
+    let rank = |k: &str| ["name", "material", "operation"].iter().position(|x| *x == k).unwrap_or(9);
+    keys.sort_by(|a, b| rank(a).cmp(&rank(b)).then(a.cmp(b)));
+    egui::Grid::new(id).num_columns(2).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+        for k in &keys {
+            let val = obj.get_mut(k).unwrap();
+            if matches!(k.as_str(), "type" | "kind" | "path" | "id") || val.is_null() {
+                continue;
+            }
+            ui.label(k.replace('_', " "));
+            match val {
+                Value::Number(n) => {
+                    let mut x = n.as_f64().unwrap_or(0.0);
+                    let sp = if x == 0.0 { 0.01 } else { x.abs() * 0.01 };
+                    // significant digits, so small values like 1.2e-5 stay readable
+                    if ui.add(egui::DragValue::new(&mut x).speed(sp).custom_formatter(|v, _| render::fmt_val(v))).changed() {
+                        *val = json!(x);
+                        changed = true;
+                    }
+                }
+                Value::Array(a) if a.len() == 3 && a.iter().all(|e| e.is_number()) => {
+                    ui.horizontal(|ui| {
+                        for e in a.iter_mut() {
+                            let mut x = e.as_f64().unwrap_or(0.0);
+                            let sp = (x.abs() * 0.01).max(0.05);
+                            if ui.add(egui::DragValue::new(&mut x).speed(sp)).changed() {
+                                *e = json!(x);
+                                changed = true;
+                            }
+                        }
+                    });
+                }
+                Value::Array(a) if a.iter().all(|e| e.is_string()) => {
+                    let mut t = a.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join(", ");
+                    if ui.add(egui::TextEdit::singleline(&mut t).desired_width(170.0)).on_hover_text("comma-separated face names").changed() {
+                        *val = json!(t.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).collect::<Vec<_>>());
+                        changed = true;
+                    }
+                }
+                Value::Bool(b) => {
+                    changed |= ui.checkbox(b, "").changed();
+                }
+                Value::String(t) if k == "material" => {
+                    let mut cur = t.clone();
+                    egui::ComboBox::from_id_salt(format!("{id}-mat")).width(170.0).selected_text(&cur).show_ui(ui, |ui| {
+                        for m in mats {
+                            ui.selectable_value(&mut cur, m.clone(), m);
+                        }
+                    });
+                    if cur != *t {
+                        *t = cur;
+                        changed = true;
+                    }
+                }
+                Value::String(t) if matches!(k.as_str(), "axis" | "polarization" | "direction") => {
+                    ui.horizontal(|ui| {
+                        for ax in ["x", "y", "z"] {
+                            if ui.selectable_label(t == ax, ax.to_uppercase()).clicked() && t != ax {
+                                *t = ax.to_string();
+                                changed = true;
+                            }
+                        }
+                    });
+                }
+                Value::String(t) if k == "operation" => {
+                    ui.horizontal(|ui| {
+                        for o in ["add", "subtract"] {
+                            if ui.selectable_label(t == o, o).clicked() && t != o {
+                                *t = o.to_string();
+                                changed = true;
+                            }
+                        }
+                    });
+                }
+                Value::String(t) => {
+                    changed |= ui.add(egui::TextEdit::singleline(t).desired_width(170.0)).changed();
+                }
+                _ => {
+                    ui.label(RichText::new("—").weak());
+                }
+            }
+            ui.end_row();
+        }
+    });
+    changed
+}
+
+/// Simple line chart: series of (x, y) points with axes, ticks and a hover readout.
+fn line_chart(ui: &mut egui::Ui, p: &Pal, series: &[(String, Vec<(f64, f64)>)], xlabel: &str, size: egui::Vec2) {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 6.0, p.card);
+    let pts: Vec<(f64, f64)> = series.iter().flat_map(|s| s.1.iter().copied()).filter(|q| q.0.is_finite() && q.1.is_finite()).collect();
+    if pts.len() < 2 {
+        painter.text(rect.center(), Align2::CENTER_CENTER, "no data", FontId::proportional(13.0), p.weak);
+        return;
+    }
+    let (mut x0, mut x1, mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for (x, y) in &pts {
+        x0 = x0.min(*x);
+        x1 = x1.max(*x);
+        y0 = y0.min(*y);
+        y1 = y1.max(*y);
+    }
+    if (y1 - y0).abs() < 1e-30 {
+        y0 -= 1.0;
+        y1 += 1.0;
+    }
+    if (x1 - x0).abs() < 1e-30 {
+        x1 += 1.0;
+    }
+    let pad = (y1 - y0) * 0.06;
+    let (y0, y1) = (y0 - pad, y1 + pad);
+    let plot = Rect::from_min_max(rect.min + vec2(62.0, 10.0), rect.max - vec2(30.0, 30.0));
+    let sx = |x: f64| plot.min.x + ((x - x0) / (x1 - x0)) as f32 * plot.width();
+    let sy = |y: f64| plot.max.y - ((y - y0) / (y1 - y0)) as f32 * plot.height();
+    let axis = Stroke::new(1.0, p.border);
+    painter.line_segment([plot.left_bottom(), plot.right_bottom()], axis);
+    painter.line_segment([plot.left_bottom(), plot.left_top()], axis);
+    for i in 0..=4 {
+        let fy = y0 + (y1 - y0) * i as f64 / 4.0;
+        let fx = x0 + (x1 - x0) * i as f64 / 4.0;
+        painter.text(pos2(plot.min.x - 6.0, sy(fy)), Align2::RIGHT_CENTER, render::fmt_val(fy), FontId::proportional(10.0), p.weak);
+        painter.text(pos2(sx(fx), plot.max.y + 4.0), Align2::CENTER_TOP, render::fmt_val(fx), FontId::proportional(10.0), p.weak);
+        painter.line_segment([pos2(plot.min.x, sy(fy)), pos2(plot.max.x, sy(fy))], Stroke::new(0.5, p.border.gamma_multiply(0.5)));
+    }
+    painter.text(pos2(plot.center().x, rect.max.y - 2.0), Align2::CENTER_BOTTOM, xlabel, FontId::proportional(11.0), p.weak);
+    let colors = [p.accent, Color32::from_rgb(70, 170, 230), Color32::from_rgb(120, 200, 90), Color32::from_rgb(220, 90, 160)];
+    for (si, (name, s)) in series.iter().enumerate() {
+        let c = colors[si % colors.len()];
+        let line: Vec<Pos2> = s.iter().filter(|q| q.0.is_finite() && q.1.is_finite()).map(|(x, y)| pos2(sx(*x), sy(*y))).collect();
+        painter.add(egui::Shape::line(line.clone(), Stroke::new(2.0, c)));
+        if line.len() <= 60 {
+            for q in &line {
+                painter.circle_filled(*q, 2.5, c);
+            }
+        }
+        painter.text(plot.min + vec2(8.0, 6.0 + 14.0 * si as f32), Align2::LEFT_TOP, name, FontId::proportional(11.0), c);
+    }
+    if let Some(hp) = resp.hover_pos() {
+        if plot.contains(hp) {
+            let x = x0 + ((hp.x - plot.min.x) / plot.width()) as f64 * (x1 - x0);
+            if let Some((bx, by)) = series.first().and_then(|s| s.1.iter().min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs())).copied()) {
+                painter.circle_stroke(pos2(sx(bx), sy(by)), 4.0, Stroke::new(1.5, p.text));
+                painter.text(pos2(sx(bx) + 8.0, sy(by) - 8.0), Align2::LEFT_BOTTOM, format!("{}, {}", render::fmt_val(bx), render::fmt_val(by)), FontId::proportional(11.0), p.text);
+            }
+        }
+    }
+}
+
 /// An action that discards the current model; asks first when there are unsaved changes.
 #[derive(Clone, Debug)]
 enum Pending {
@@ -382,6 +544,18 @@ pub struct SimApp {
     key: Option<RenderKey>,
     /// action waiting for the "save changes?" answer
     confirm: Option<Pending>,
+    /// body / load picked in the browser, and the editable copy shown in Properties ("b:Name" / "l:3")
+    sel_body: Option<String>,
+    sel_load: Option<u32>,
+    edit_val: Option<(String, Value)>,
+    /// transform panel: mode, translate, count, mirror axis, plane, copy
+    xform: (String, [f64; 3], usize, usize, f64, bool),
+    /// material editor: (material it is based on, editable fields incl. name)
+    mat_edit: Option<(String, Value)>,
+    show_chart: bool,
+    probe_mode: bool,
+    /// probed nodes, with the results revision they belong to
+    probes: Vec<(u32, u64)>,
     allow_close: bool,
     last_autosave: f64,
     recovery_offered: bool,
@@ -545,6 +719,14 @@ impl SimApp {
             tex: None,
             key: None,
             confirm: None,
+            sel_body: None,
+            sel_load: None,
+            edit_val: None,
+            xform: ("move".into(), [10.0, 0.0, 0.0], 3, 0, 0.0, true),
+            mat_edit: None,
+            show_chart: false,
+            probe_mode: false,
+            probes: Vec::new(),
             allow_close: false,
             last_autosave: 0.0,
             recovery_offered: false,
@@ -632,6 +814,20 @@ impl SimApp {
             ui.add_space(10.0);
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| self.file_menu(ui));
+                ui.menu_button("Edit", |ui| {
+                    let (nu, nr) = {
+                        let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        (s.undo.len(), s.redo.len())
+                    };
+                    if ui.add_enabled(nu > 0, egui::Button::new("Undo").shortcut_text("Ctrl+Z")).clicked() {
+                        ui.close();
+                        self.run("undo", json!({}));
+                    }
+                    if ui.add_enabled(nr > 0, egui::Button::new("Redo").shortcut_text("Ctrl+Shift+Z")).clicked() {
+                        ui.close();
+                        self.run("redo", json!({}));
+                    }
+                });
                 ui.menu_button("Examples", |ui| {
                     if ui.button("🔩  Cantilever bracket with hole").clicked() {
                         ui.close();
@@ -1074,6 +1270,18 @@ impl SimApp {
                     });
                     ui.add_space(6.0);
                 }
+                // ---- charts for one-parameter studies
+                if st.parameters.len() == 1 && st.runs.iter().filter(|r| r.error.is_none()).count() >= 2 {
+                    egui::CollapsingHeader::new(RichText::new("📈 Chart").strong()).default_open(false).show(ui, |ui| {
+                        for (ri, name) in st.responses.iter().enumerate() {
+                            let mut pts: Vec<(f64, f64)> = st.runs.iter().filter_map(|r| Some((r.values[0], r.responses.get(ri).copied().flatten()?))).collect();
+                            pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+                            line_chart(ui, &p, &[(name.clone(), pts)], &st.parameters[0].target, vec2(ui.available_width().max(300.0), 150.0));
+                            ui.add_space(4.0);
+                        }
+                    });
+                    ui.add_space(6.0);
+                }
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                     egui::Grid::new("studytable").striped(true).show(ui, |ui| {
                         ui.label(RichText::new("#").strong());
@@ -1443,6 +1651,18 @@ impl SimApp {
                         });
                         if ui.add(primary(&p, "Assign to all bodies")).clicked() {
                             self.run("set_material", json!({"material": self.f.material}));
+                        }
+                        if ui.button("✏ New / edit material…").on_hover_text("Create a custom material from the selected one, or change a custom material").clicked() {
+                            if let Some(m) = lib.iter().find(|m| m.name == self.f.material) {
+                                let full = serde_json::to_value(m).unwrap_or(json!({}));
+                                let mut v = json!({"name": if crate::material::library().iter().any(|x| x.name == m.name) { format!("{} (custom)", m.name) } else { m.name.clone() }});
+                                for k in MAT_KEYS {
+                                    if let Some(x) = full.get(*k) {
+                                        v[*k] = x.clone();
+                                    }
+                                }
+                                self.mat_edit = Some((m.name.clone(), v));
+                            }
                         }
                     });
                 });
@@ -1869,6 +2089,18 @@ impl SimApp {
                 }
             });
         }
+        group(ui, &p, "TOOLS", |ui| {
+            if tool(ui, &p, "📈", "History", Some(if self.show_chart { p.accent } else { p.weak }), !r.history.is_empty()) {
+                self.show_chart = !self.show_chart;
+            }
+            if tool(ui, &p, "🎯", "Probe", Some(if self.probe_mode { p.accent } else { p.weak }), true) {
+                self.probe_mode = !self.probe_mode;
+                self.toast = Some((if self.probe_mode { "Probe: click the model to read the value at the nearest node (click again to add more)" } else { "Probe off" }.into(), false, 4.0));
+            }
+            if !self.probes.is_empty() && tool(ui, &p, "✖", "Clear", None, true) {
+                self.probes.clear();
+            }
+        });
         group(ui, &p, "EXPORT", |ui| {
             if tool(ui, &p, "📄", "Report", None, true) {
                 if let Some(path) = rfd::FileDialog::new().add_filter("HTML report", &["html"]).set_file_name("simcraft-report.html").save_file() {
@@ -1939,6 +2171,194 @@ impl SimApp {
                 }
             });
         });
+    }
+
+    /// History chart of the current results (transient, harmonic sweep, load steps, convergence).
+    fn chart_window(&mut self, ctx: &egui::Context) {
+        if !self.show_chart {
+            return;
+        }
+        let Some(r) = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).results.clone() else {
+            self.show_chart = false;
+            return;
+        };
+        if r.history.is_empty() {
+            self.show_chart = false;
+            return;
+        }
+        let p = self.p;
+        let mut open = true;
+        egui::Window::new(RichText::new("📈 History").strong()).open(&mut open).resizable(true).default_size(vec2(560.0, 340.0)).show(ctx, |ui| {
+            let label = if r.history_label.is_empty() { "value".to_string() } else { r.history_label.clone() };
+            let xl = if r.history_x.is_empty() { "step".to_string() } else { r.history_x.clone() };
+            let sz = vec2(ui.available_width().max(300.0), (ui.available_height() - 6.0).max(200.0));
+            line_chart(ui, &p, &[(label, r.history.clone())], &xl, sz);
+        });
+        self.show_chart = open;
+    }
+
+    /// Custom material editor (saves through define_material).
+    fn material_window(&mut self, ctx: &egui::Context) {
+        let Some((base, mut v)) = self.mat_edit.clone() else { return };
+        let p = self.p;
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new(RichText::new("✏ Material").strong()).open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
+            ui.label(RichText::new(format!("Based on {base}. Units: E in GPa, strengths in MPa, density kg/m³, k W/m·K, α 1/K, c J/kg·K, σ S/m.")).small().color(p.weak));
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                json_editor(ui, &mut v, &[], "mated");
+            });
+            ui.add_space(6.0);
+            save = ui.add(primary(&p, "Save material")).clicked();
+        });
+        if save {
+            let mut a = v.clone();
+            a["based_on"] = json!(base);
+            let name = v["name"].as_str().unwrap_or("").to_string();
+            if self.run("define_material", a) {
+                self.f.material = name;
+                self.mat_edit = None;
+                return;
+            }
+        }
+        self.mat_edit = if open { Some((base, v)) } else { None };
+    }
+
+    /// Properties panel for the body or load picked in the browser.
+    fn item_editor(&mut self, ui: &mut egui::Ui) {
+        let p = self.p;
+        let (model, lib) = {
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (s.model.clone(), s.model.materials().into_iter().map(|m| m.name).collect::<Vec<_>>())
+        };
+        // the editable copy follows the selection (and is refreshed after undo / external edits)
+        let (key, fresh) = if let Some(n) = &self.sel_body {
+            let Some(b) = model.bodies.iter().find(|b| &b.name == n) else {
+                self.sel_body = None;
+                return;
+            };
+            let mut v = serde_json::to_value(&b.shape).unwrap_or(json!({}));
+            v["name"] = json!(b.name);
+            v["material"] = json!(b.material);
+            v["operation"] = json!(if b.op == Op::Add { "add" } else { "subtract" });
+            (format!("b:{n}"), v)
+        } else {
+            let id = self.sel_load.unwrap();
+            let Some(l) = model.loads.iter().find(|l| l.id == id) else {
+                self.sel_load = None;
+                return;
+            };
+            (format!("l:{id}"), serde_json::to_value(&l.load).unwrap_or(json!({})))
+        };
+        let stale = !matches!(&self.edit_val, Some((k, _)) if *k == key);
+        if stale {
+            self.edit_val = Some((key.clone(), fresh.clone()));
+        }
+        let mut apply = None;
+        let mut action: Option<(&str, Value)> = None;
+        card(ui, &p, |ui| {
+            let title = if self.sel_body.is_some() { format!("Body · {}", fresh["name"].as_str().unwrap_or("")) } else { format!("Load #{} · {}", self.sel_load.unwrap(), model.loads.iter().find(|l| Some(l.id) == self.sel_load).map(|l| l.load.label()).unwrap_or("")) };
+            ui.label(RichText::new(title).strong());
+            ui.add_space(4.0);
+            let (_, v) = self.edit_val.as_mut().unwrap();
+            json_editor(ui, v, &lib, &key);
+            ui.add_space(6.0);
+            let differs = *v != fresh;
+            ui.horizontal(|ui| {
+                if ui.add_enabled(differs, primary(&p, "Apply")).clicked() {
+                    apply = Some(v.clone());
+                }
+                if ui.add_enabled(differs, egui::Button::new("Revert")).clicked() {
+                    *v = fresh.clone();
+                }
+                if ui.button("Close").clicked() {
+                    self.sel_body = None;
+                    self.sel_load = None;
+                }
+            });
+        });
+        // transform tools for bodies
+        if let Some(name) = self.sel_body.clone() {
+            ui.add_space(8.0);
+            card(ui, &p, |ui| {
+                ui.label(RichText::new("Transform").strong());
+                let x = &mut self.xform;
+                ui.horizontal(|ui| {
+                    for (m, l) in [("move", "Move"), ("copy", "Copy"), ("pattern", "Pattern"), ("mirror", "Mirror")] {
+                        ui.selectable_value(&mut x.0, m.to_string(), l);
+                    }
+                });
+                if x.0 == "mirror" {
+                    ui.horizontal(|ui| {
+                        ui.label("Plane");
+                        for (i, a) in ["X", "Y", "Z"].iter().enumerate() {
+                            ui.selectable_value(&mut x.3, i, *a);
+                        }
+                        ui.label("=");
+                        ui.add(egui::DragValue::new(&mut x.4).speed(0.5).suffix(" mm"));
+                    });
+                    ui.checkbox(&mut x.5, "Keep the original (mirrored copy)");
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(if x.0 == "pattern" { "Step" } else { "Offset" });
+                        for c in x.1.iter_mut() {
+                            ui.add(egui::DragValue::new(c).speed(0.5).suffix(" mm"));
+                        }
+                    });
+                    if x.0 == "pattern" {
+                        ui.horizontal(|ui| {
+                            ui.label("Instances");
+                            ui.add(egui::DragValue::new(&mut x.2).range(2..=200));
+                        });
+                    }
+                }
+                if ui.add(primary(&p, "Apply transform")).clicked() {
+                    let a = match x.0.as_str() {
+                        "mirror" => json!({"name": name, "mode": "mirror", "axis": (["x", "y", "z"][x.3]), "at": x.4, "copy": x.5}),
+                        "pattern" => json!({"name": name, "mode": "pattern", "translate": x.1, "count": x.2}),
+                        m => json!({"name": name, "mode": m, "translate": x.1}),
+                    };
+                    action = Some(("transform_body", a));
+                }
+            });
+        }
+        if let Some(v) = apply {
+            if let Some(old) = self.sel_body.clone() {
+                let mut a = json!({"name": old});
+                for (k, val) in v.as_object().into_iter().flatten() {
+                    if matches!(k.as_str(), "type" | "path") || fresh.get(k) == Some(val) {
+                        continue;
+                    }
+                    if k == "name" {
+                        a["new_name"] = val.clone();
+                    } else {
+                        a[k] = val.clone();
+                    }
+                }
+                if self.run("edit_body", a) {
+                    if let Some(n) = v["name"].as_str() {
+                        self.sel_body = Some(n.to_string());
+                    }
+                    self.edit_val = None;
+                }
+            } else if let Some(id) = self.sel_load {
+                let mut a = json!({"id": id});
+                for (k, val) in v.as_object().into_iter().flatten() {
+                    if k != "kind" && fresh.get(k) != Some(val) {
+                        a[k] = val.clone();
+                    }
+                }
+                if self.run("edit_load", a) {
+                    self.edit_val = None;
+                }
+            }
+        }
+        if let Some((t, a)) = action {
+            if self.run(t, a) {
+                self.need_fit = true;
+            }
+        }
     }
 
     fn dirty(&self) -> bool {
@@ -2123,6 +2543,10 @@ impl SimApp {
                         if b.op == Op::Subtract {
                             lbl = lbl.color(p.weak);
                         }
+                        let picked = self.sel_body.as_deref() == Some(b.name.as_str());
+                        if picked {
+                            lbl = lbl.strong().color(p.accent);
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if del(ui) {
                                 self.run("remove_body", json!({"name": b.name}));
@@ -2131,7 +2555,11 @@ impl SimApp {
                                 ui.label(RichText::new("cut").small().color(p.weak));
                             }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add(egui::Label::new(lbl).truncate()).on_hover_text(tip);
+                                if ui.add(egui::Label::new(lbl).truncate().sense(Sense::click())).on_hover_text(format!("{tip}\nClick to edit")).clicked() {
+                                    self.sel_body = if picked { None } else { Some(b.name.clone()) };
+                                    self.sel_load = None;
+                                    self.form = Form::None;
+                                }
                             });
                         });
                     });
@@ -2152,7 +2580,13 @@ impl SimApp {
                             }
                             ui.label(RichText::new(format!("#{}", l.id)).small().color(p.weak));
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                ui.add(egui::Label::new(l.load.label()).truncate()).on_hover_text(format!("#{} {}", l.id, l.load.summary()));
+                                let picked = self.sel_load == Some(l.id);
+                                let txt = if picked { RichText::new(l.load.label()).strong().color(p.accent) } else { RichText::new(l.load.label()) };
+                                if ui.add(egui::Label::new(txt).truncate().sense(Sense::click())).on_hover_text(format!("#{} {}\nClick to edit", l.id, l.load.summary())).clicked() {
+                                    self.sel_load = if picked { None } else { Some(l.id) };
+                                    self.sel_body = None;
+                                    self.form = Form::None;
+                                }
                             });
                         });
                     });
@@ -2255,6 +2689,7 @@ impl SimApp {
         };
         let op_args = |sub: bool| if sub { "subtract" } else { "add" };
         match self.form {
+            Form::None if self.sel_body.is_some() || self.sel_load.is_some() => self.item_editor(ui),
             Form::None => {
                 card(ui, &p, |ui| {
                     let sel = self.selected_names(mesh.as_ref());
@@ -2760,7 +3195,33 @@ impl SimApp {
             let (bw, bh) = self.buf_size;
             (x < bw && y < bh).then(|| self.face_buf[y * bw + x]).filter(|f| *f != u32::MAX)
         };
-        if resp.clicked() {
+        let res_id = results.as_ref().map(|r| Arc::as_ptr(r) as u64).unwrap_or(0);
+        let probing = self.probe_mode && display.show_results && results.is_some();
+        // screen position of a node (deformed like the picture)
+        let node_screen = |n: usize| -> Pos2 {
+            let mut q = mesh.nodes[n];
+            if let (Some(r), Some((_, sc))) = (&results, self.legend) {
+                if let Some(d) = r.deformation(display.mode) {
+                    if d.len() == mesh.nodes.len() && sc > 0.0 {
+                        q = add(q, scale(d[n], sc * anim));
+                    }
+                }
+            }
+            let (x, y, _) = self.cam.project(q, rect.width() as f64, rect.height() as f64);
+            rect.min + vec2(x as f32, y as f32)
+        };
+        if probing && resp.clicked() {
+            if let (Some(pos), Some(fid)) = (resp.interact_pointer_pos(), resp.interact_pointer_pos().and_then(|q| pick(q))) {
+                let n = mesh.faces[fid as usize].nodes.iter().copied().min_by(|a, b| node_screen(*a as usize).distance(pos).total_cmp(&node_screen(*b as usize).distance(pos))).unwrap();
+                self.probes.retain(|(_, rid)| *rid == res_id);
+                if !self.probes.iter().any(|(m, _)| *m == n) {
+                    self.probes.push((n, res_id));
+                    if self.probes.len() > 8 {
+                        self.probes.remove(0);
+                    }
+                }
+            }
+        } else if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
                 match pick(pos) {
@@ -2796,6 +3257,29 @@ impl SimApp {
             }
         }
 
+        // ---- probe markers
+        if display.show_results {
+            if let Some(r) = &results {
+                let f = if r.has(display.field) { display.field } else { r.available_fields()[0] };
+                if let Some(vals) = r.scalar(f, display.mode) {
+                    for (n, rid) in &self.probes {
+                        if *rid != res_id || *n as usize >= vals.len() {
+                            continue;
+                        }
+                        let sp = node_screen(*n as usize);
+                        if !rect.contains(sp) {
+                            continue;
+                        }
+                        painter.circle(sp, 4.5, p.accent, Stroke::new(1.5, Color32::WHITE));
+                        let txt = format!("{} {}", render::fmt_val(vals[*n as usize]), f.unit());
+                        let galley = painter.layout_no_wrap(txt, FontId::monospace(12.0), Color32::WHITE);
+                        let br = Rect::from_min_size(sp + vec2(8.0, -22.0), galley.size() + vec2(10.0, 6.0));
+                        painter.rect_filled(br, 4.0, Color32::from_black_alpha(190));
+                        painter.galley(br.min + vec2(5.0, 3.0), galley, Color32::WHITE);
+                    }
+                }
+            }
+        }
         // ---- title + legend card
         let o = rect.left_top() + vec2(14.0, 14.0);
         if display.show_results {
@@ -3074,7 +3558,66 @@ impl eframe::App for SimApp {
         self.mcp_dialog(&ctx);
         self.planner_window(&ctx);
         self.study_window(&ctx);
+        // test hook (`__ui`, only with SIMCRAFT_TEST_HOOKS): drive GUI-only state for screenshots
+        let req = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ui_request.take();
+        if let Some(q) = req {
+            if let Some(b) = q["select_body"].as_str() {
+                self.sel_body = Some(b.to_string());
+                self.sel_load = None;
+                self.form = Form::None;
+            }
+            if let Some(id) = q["select_load"].as_u64() {
+                self.sel_load = Some(id as u32);
+                self.sel_body = None;
+                self.form = Form::None;
+            }
+            if let Some(m) = q["edit_material"].as_str() {
+                self.f.material = m.to_string();
+                let lib = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.materials();
+                if let Some(mat) = lib.iter().find(|x| x.name == m) {
+                    let full = serde_json::to_value(mat).unwrap_or(json!({}));
+                    let mut v = json!({"name": format!("{} (custom)", mat.name)});
+                    for k in MAT_KEYS {
+                        if let Some(x) = full.get(*k) {
+                            v[*k] = x.clone();
+                        }
+                    }
+                    self.mat_edit = Some((mat.name.clone(), v));
+                }
+            }
+            if q["show_chart"].as_bool() == Some(true) {
+                self.show_chart = true;
+            }
+            if let Some(n) = q["probe_node"].as_u64() {
+                let rid = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).results.as_ref().map(|r| Arc::as_ptr(r) as u64).unwrap_or(0);
+                self.probes.push((n as u32, rid));
+                self.probe_mode = true;
+            }
+            if let Some(t) = q["tab"].as_str() {
+                self.tab = match t {
+                    "results" => Tab::Results,
+                    "material" => Tab::Material,
+                    "solve" => Tab::Solve,
+                    _ => self.tab,
+                };
+            }
+        }
         self.safety_ui(&ctx);
+        self.chart_window(&ctx);
+        self.material_window(&ctx);
+        if !ctx.egui_wants_keyboard_input() {
+            let (undo, redo) = ctx.input_mut(|i| {
+                let redo = i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)) || i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y));
+                let undo = i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z));
+                (undo, redo)
+            });
+            if undo {
+                self.run("undo", json!({}));
+            }
+            if redo {
+                self.run("redo", json!({}));
+            }
+        }
         self.fatigue_window(&ctx);
         if let Some((msg, err, ttl)) = &mut self.toast {
             *ttl -= (ui.input(|i| i.stable_dt) as f64).min(0.1);
