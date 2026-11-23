@@ -5,6 +5,7 @@ use rayon::prelude::*;
 
 /// Sparse matrix whose sparsity follows node adjacency, with `bs` dofs per node.
 /// Row (node n, comp c) holds deg(n)*bs entries laid out as [neighbour][comp].
+#[derive(Clone)]
 pub struct NodeSparse {
     pub bs: usize,
     pub ptr: Vec<usize>,
@@ -23,7 +24,10 @@ impl NodeSparse {
         let mut ptr = Vec::with_capacity(n_nodes + 1);
         let mut adj = Vec::new();
         ptr.push(0);
-        for l in lists.iter_mut() {
+        for (i, l) in lists.iter_mut().enumerate() {
+            if l.is_empty() {
+                l.push(i as u32); // isolated node: keep a diagonal entry
+            }
             l.sort_unstable();
             l.dedup();
             adj.extend_from_slice(l);
@@ -202,7 +206,13 @@ pub fn pcg(
     let mut r = vec![0.0; n];
     a.matvec(x, &mut r);
     zip_apply(&mut r, b, |ri, bi| *ri = bi - *ri);
-    let bnorm = dotp(b, b).sqrt().max(1e-300);
+    // Converge relative to the initial residual: with Dirichlet rows in b (identity rows holding
+    // prescribed values) a b-relative test can stop long before the interior is solved.
+    let rinit = dotp(&r, &r).sqrt();
+    if rinit == 0.0 {
+        return Ok(CgStats { iterations: 0, residual: 0.0 });
+    }
+    let bnorm = rinit;
     let mut z: Vec<f64> = r.iter().zip(&dinv).map(|(r, d)| r * d).collect();
     let mut p = z.clone();
     let mut rz = dotp(&r, &z);
@@ -357,16 +367,20 @@ fn rcm(ptr: &[usize], adj: &[u32]) -> Vec<usize> {
     let deg = |i: usize| ptr[i + 1] - ptr[i];
     let mut visited = vec![false; n];
     let mut order = Vec::with_capacity(n);
-    let bfs_last = |start: usize| -> usize {
-        let mut seen = vec![false; n];
+    // visit stamps shared by all searches (no per-search allocation: models can have millions
+    // of isolated nodes, e.g. the air of a microwave cavity in a solid-only thermal solve)
+    let mut seen = vec![0u32; n];
+    let mut stamp = 0u32;
+    let mut bfs_last = |start: usize| -> usize {
+        stamp += 1;
         let mut q = std::collections::VecDeque::from([start]);
-        seen[start] = true;
+        seen[start] = stamp;
         let mut last = start;
         while let Some(v) = q.pop_front() {
             last = v;
             for &w in &adj[ptr[v]..ptr[v + 1]] {
-                if !seen[w as usize] {
-                    seen[w as usize] = true;
+                if seen[w as usize] != stamp {
+                    seen[w as usize] = stamp;
                     q.push_back(w as usize);
                 }
             }
@@ -377,8 +391,14 @@ fn rcm(ptr: &[usize], adj: &[u32]) -> Vec<usize> {
         if visited[s0] {
             continue;
         }
+        if adj[ptr[s0]..ptr[s0 + 1]].iter().all(|&w| w as usize == s0) {
+            visited[s0] = true;
+            order.push(s0);
+            continue;
+        }
         // pseudo-peripheral start node
-        let start = bfs_last(bfs_last(s0));
+        let far = bfs_last(s0);
+        let start = bfs_last(far);
         let start = if visited[start] { s0 } else { start };
         let mut q = std::collections::VecDeque::from([start]);
         visited[start] = true;
@@ -430,6 +450,11 @@ impl Factor {
             start[i + 1] = start[i] + (i - first[i] + 1);
         }
         if start[n] > max_entries {
+            return None;
+        }
+        // estimated factorisation work Σ rowlen²; beyond the budget PCG is faster
+        let flops: f64 = (0..n).map(|i| ((i - first[i] + 1) as f64).powi(2)).sum();
+        if flops > DIRECT_MAX_FLOPS {
             return None;
         }
         let mut l = vec![0.0; start[n]];
@@ -506,30 +531,75 @@ impl Factor {
 
 /// Max envelope entries for the direct solver (~1.2 GB of f64 at the limit).
 pub const DIRECT_MAX: usize = 150_000_000;
+/// Max estimated factorisation work for the direct solver.
+pub const DIRECT_MAX_FLOPS: f64 = 2.0e10;
+
+/// Accumulated wall time spent inside linear solves (reset per analysis).
+pub static SOLVE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub enum Solver {
     Direct(Factor),
     Iterative,
+    Gpu(crate::gpu::GpuSystem),
 }
+
+/// Smallest system (unknowns) sent to the GPU in Auto mode; below this the CPU is faster.
+pub const GPU_AUTO_MIN: usize = 50_000;
 
 impl Solver {
     pub fn new(a: &NodeSparse) -> Result<Solver> {
+        use crate::gpu::{ComputeMode, GpuSystem};
+        let mode = crate::gpu::mode();
+        if std::env::var("SIMCRAFT_ITERATIVE").is_ok() && mode == ComputeMode::Cpu {
+            return Ok(Solver::Iterative);
+        }
+        let try_gpu = |why: &str| -> Option<Solver> {
+            match GpuSystem::new(a) {
+                Ok(g) => Some(Solver::Gpu(g)),
+                Err(e) => {
+                    crate::gpu::note_fallback(format!("{why}, but the GPU could not be used ({e:#}); solved on the CPU instead"));
+                    None
+                }
+            }
+        };
+        if mode == ComputeMode::Gpu {
+            if let Some(s) = try_gpu("GPU compute was requested") {
+                return Ok(s);
+            }
+        }
         if std::env::var("SIMCRAFT_ITERATIVE").is_ok() {
             return Ok(Solver::Iterative);
         }
         match Factor::new(a, DIRECT_MAX) {
             Some(f) => Ok(Solver::Direct(f?)),
-            None => Ok(Solver::Iterative),
+            None => {
+                if mode == ComputeMode::Auto && a.n() >= GPU_AUTO_MIN {
+                    if let Some(s) = try_gpu("this large model was sent to the GPU") {
+                        return Ok(s);
+                    }
+                }
+                Ok(Solver::Iterative)
+            }
         }
     }
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> String {
         match self {
-            Solver::Direct(_) => "direct sparse Cholesky",
-            Solver::Iterative => "Jacobi-PCG iterative",
+            Solver::Direct(_) => "direct sparse Cholesky (CPU)".into(),
+            Solver::Iterative => "Jacobi-PCG iterative (CPU)".into(),
+            Solver::Gpu(g) => format!("Jacobi-PCG iterative (GPU: {})", g.device_name),
         }
+    }
+    pub fn on_gpu(&self) -> bool {
+        matches!(self, Solver::Gpu(_))
     }
     /// Solve a x = b; `x` holds the initial guess for the iterative path.
     pub fn solve(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, progress: &dyn Fn(f64)) -> Result<usize> {
+        let t = std::time::Instant::now();
+        let r = self.solve_inner(a, b, x, tol, progress);
+        SOLVE_NANOS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        r
+    }
+    fn solve_inner(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, progress: &dyn Fn(f64)) -> Result<usize> {
         match self {
             Solver::Direct(f) => {
                 let r = f.solve(b);
@@ -537,6 +607,13 @@ impl Solver {
                 Ok(0)
             }
             Solver::Iterative => Ok(pcg(a, b, x, tol, 30_000, progress)?.iterations),
+            Solver::Gpu(g) => match g.solve(a, b, x, tol, 30_000, progress) {
+                Ok(n) => Ok(n),
+                Err(e) => {
+                    crate::gpu::note_fallback(format!("GPU solve failed ({e:#}); solved on the CPU instead"));
+                    Ok(pcg(a, b, x, tol, 30_000, progress)?.iterations)
+                }
+            },
         }
     }
 }

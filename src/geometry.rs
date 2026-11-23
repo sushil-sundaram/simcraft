@@ -95,9 +95,28 @@ pub enum Shape {
         #[serde(skip)]
         data: Option<Arc<StlData>>,
     },
+    /// Printed circuit board imported from KiCad: outline extruded over the board thickness, with
+    /// homogenised copper (see `kicad.rs`). `offset` = position of the board's min corner.
+    Pcb {
+        path: String,
+        #[serde(default)]
+        offset: V3,
+        #[serde(skip)]
+        data: Option<Arc<crate::kicad::PcbData>>,
+    },
 }
 fn one() -> f64 {
     1.0
+}
+
+/// Solid bodies are the parts being analysed; an enclosure is the surrounding air / fluid box
+/// used by electrostatic, magnetostatic and CFD analyses.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    #[default]
+    Solid,
+    Enclosure,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -108,12 +127,23 @@ pub struct Body {
     pub op: Op,
     #[serde(default = "default_material")]
     pub material: String,
+    #[serde(default)]
+    pub role: Role,
 }
 pub fn default_material() -> String {
     "Structural Steel".to_string()
 }
 
 impl Shape {
+    /// Exact volume [mm³] of primitive shapes (None for STL).
+    pub fn volume(&self) -> Option<f64> {
+        match self {
+            Shape::Box { size, .. } => Some(size[0] * size[1] * size[2]),
+            Shape::Cylinder { radius, height, .. } => Some(std::f64::consts::PI * radius * radius * height),
+            Shape::Sphere { radius, .. } => Some(4.0 / 3.0 * std::f64::consts::PI * radius.powi(3)),
+            Shape::Stl { .. } | Shape::Pcb { .. } => None,
+        }
+    }
     pub fn bounds(&self) -> (V3, V3) {
         match self {
             Shape::Box { min, size } => (*min, add(*min, *size)),
@@ -137,6 +167,10 @@ impl Shape {
             Shape::Stl { data, .. } => match data {
                 Some(d) => (d.min, d.max),
                 None => ([0.0; 3], [0.0; 3]),
+            },
+            Shape::Pcb { data, offset, .. } => match data {
+                Some(d) => crate::kicad::board_bounds(d, *offset),
+                None => (*offset, *offset),
             },
         }
     }
@@ -163,6 +197,11 @@ impl Shape {
                     bail!("STL '{path}' is not loaded");
                 }
             }
+            Shape::Pcb { data, path, .. } => {
+                if data.is_none() {
+                    bail!("KiCad board '{path}' is not loaded");
+                }
+            }
         }
         Ok(())
     }
@@ -186,6 +225,10 @@ impl Shape {
                 dot(d, d) <= radius * radius
             }
             Shape::Stl { .. } => false,
+            Shape::Pcb { data, offset, .. } => match data {
+                Some(d) => p[2] >= offset[2] && p[2] <= offset[2] + d.thickness && d.inside(p[0] - offset[0], p[1] - offset[1]),
+                None => false,
+            },
         }
     }
 
@@ -201,6 +244,7 @@ impl Shape {
                 let n = data.as_ref().map(|d| d.n_segments).unwrap_or(0);
                 (0..n).map(|i| format!("face{i}")).collect()
             }
+            Shape::Pcb { .. } => ["edge", "bottom", "top"].iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -267,6 +311,20 @@ impl Shape {
             Shape::Sphere { center, radius } => {
                 let d = sub(p, *center);
                 (0, score((norm(d) - radius).abs(), normalize(d)))
+            }
+            Shape::Pcb { data, offset, .. } => {
+                let t = data.as_ref().map(|d| d.thickness).unwrap_or(0.0);
+                let bottom = score((p[2] - offset[2]).abs(), [0.0, 0.0, -1.0]);
+                let top = score((p[2] - offset[2] - t).abs(), [0.0, 0.0, 1.0]);
+                let side = if n[2].abs() < 0.5 { h * 0.25 } else { f64::INFINITY };
+                let mut best = (0, side);
+                if bottom < best.1 {
+                    best = (1, bottom);
+                }
+                if top < best.1 {
+                    best = (2, top);
+                }
+                best
             }
             Shape::Stl { data, .. } => {
                 let Some(d) = data else { return (0, f64::INFINITY) };

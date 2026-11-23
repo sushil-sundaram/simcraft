@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysimcraft"
+version = "0.1.0"
+description = "Drive the SimCraft simulation app from Python"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools]
+packages = ["pysimcraft"]

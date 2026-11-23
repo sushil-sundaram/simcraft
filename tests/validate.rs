@@ -2,10 +2,10 @@ use simcraft::{fem, geometry::*, material, mesh, model::*};
 
 fn beam(h: f64) -> (Model, mesh::Mesh) {
     let mut m = Model::default();
-    m.bodies.push(Body { name: "beam".into(), shape: Shape::Box { min: [0.0; 3], size: [100.0, 10.0, 10.0] }, op: Op::Add, material: "Structural Steel".into() });
+    m.bodies.push(Body { name: "beam".into(), shape: Shape::Box { min: [0.0; 3], size: [100.0, 10.0, 10.0] }, op: Op::Add, material: "Structural Steel".into(), role: Role::Solid });
     m.loads.push(LoadItem { id: 1, load: Load::FixedSupport { faces: vec!["beam.xmin".into()] } });
     m.loads.push(LoadItem { id: 2, load: Load::Force { faces: vec!["beam.xmax".into()], vector: [0.0, 0.0, -100.0] } });
-    let me = mesh::build_mesh(&m.bodies, h, &material::library()).unwrap();
+    let me = mesh::build_mesh(&m.bodies, h, &material::library(), false).unwrap();
     (m, me)
 }
 
@@ -30,10 +30,10 @@ fn cantilever_static_and_modal() {
 fn thermal_bar() {
     let mut m = Model::default();
     m.analysis.kind = AnalysisType::SteadyThermal;
-    m.bodies.push(Body { name: "bar".into(), shape: Shape::Box { min: [0.0; 3], size: [100.0, 10.0, 10.0] }, op: Op::Add, material: "Copper C101".into() });
+    m.bodies.push(Body { name: "bar".into(), shape: Shape::Box { min: [0.0; 3], size: [100.0, 10.0, 10.0] }, op: Op::Add, material: "Copper C101".into(), role: Role::Solid });
     m.loads.push(LoadItem { id: 1, load: Load::Temperature { faces: vec!["bar.xmin".into()], value: 100.0 } });
     m.loads.push(LoadItem { id: 2, load: Load::Temperature { faces: vec!["bar.xmax".into()], value: 0.0 } });
-    let me = mesh::build_mesh(&m.bodies, 2.5, &material::library()).unwrap();
+    let me = mesh::build_mesh(&m.bodies, 2.5, &material::library(), false).unwrap();
     let r = fem::solve(&m, &me, &|_, _| {}).unwrap();
     // Q = k A dT / L = 391 * 1e-4 * 100 / 0.1 = 39.1 W
     println!("heat flows {:?}", r.reactions);
@@ -44,12 +44,12 @@ fn thermal_bar() {
 fn free_thermal_expansion_no_stress() {
     let mut m = Model::default();
     m.analysis.kind = AnalysisType::ThermalStress;
-    m.bodies.push(Body { name: "b".into(), shape: Shape::Box { min: [0.0; 3], size: [50.0, 10.0, 10.0] }, op: Op::Add, material: "Structural Steel".into() });
+    m.bodies.push(Body { name: "b".into(), shape: Shape::Box { min: [0.0; 3], size: [50.0, 10.0, 10.0] }, op: Op::Add, material: "Structural Steel".into(), role: Role::Solid });
     m.loads.push(LoadItem { id: 1, load: Load::Temperature { faces: vec!["all".into()], value: 122.0 } });
     m.loads.push(LoadItem { id: 2, load: Load::Displacement { faces: vec!["b.xmin".into()], x: Some(0.0), y: None, z: None } });
     m.loads.push(LoadItem { id: 3, load: Load::Displacement { faces: vec!["b.ymin".into()], x: None, y: Some(0.0), z: None } });
     m.loads.push(LoadItem { id: 4, load: Load::Displacement { faces: vec!["b.zmin".into()], x: None, y: None, z: Some(0.0) } });
-    let me = mesh::build_mesh(&m.bodies, 2.5, &material::library()).unwrap();
+    let me = mesh::build_mesh(&m.bodies, 2.5, &material::library(), false).unwrap();
     let r = fem::solve(&m, &me, &|_, _| {}).unwrap();
     let ux = r.disp.as_ref().unwrap().iter().map(|d| d[0]).fold(0.0, f64::max);
     let vm = r.vm.as_ref().unwrap().iter().cloned().fold(0.0, f64::max);

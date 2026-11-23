@@ -54,8 +54,15 @@ impl Camera {
     }
     pub fn fit(&mut self, lo: V3, hi: V3, w: f64, h: f64) {
         self.target = scale(add(lo, hi), 0.5);
-        let diag = norm(sub(hi, lo)).max(1e-6);
-        self.zoom = 0.78 * w.min(h) / diag;
+        let (r, u, _) = self.basis();
+        let (mut sx, mut sy) = (1e-9f64, 1e-9f64);
+        for i in 0..8 {
+            let c = [if i & 1 == 0 { lo[0] } else { hi[0] }, if i & 2 == 0 { lo[1] } else { hi[1] }, if i & 4 == 0 { lo[2] } else { hi[2] }];
+            let d = sub(c, self.target);
+            sx = sx.max(dot(d, r).abs());
+            sy = sy.max(dot(d, u).abs());
+        }
+        self.zoom = 0.84 * (w / (2.0 * sx)).min(h / (2.0 * sy));
     }
     pub fn project(&self, p: V3, w: f64, h: f64) -> (f64, f64, f64) {
         let (r, u, f) = self.basis();
@@ -86,10 +93,21 @@ pub struct Display {
     /// Dark viewport / UI theme.
     #[serde(default)]
     pub dark: bool,
+    /// Cut-plane view through the domain.
+    #[serde(default)]
+    pub section: Option<Section>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Section {
+    /// 0 = x, 1 = y, 2 = z
+    pub axis: usize,
+    /// 0..1 across the domain
+    pub position: f64,
 }
 impl Default for Display {
     fn default() -> Self {
-        Display { show_results: false, field: Field::TotalDeformation, mode: 0, deformation_scale: None, show_mesh: true, show_undeformed: false, dark: false }
+        Display { show_results: false, field: Field::TotalDeformation, mode: 0, deformation_scale: None, show_mesh: true, show_undeformed: false, dark: false, section: None }
     }
 }
 
@@ -120,6 +138,14 @@ pub fn load_color(l: &Load) -> [u8; 3] {
         Load::Temperature { .. } => [230, 60, 120],
         Load::HeatFlux { .. } => [230, 190, 20],
         Load::Convection { .. } => [20, 180, 200],
+        Load::CompressionOnly { .. } => [40, 160, 230],
+        Load::Symmetry { .. } => [120, 130, 210],
+        Load::Voltage { .. } => [170, 60, 220],
+        Load::Current { .. } => [210, 80, 190],
+        Load::Inlet { .. } => [40, 190, 90],
+        Load::Outlet { .. } => [150, 200, 40],
+        Load::Coil { .. } => [200, 120, 40],
+        Load::Magnet { .. } => [200, 50, 80],
         _ => [160, 160, 160],
     }
 }
@@ -131,8 +157,12 @@ pub struct Scene {
     pub t: Vec<f64>,
     pub color: Vec<[u8; 3]>,
     pub face: Vec<u32>,
+    /// Per quad: 0 = solid surface, 1 = enclosure wall (drawn only from inside), 2 = section cut.
+    pub kind: Vec<u8>,
     pub undeformed: Vec<V3>,
     pub range: Option<(f64, f64)>,
+    /// Colour scale reversed (low values red) — see `Field::reversed_scale`.
+    pub reversed: bool,
     pub scale_used: f64,
     pub lo: V3,
     pub hi: V3,
@@ -197,14 +227,49 @@ pub fn build_scene(
         t: Vec::with_capacity(n),
         color: Vec::with_capacity(n),
         face: Vec::with_capacity(mesh.faces.len()),
+        kind: Vec::with_capacity(mesh.faces.len()),
         undeformed: Vec::new(),
         range,
+        reversed: disp.field.reversed_scale(),
         scale_used,
         lo: [f64::INFINITY; 3],
         hi: [f64::NEG_INFINITY; 3],
     };
+    if !use_res {
+        for it in &model.loads {
+            if let Some(b) = it.load.body() {
+                if let Ok(els) = mesh.body_elems(b) {
+                    let set: HashSet<u32> = els.iter().map(|&e| e as u32).collect();
+                    for (fi, f) in mesh.faces.iter().enumerate() {
+                        if !f.outer && set.contains(&f.elem) && face_color[fi].is_none() {
+                            face_color[fi] = Some(load_color(&it.load));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let section = disp.section.map(|sec| {
+        let a = sec.axis.min(2);
+        (a, mesh.bbox.0[a] + sec.position.clamp(0.0, 1.0) * (mesh.bbox.1[a] - mesh.bbox.0[a]))
+    });
+    let defl = if section.is_some() { None } else { defl };
+    let rev = disp.field.reversed_scale();
+    let norm_t = |v: f64| {
+        let t = match range {
+            Some((mn, mx)) if mx - mn > 1e-30 * mx.abs().max(1.0) => (v - mn) / (mx - mn),
+            _ => 0.5,
+        };
+        if rev { 1.0 - t } else { t }
+    };
     let k = scale_used * anim;
     for (fi, f) in mesh.faces.iter().enumerate() {
+        if let Some((a, pc)) = section {
+            // cut away the half in front of the plane
+            if !f.outer && mesh.elem_center(f.elem as usize)[a] < pc {
+                continue;
+            }
+        }
         let hl = highlight.contains(&f.patch);
         for &nid in &f.nodes {
             let base = mesh.nodes[nid as usize];
@@ -221,16 +286,13 @@ pub fn build_scene(
                 s.undeformed.push(base);
             }
             let (t, col) = match (&values, range) {
-                (Some(v), Some((mn, mx))) => {
-                    let t = if mx - mn > 1e-30 * mx.abs().max(1.0) { (v[nid as usize] - mn) / (mx - mn) } else { 0.5 };
+                (Some(v), Some(_)) => {
+                    let t = norm_t(v[nid as usize]);
                     (t, [0, 0, 0])
                 }
                 _ => {
-                    let c = if hl {
-                        [40, 200, 90]
-                    } else {
-                        face_color[fi].unwrap_or([178, 182, 190])
-                    };
+                    let base = if f.outer { if disp.dark { [70, 78, 92] } else { [214, 222, 234] } } else { [178, 182, 190] };
+                    let c = if hl { [40, 200, 90] } else { face_color[fi].unwrap_or(base) };
                     (f64::NAN, c)
                 }
             };
@@ -238,6 +300,49 @@ pub fn build_scene(
             s.color.push(col);
         }
         s.face.push(fi as u32);
+        s.kind.push(if f.outer { 1 } else { 0 });
+    }
+    // section quads through every element cut by the plane
+    if let Some((a, pc)) = section {
+        let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+        let h = mesh.h;
+        for (e, en) in mesh.elems.iter().enumerate() {
+            let lower = mesh.origin[a] + mesh.elem_cell[e][a] as f64 * h;
+            if !(pc >= lower && pc < lower + h) {
+                continue;
+            }
+            let w = (pc - lower) / h;
+            for (ob, oc) in [(0usize, 0usize), (1, 0), (1, 1), (0, 1)] {
+                let pick = |da: usize| {
+                    let mut d = [0usize; 3];
+                    d[a] = da;
+                    d[b] = ob;
+                    d[c] = oc;
+                    en[crate::mesh::CORNER.iter().position(|q| *q == d).unwrap()] as usize
+                };
+                let (n0, n1) = (pick(0), pick(1));
+                let mut pos = mesh.nodes[n0];
+                pos[a] = pc;
+                s.pos.push(pos);
+                for q in 0..3 {
+                    s.lo[q] = s.lo[q].min(pos[q]);
+                    s.hi[q] = s.hi[q].max(pos[q]);
+                }
+                match &values {
+                    Some(v) => {
+                        s.t.push(norm_t((1.0 - w) * v[n0] + w * v[n1]));
+                        s.color.push([0, 0, 0]);
+                    }
+                    None => {
+                        s.t.push(f64::NAN);
+                        let solid = mesh.elem_region[e] == crate::mesh::REGION_SOLID;
+                        s.color.push(if solid { [160, 166, 176] } else if disp.dark { [60, 90, 120] } else { [190, 215, 240] });
+                    }
+                }
+            }
+            s.face.push(u32::MAX);
+            s.kind.push(2);
+        }
     }
     s
 }
@@ -286,8 +391,10 @@ pub fn rasterize(scene: &Scene, cam: &Camera, w: usize, h: usize, show_mesh: boo
     for (qi, quad) in proj.chunks(4).enumerate() {
         let p = &scene.pos[qi * 4..qi * 4 + 4];
         let nrm = normalize(cross(sub(p[1], p[0]), sub(p[3], p[0])));
-        if dot(nrm, fwd) > 0.05 {
-            continue; // back face
+        match scene.kind.get(qi).copied().unwrap_or(0) {
+            0 if dot(nrm, fwd) > 0.05 => continue,  // back face of a solid
+            1 if dot(nrm, fwd) < -0.05 => continue, // near enclosure wall: see through it
+            _ => {}
         }
         let shade = 0.38 + 0.62 * dot(nrm, light).abs();
         let edge_px = {
@@ -401,6 +508,16 @@ const FONT: &[(char, [u8; 7])] = &[
     ('2', [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F]),
     ('H', [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11]),
     ('z', [0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F]),
+    ('s', [0x00, 0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E]),
+    ('V', [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04]),
+    ('A', [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11]),
+    ('T', [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04]),
+    ('K', [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11]),
+    ('J', [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C]),
+    ('N', [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11]),
+    ('°', [0x0C, 0x12, 0x12, 0x0C, 0x00, 0x00, 0x00]),
+    ('²', [0x0C, 0x02, 0x04, 0x0E, 0x00, 0x00, 0x00]),
+    ('³', [0x0E, 0x02, 0x06, 0x02, 0x0E, 0x00, 0x00]),
     (' ', [0; 7]),
 ];
 
@@ -465,7 +582,7 @@ pub fn render_png(scene: &Scene, cam: &Camera, w: usize, h: usize, show_mesh: bo
         let (lx, ly, bw, bh) = (14usize, 30usize, 22usize, 22usize);
         let sc = if w >= 900 { 2 } else { 1 };
         for b in 0..9 {
-            let col = BANDS[8 - b];
+            let col = if scene.reversed { BANDS[b] } else { BANDS[8 - b] };
             for y in ly + b * bh..ly + (b + 1) * bh {
                 for x in lx..lx + bw {
                     if x < w && y < h {
