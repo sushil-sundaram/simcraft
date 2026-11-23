@@ -17,7 +17,7 @@ pub struct Session {
     pub model: Model,
     pub mesh: Option<Arc<Mesh>>,
     mesh_rev: u64,
-    mesh_mode: bool,
+    mesh_mode: (bool, bool),
     pub geom_rev: u64,
     pub results: Option<Arc<Results>>,
     pub results_stale: bool,
@@ -42,7 +42,7 @@ impl Default for Session {
             model: Model::default(),
             mesh: None,
             mesh_rev: u64::MAX,
-            mesh_mode: false,
+            mesh_mode: (false, false),
             geom_rev: 0,
             results: None,
             results_stale: false,
@@ -117,17 +117,39 @@ impl Session {
         matches!(self.model.analysis.kind, AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating)
     }
     pub fn mesh_valid(&self) -> bool {
-        self.mesh.as_ref().is_some_and(|m| self.fdtd() || m.elems.len() <= mesh::MAX_CELLS) && self.mesh_rev == self.geom_rev && self.mesh_mode == self.model.mesh_with_enclosure()
+        self.mesh.as_ref().is_some_and(|m| self.fdtd() || m.elems.len() <= mesh::MAX_CELLS) && self.mesh_rev == self.geom_rev && self.mesh_mode == (self.model.mesh_with_enclosure(), self.model.mesh_fitted())
     }
     pub fn ensure_mesh(&mut self) -> Result<Arc<Mesh>> {
         if self.mesh_valid() {
             return Ok(self.mesh.clone().unwrap());
         }
         let h = self.element_size();
-        let mode = self.model.mesh_with_enclosure();
+        let mode = (self.model.mesh_with_enclosure(), self.model.mesh_fitted());
         let limit = if self.fdtd() { mesh::MAX_CELLS_FDTD } else { mesh::MAX_CELLS };
-        let m = Arc::new(mesh::build_mesh_max(&self.model.bodies, h, &self.model.materials(), mode, limit)?);
+        let m = Arc::new(mesh::build_for(&self.model, h, limit)?);
+        // results computed on another mesh cannot be shown on this one
+        if self.results.as_ref().is_some_and(|r| r.node_len().is_some_and(|n| n != m.nodes.len())) {
+            self.results = None;
+        }
         self.mesh_mode = mode;
+        self.mesh = Some(m.clone());
+        self.mesh_rev = self.geom_rev;
+        self.revision += 1;
+        Ok(m)
+    }
+    /// Plain voxel mesh (no boundary fitting), e.g. for topology optimisation on the voxel grid.
+    /// Becomes the session mesh so results display on it; the next fitted solve rebuilds.
+    pub fn ensure_plain_mesh(&mut self) -> Result<Arc<Mesh>> {
+        let m = self.ensure_mesh()?;
+        if m.fitted.is_empty() {
+            return Ok(m);
+        }
+        let h = self.element_size();
+        let m = Arc::new(mesh::build_mesh_max(&self.model.bodies, h, &self.model.materials(), self.model.mesh_with_enclosure(), mesh::MAX_CELLS)?);
+        if self.results.as_ref().is_some_and(|r| r.node_len().is_some_and(|n| n != m.nodes.len())) {
+            self.results = None;
+        }
+        self.mesh_mode = (self.model.mesh_with_enclosure(), false);
         self.mesh = Some(m.clone());
         self.mesh_rev = self.geom_rev;
         self.revision += 1;
@@ -627,6 +649,9 @@ impl Core {
                     }
                     st.combination = c.to_lowercase();
                 }
+                if let Some(b) = a.get("boundary_fit").and_then(|v| v.as_bool()) {
+                    st.boundary_fit = b;
+                }
                 if let Some(t) = opt_str(a, "turbulence") {
                     let t = t.to_lowercase();
                     if !matches!(t.as_str(), "laminar" | "lvel") {
@@ -1056,7 +1081,7 @@ impl Core {
     fn study_inner(&self, tool: &str, a: &Value) -> Result<Output> {
         let (model, mesh, project) = {
             let mut s = self.session.lock().unwrap();
-            let mesh = if tool == "topology_optimize" { Some(s.ensure_mesh()?) } else { None };
+            let mesh = if tool == "topology_optimize" { Some(s.ensure_plain_mesh()?) } else { None };
             (s.model.clone(), mesh, s.project_path.clone())
         };
         *self.progress.lock().unwrap() = Progress { running: true, fraction: 0.0, message: "starting study".into() };
@@ -1300,7 +1325,7 @@ pub fn tool_defs() -> Vec<Value> {
         t("list_materials", "List the engineering materials library with properties.", json!({}), &[]),
         t("define_material", "Create or overwrite a custom material. Unspecified properties come from 'based_on' (default Structural Steel).", json!({"name": {"type": "string"}, "based_on": {"type": "string"}, "fatigue_strength_coefficient_mpa": {"type": "number", "description": "Basquin σf' (0 = estimate)"}, "fatigue_exponent": {"type": "number", "description": "Basquin b, negative (e.g. -0.09)"}, "endurance_limit_mpa": {"type": "number"}, "relative_permittivity": {"type": "number", "description": "εr"}, "electrical_conductivity": {"type": "number", "description": "S/m"}, "relative_permeability": {"type": "number", "description": "μr"}, "loss_tangent": {"type": "number", "description": "dielectric tan δ at the RF frequency (full-wave EM)"}, "youngs_modulus_gpa": {"type": "number"}, "poisson_ratio": {"type": "number"}, "density": {"type": "number", "description": "kg/m³"}, "yield_strength_mpa": {"type": "number"}, "ultimate_strength_mpa": {"type": "number"}, "thermal_conductivity": {"type": "number", "description": "W/(m·K)"}, "thermal_expansion": {"type": "number", "description": "1/K"}, "specific_heat": {"type": "number"}}), &["name"]),
         t("set_material", "Assign a material to bodies (all bodies if 'bodies' omitted).", json!({"material": {"type": "string"}, "bodies": {"type": "array", "items": {"type": "string"}}}), &["material"]),
-        t("set_analysis", "Choose the analysis system and its settings. Structural: static_structural, modal, linear_buckling, transient_structural, nonlinear_structural (plasticity), harmonic_response (forces/pressures are amplitudes), response_spectrum and random_vibration (base excitation; supports only, give 'table' and 'direction'). Follow with fatigue_life for S-N fatigue. Thermal: steady_thermal, transient_thermal, thermal_stress. Electromagnetic: electrostatic, current_flow, thermal_electric, magnetostatic (needs enclosure). Full-wave EM: full_wave_em (FDTD at one frequency: E field, absorbed power, SAR; needs an enclosure = the cavity or air box, and an RF port via add_port) and microwave_heating (full_wave_em + transient heating of the solids over end_time). Fluids: fluid (needs enclosure) and conjugate_heat_transfer (flow + temperature in fluid and solids: electronics cooling, heat sinks; add_heat_generation in the parts, add_inlet with temperature, add_gravity for natural convection/buoyancy).", json!({"type": {"type": "string", "enum": AnalysisType::all().iter().map(|a| a.key()).collect::<Vec<_>>()}, "modes": {"type": "integer", "description": "Number of modes for modal / buckling (default 6)"}, "reference_temperature": {"type": "number", "description": "Stress-free temperature °C (default 22)"}, "end_time": {"type": "number", "description": "Transient end time [s] (default 1)"}, "time_steps": {"type": "integer", "description": "Transient time steps (default 50)"}, "initial_temperature": {"type": "number", "description": "Transient thermal start temperature °C"}, "damping_ratio": {"type": "number", "description": "Transient structural damping ratio (default 0.02)"}, "load_steps": {"type": "integer", "description": "Nonlinear load steps (default 10)"}, "max_iterations": {"type": "integer", "description": "CFD pseudo-time iterations (default 3000)"}, "turbulence": {"type": "string", "enum": ["laminar", "lvel"], "description": "CFD turbulence model: laminar (default) or lvel (algebraic wall-distance model, good for electronics enclosures)"}, "freq_min": {"type": "number", "description": "Harmonic sweep start [Hz] (default 0.5·f1)"}, "freq_max": {"type": "number", "description": "Harmonic sweep end [Hz] (default 1.5·highest mode used)"}, "freq_steps": {"type": "integer", "description": "Harmonic frequency points (default 300; resonances are refined automatically)"}, "table": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}, "description": "[[Hz, value], ...] — response spectrum: acceleration in g; random vibration: acceleration PSD in g²/Hz (log-log interpolated)"}, "direction": {"type": "string", "enum": ["x", "y", "z"], "description": "Base-excitation direction for response spectrum / random vibration"}, "combination": {"type": "string", "enum": ["srss", "cqc"], "description": "Response spectrum modal combination (default srss)"}, "frequency_ghz": {"type": "number", "description": "Full-wave EM / microwave heating excitation frequency in GHz (default 2.45)"}, "em_boundary": {"type": "string", "enum": ["pec", "open"], "description": "Full-wave EM outer boundary: pec = the enclosure is a closed metal cavity (oven), open = absorbing (radiation, EMI)"}, "max_periods": {"type": "integer", "description": "Full-wave EM: max RF periods to reach steady state (default 400)"}, "compute": {"type": "string", "enum": ["auto", "cpu", "gpu"], "description": "Where linear solves run: auto = CPU direct for small models, GPU for large iterative solves; cpu; gpu = always GPU (falls back to CPU if unavailable)"}}), &[]),
+        t("set_analysis", "Choose the analysis system and its settings. Structural: static_structural, modal, linear_buckling, transient_structural, nonlinear_structural (plasticity), harmonic_response (forces/pressures are amplitudes), response_spectrum and random_vibration (base excitation; supports only, give 'table' and 'direction'). Follow with fatigue_life for S-N fatigue. Thermal: steady_thermal, transient_thermal, thermal_stress. Electromagnetic: electrostatic, current_flow, thermal_electric, magnetostatic (needs enclosure). Full-wave EM: full_wave_em (FDTD at one frequency: E field, absorbed power, SAR; needs an enclosure = the cavity or air box, and an RF port via add_port) and microwave_heating (full_wave_em + transient heating of the solids over end_time). Fluids: fluid (needs enclosure) and conjugate_heat_transfer (flow + temperature in fluid and solids: electronics cooling, heat sinks; add_heat_generation in the parts, add_inlet with temperature, add_gravity for natural convection/buoyancy).", json!({"type": {"type": "string", "enum": AnalysisType::all().iter().map(|a| a.key()).collect::<Vec<_>>()}, "modes": {"type": "integer", "description": "Number of modes for modal / buckling (default 6)"}, "reference_temperature": {"type": "number", "description": "Stress-free temperature °C (default 22)"}, "end_time": {"type": "number", "description": "Transient end time [s] (default 1)"}, "time_steps": {"type": "integer", "description": "Transient time steps (default 50)"}, "initial_temperature": {"type": "number", "description": "Transient thermal start temperature °C"}, "damping_ratio": {"type": "number", "description": "Transient structural damping ratio (default 0.02)"}, "load_steps": {"type": "integer", "description": "Nonlinear load steps (default 10)"}, "max_iterations": {"type": "integer", "description": "CFD pseudo-time iterations (default 3000)"}, "boundary_fit": {"type": "boolean", "description": "Static structural: move surface nodes onto the true curved/off-grid surfaces for accurate peak stresses (default true)"}, "turbulence": {"type": "string", "enum": ["laminar", "lvel"], "description": "CFD turbulence model: laminar (default) or lvel (algebraic wall-distance model, good for electronics enclosures)"}, "freq_min": {"type": "number", "description": "Harmonic sweep start [Hz] (default 0.5·f1)"}, "freq_max": {"type": "number", "description": "Harmonic sweep end [Hz] (default 1.5·highest mode used)"}, "freq_steps": {"type": "integer", "description": "Harmonic frequency points (default 300; resonances are refined automatically)"}, "table": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}, "description": "[[Hz, value], ...] — response spectrum: acceleration in g; random vibration: acceleration PSD in g²/Hz (log-log interpolated)"}, "direction": {"type": "string", "enum": ["x", "y", "z"], "description": "Base-excitation direction for response spectrum / random vibration"}, "combination": {"type": "string", "enum": ["srss", "cqc"], "description": "Response spectrum modal combination (default srss)"}, "frequency_ghz": {"type": "number", "description": "Full-wave EM / microwave heating excitation frequency in GHz (default 2.45)"}, "em_boundary": {"type": "string", "enum": ["pec", "open"], "description": "Full-wave EM outer boundary: pec = the enclosure is a closed metal cavity (oven), open = absorbing (radiation, EMI)"}, "max_periods": {"type": "integer", "description": "Full-wave EM: max RF periods to reach steady state (default 400)"}, "compute": {"type": "string", "enum": ["auto", "cpu", "gpu"], "description": "Where linear solves run: auto = CPU direct for small models, GPU for large iterative solves; cpu; gpu = always GPU (falls back to CPU if unavailable)"}}), &[]),
         t("list_faces", "Mesh the geometry if needed and list selectable faces with area, centroid and outward normal. Call this before adding supports or loads.", json!({}), &[]),
         t("add_fixed_support", "Fix faces in all directions.", json!({"faces": faces}), &["faces"]),
         t("add_displacement", "Prescribe displacement (mm) on faces; omit a component to leave it free (e.g. z=0 for a roller).", json!({"faces": faces, "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}), &["faces"]),

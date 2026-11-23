@@ -58,6 +58,11 @@ pub struct Mesh {
     pub bbox: (V3, V3),
     pub body_names: Vec<String>,
     pub with_enclosure: bool,
+    /// Per patch: (body index, patch index within the body's shape).
+    pub patch_src: Vec<(u32, u32)>,
+    /// Per element: true when boundary fitting moved its nodes (general hexahedron, not a cube).
+    /// Empty for plain voxel meshes.
+    pub fitted: Vec<bool>,
 }
 
 /// Local hex node index for corner offset (dx,dy,dz).
@@ -128,6 +133,12 @@ pub fn build_mesh(bodies: &[Body], h: f64, materials: &[Material], with_enclosur
 pub const MAX_CELLS_FDTD: usize = 12_000_000;
 
 pub fn build_mesh_max(bodies: &[Body], h: f64, materials: &[Material], with_enclosure: bool, max_cells: usize) -> Result<Mesh> {
+    build_mesh_ex(bodies, h, materials, with_enclosure, max_cells, false)
+}
+
+/// `conservative`: keep only cells whose 8 corners are all inside the solid (for boundary
+/// fitting: every surface node then lies inside the true surface and moves outward onto it).
+pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclosure: bool, max_cells: usize, conservative: bool) -> Result<Mesh> {
     let has_solid = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Solid);
     let has_encl = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Enclosure);
     let with_enclosure = with_enclosure && has_encl;
@@ -270,6 +281,86 @@ pub fn build_mesh_max(bodies: &[Body], h: f64, materials: &[Material], with_encl
                 }
             }
         }
+    }
+
+    if conservative {
+        let (gx, gy, gz) = (nx + 1, ny + 1, nz + 1);
+        let nid = |i: usize, j: usize, k: usize| i + gx * (j + gy * k);
+        let node_pt = |i: usize, j: usize, k: usize| [origin[0] + i as f64 * h, origin[1] + j as f64 * h, origin[2] + k as f64 * h];
+        let eps = 1e-6 * h;
+        // membership of grid nodes (boundary counts as inside for added bodies, as outside for cuts)
+        let node_in = |body: &Body, strict: bool| -> Vec<bool> {
+            let mut v = vec![false; gx * gy * gz];
+            match &body.shape {
+                Shape::Stl { data: Some(d), .. } => {
+                    let cols: Vec<(usize, usize, Vec<f64>)> = (0..gy * gz)
+                        .into_par_iter()
+                        .map(|jk| {
+                            let (j, k) = (jk % gy, jk / gy);
+                            let p = node_pt(0, j, k);
+                            (j, k, d.x_crossings(p[1] + h * 1.1e-4, p[2] + h * 0.7e-4))
+                        })
+                        .collect();
+                    for (j, k, xs) in cols {
+                        for i in 0..gx {
+                            let x = node_pt(i, j, k)[0];
+                            if xs.iter().filter(|&&q| q < x).count() % 2 == 1 {
+                                v[nid(i, j, k)] = true;
+                            }
+                        }
+                    }
+                }
+                shape => {
+                    v.par_iter_mut().enumerate().for_each(|(g, o)| {
+                        let p = node_pt(g % gx, (g / gx) % gy, g / (gx * gy));
+                        *o = if strict {
+                            (0..6).all(|q| {
+                                let mut t = p;
+                                t[q / 2] += if q % 2 == 0 { -eps } else { eps };
+                                shape.contains(t)
+                            })
+                        } else {
+                            shape.contains(p)
+                        };
+                    });
+                }
+            }
+            v
+        };
+        let mut solid = vec![false; gx * gy * gz];
+        for b in bodies.iter().filter(|b| b.role == Role::Solid && b.op == Op::Add) {
+            for (s, v) in solid.iter_mut().zip(node_in(b, false)) {
+                *s |= v;
+            }
+        }
+        for b in bodies.iter().filter(|b| b.role == Role::Solid && b.op == Op::Subtract) {
+            for (s, v) in solid.iter_mut().zip(node_in(b, true)) {
+                if v {
+                    *s = false;
+                }
+            }
+        }
+        let mut dropped = 0usize;
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let c = cid(i, j, k);
+                    if occ[c] < 0 || region[c] != REGION_SOLID {
+                        continue;
+                    }
+                    let all = CORNER.iter().all(|o| solid[nid(i + o[0], j + o[1], k + o[2])]);
+                    if !all {
+                        occ[c] = if with_enclosure { encl_mat[c] } else { -1 };
+                        if with_enclosure && encl_mat[c] >= 0 {
+                            region[c] = REGION_ENCLOSURE;
+                            owner[c] = encl_owner[c];
+                        }
+                        dropped += 1;
+                    }
+                }
+            }
+        }
+        let _ = dropped;
     }
 
     // Connected components (face adjacency); drop tiny floating fragments.
@@ -429,10 +520,13 @@ pub fn build_mesh_max(bodies: &[Body], h: f64, materials: &[Material], with_encl
         .collect();
     let mut remap = vec![u32::MAX; names.len().max(1)];
     let mut patches: Vec<PatchInfo> = Vec::new();
+    let mut patch_src: Vec<(u32, u32)> = Vec::new();
     for (f, &g) in faces.iter_mut().zip(&assign) {
         let g = g as usize;
         if remap[g] == u32::MAX {
             remap[g] = patches.len() as u32;
+            let bi = offsets.iter().rposition(|&o| o <= g).unwrap_or(0);
+            patch_src.push((bi as u32, (g - offsets[bi]) as u32));
             patches.push(PatchInfo { name: names.get(g).cloned().unwrap_or_else(|| "surface".into()), area_mm2: 0.0, centroid: [0.0; 3], normal: [0.0; 3], n_faces: 0 });
         }
         f.patch = remap[g];
@@ -467,10 +561,364 @@ pub fn build_mesh_max(bodies: &[Body], h: f64, materials: &[Material], with_encl
         bbox: (lo, hi),
         body_names: bodies.iter().map(|b| b.name.clone()).collect(),
         with_enclosure,
+        patch_src,
+        fitted: Vec::new(),
     })
 }
 
+/// Mesh for a model: voxel mesh, boundary-fitted when the analysis asks for it.
+pub fn build_for(model: &crate::model::Model, h: f64, max_cells: usize) -> Result<Mesh> {
+    let fit = model.mesh_fitted();
+    let mut m = build_mesh_ex(&model.bodies, h, &model.materials(), model.mesh_with_enclosure(), max_cells, fit)?;
+    if fit {
+        m.fit_boundary(&model.bodies);
+    }
+    Ok(m)
+}
+
+/// Smallest corner det J (relative to the undistorted cube) a fitted element may have.
+pub const MIN_QUALITY: f64 = 0.05;
+
+/// Outcome of boundary fitting.
+#[derive(Debug, Default, Clone)]
+pub struct FitReport {
+    pub moved_nodes: usize,
+    pub max_move_mm: f64,
+    pub fitted_elements: usize,
+    pub relaxed_elements: usize,
+}
+
+/// det J of the trilinear map of hex `x` (corners in CORNER order) at ξ ∈ [-1, 1]³.
+pub fn hex_det_j(x: &[V3; 8], xi: V3) -> f64 {
+    let mut j = [[0.0f64; 3]; 3];
+    for (i, c) in CORNER.iter().enumerate() {
+        let s = c.map(|v| 2.0 * v as f64 - 1.0);
+        let f = |k: usize| 1.0 + s[k] * xi[k];
+        let g = [s[0] * f(1) * f(2) / 8.0, f(0) * s[1] * f(2) / 8.0, f(0) * f(1) * s[2] / 8.0];
+        for r in 0..3 {
+            for c2 in 0..3 {
+                j[r][c2] += x[i][r] * g[c2];
+            }
+        }
+    }
+    j[0][0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1]) - j[0][1] * (j[1][0] * j[2][2] - j[1][2] * j[2][0]) + j[0][2] * (j[1][0] * j[2][1] - j[1][1] * j[2][0])
+}
+
 impl Mesh {
+    pub fn is_fitted(&self, e: usize) -> bool {
+        self.fitted.get(e).copied().unwrap_or(false)
+    }
+    pub fn elem_nodes(&self, e: usize) -> [V3; 8] {
+        self.elems[e].map(|n| self.nodes[n as usize])
+    }
+    /// Element volume [mm³] (h³ for cubes).
+    pub fn elem_volume(&self, e: usize) -> f64 {
+        if !self.is_fitted(e) {
+            return self.h.powi(3);
+        }
+        let x = self.elem_nodes(e);
+        let g = 0.577_350_269_189_625_8;
+        let mut v = 0.0;
+        for a in [-g, g] {
+            for b in [-g, g] {
+                for c in [-g, g] {
+                    v += hex_det_j(&x, [a, b, c]);
+                }
+            }
+        }
+        v
+    }
+
+    /// Move surface nodes onto the true surfaces of the bodies (boundary fitting) and relax the
+    /// next layers inward, so curved and off-grid surfaces are represented exactly at the nodes.
+    /// Elements that would become too distorted are relaxed back towards the voxel shape.
+    pub fn fit_boundary(&mut self, bodies: &[Body]) -> FitReport {
+        let h = self.h;
+        // ---- which patches need fitting: curved surfaces and planes that miss the voxel grid.
+        // Patches whose voxel faces already lie on the true surface are left alone.
+        let n_old = self.nodes.len();
+        let mut needs = vec![false; self.patches.len()];
+        for f in self.faces.iter().filter(|f| !f.outer) {
+            if needs[f.patch as usize] {
+                continue;
+            }
+            let (bi, lp) = self.patch_src[f.patch as usize];
+            let Some(b) = bodies.get(bi as usize) else { continue };
+            for &n in &f.nodes {
+                let p0 = self.nodes[n as usize];
+                if b.shape.project(lp as usize, p0).is_some_and(|q| norm(sub(q, p0)) > 1e-6 * h) {
+                    needs[f.patch as usize] = true;
+                    break;
+                }
+            }
+        }
+        // ---- pillow layer on those faces: a new hexahedron whose outer nodes are fitted to the
+        // surface. No element then has more than one face on a curved surface, so staircase corners
+        // cannot collapse.
+        let mut prime: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut shrink_dir: Vec<V3> = vec![[0.0; 3]; n_old];
+        let mut plane_normals: Vec<Vec<V3>> = vec![Vec::new(); n_old];
+        let solid_faces: Vec<usize> = (0..self.faces.len()).filter(|&f| !self.faces[f].outer && needs[self.faces[f].patch as usize]).collect();
+        for f in self.faces.iter().filter(|f| !f.outer && !needs[f.patch as usize]) {
+            for &n in &f.nodes {
+                let nr = dir_normal(f.dir);
+                if !plane_normals[n as usize].contains(&nr) {
+                    plane_normals[n as usize].push(nr);
+                }
+            }
+        }
+        for &fi in &solid_faces {
+            let f = self.faces[fi].clone();
+            let nrm = dir_normal(f.dir);
+            for &n in &f.nodes {
+                shrink_dir[n as usize] = add(shrink_dir[n as usize], nrm);
+                if let std::collections::hash_map::Entry::Vacant(v) = prime.entry(n) {
+                    v.insert(self.nodes.len() as u32);
+                    self.nodes.push(self.nodes[n as usize]);
+                }
+            }
+        }
+        // edges (pairs of old nodes) used by pillowed faces → count, to find exposed pillow sides
+        let ekey = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
+        let mut edge_use: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        for &fi in &solid_faces {
+            let nds = self.faces[fi].nodes;
+            for k in 0..4 {
+                *edge_use.entry(ekey(nds[k], nds[(k + 1) % 4])).or_insert(0) += 1;
+            }
+        }
+        // non-pillowed faces by edge (to give exposed pillow sides their patch)
+        let mut plain_by_edge: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
+        for (fi, f) in self.faces.iter().enumerate() {
+            if f.outer || needs[f.patch as usize] {
+                continue;
+            }
+            for k in 0..4 {
+                plain_by_edge.insert(ekey(f.nodes[k], f.nodes[(k + 1) % 4]), fi);
+            }
+        }
+        let mut new_faces: Vec<BFace> = Vec::new();
+        for &fi in &solid_faces {
+            let f = self.faces[fi].clone();
+            let e = f.elem as usize;
+            let top = f.nodes.map(|n| prime[&n]);
+            // face nodes are counter-clockwise seen from outside: bottom (voxel face) → top (outer)
+            self.elems.push([f.nodes[0], f.nodes[1], f.nodes[2], f.nodes[3], top[0], top[1], top[2], top[3]]);
+            self.elem_mat.push(self.elem_mat[e]);
+            self.elem_region.push(self.elem_region[e]);
+            self.elem_body.push(self.elem_body[e]);
+            self.elem_cell.push(self.elem_cell[e]);
+            let pe = (self.elems.len() - 1) as u32;
+            // exposed side faces where the pillow meets an unfitted (grid-aligned) patch
+            for k in 0..4 {
+                let (a, b) = (f.nodes[k], f.nodes[(k + 1) % 4]);
+                if edge_use.get(&ekey(a, b)).copied().unwrap_or(0) >= 2 {
+                    continue;
+                }
+                let Some(&pf) = plain_by_edge.get(&ekey(a, b)) else { continue };
+                let plain = self.faces[pf].clone();
+                let mut quad = [a, b, prime[&b], prime[&a]];
+                let pts = quad.map(|n| self.nodes[n as usize]);
+                let nrm = cross(sub(pts[2], pts[0]), sub(pts[3], pts[1]));
+                let want = dir_normal(plain.dir);
+                // degenerate now (zero thickness); orient by the side's own direction from the face
+                let side_out = sub(add(pts[0], pts[1]), add(self.nodes[f.nodes[(k + 2) % 4] as usize], self.nodes[f.nodes[(k + 3) % 4] as usize]));
+                let ok = if norm(nrm) > 1e-12 { dot(nrm, want) > 0.0 } else { dot(cross(sub(pts[1], pts[0]), dir_normal(f.dir)), side_out) > 0.0 };
+                if !ok {
+                    quad = [b, a, prime[&a], prime[&b]];
+                }
+                new_faces.push(BFace { elem: pe, nodes: quad, dir: plain.dir, patch: plain.patch, center: [0.0; 3], outer: false });
+            }
+            let face = &mut self.faces[fi];
+            face.elem = pe;
+            face.nodes = top;
+        }
+        self.faces.extend(new_faces);
+        let nn = self.nodes.len();
+        // patches touching each (outer, pillow) surface node
+        let mut node_patches: Vec<Vec<u32>> = vec![Vec::new(); nn];
+        for f in self.faces.iter().filter(|f| !f.outer) {
+            for &n in &f.nodes {
+                let v = &mut node_patches[n as usize];
+                if !v.contains(&f.patch) {
+                    v.push(f.patch);
+                }
+            }
+        }
+        let base = self.nodes.clone();
+        let mut d = vec![[0.0f64; 3]; nn];
+        let mut pinned = vec![false; nn];
+        for (&old, _) in prime.iter() {
+            pinned[old as usize] = true;
+        }
+        for n in 0..nn {
+            let ps = &node_patches[n];
+            if ps.is_empty() {
+                continue;
+            }
+            pinned[n] = true;
+            // closest point on the touching patches (alternating projections converge to the
+            // edge where two patches meet). With a conservative voxelisation every surface node
+            // is inside the solid, so moves are outward and keep their order along the surface.
+            let mut q = base[n];
+            let mut ok = true;
+            for _ in 0..10 {
+                for &p in ps {
+                    let (bi, lp) = self.patch_src[p as usize];
+                    match bodies.get(bi as usize).and_then(|b| b.shape.project(lp as usize, q)) {
+                        Some(t) => q = t,
+                        None => ok = false,
+                    }
+                }
+            }
+            let mv = sub(q, base[n]);
+            if ok && norm(mv) <= 1.5 * h {
+                d[n] = mv;
+            }
+        }
+        // tangential smoothing of fitted surface nodes on single-patch surfaces: staircase steps leave
+        // uneven spacing along the surface; average with surface neighbours and re-project
+        {
+            let mut snbr: Vec<Vec<u32>> = vec![Vec::new(); nn];
+            for f in self.faces.iter().filter(|f| !f.outer) {
+                for k in 0..4 {
+                    let (a, b) = (f.nodes[k], f.nodes[(k + 1) % 4]);
+                    if !snbr[a as usize].contains(&b) {
+                        snbr[a as usize].push(b);
+                    }
+                    if !snbr[b as usize].contains(&a) {
+                        snbr[b as usize].push(a);
+                    }
+                }
+            }
+            for _ in 0..4 {
+                let cur: Vec<V3> = (0..nn).map(|n| add(base[n], d[n])).collect();
+                for n in 0..nn {
+                    let ps = &node_patches[n];
+                    if ps.len() != 1 || snbr[n].is_empty() || norm(d[n]) == 0.0 {
+                        continue;
+                    }
+                    let mut avg = [0.0; 3];
+                    for &m in &snbr[n] {
+                        avg = add(avg, cur[m as usize]);
+                    }
+                    avg = scale(avg, 1.0 / snbr[n].len() as f64);
+                    let target = add(scale(cur[n], 0.5), scale(avg, 0.5));
+                    let (bi, lp) = self.patch_src[ps[0] as usize];
+                    if let Some(q) = bodies.get(bi as usize).and_then(|b| b.shape.project(lp as usize, target)) {
+                        let mv = sub(q, base[n]);
+                        if norm(mv) <= 1.5 * h {
+                            d[n] = mv;
+                        }
+                    }
+                }
+            }
+        }
+        // the voxel surface nodes step inward along their pillowed faces' normals (kept inside any
+        // unfitted plane they also lie on), giving the pillow layer its thickness
+        {
+            let t = 0.4 * h;
+            for (&old, _) in prime.iter() {
+                let o = old as usize;
+                let mut sd = shrink_dir[o];
+                for pnrm in &plane_normals[o] {
+                    sd = sub(sd, scale(*pnrm, dot(sd, *pnrm)));
+                }
+                let l = norm(sd);
+                if l > 1e-9 {
+                    d[o] = scale(sd, -t / l);
+                }
+            }
+        }
+        // node neighbours along element edges
+        const EDGES: [(usize, usize); 12] = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)];
+        let mut nbr: Vec<Vec<u32>> = vec![Vec::new(); nn];
+        for en in &self.elems {
+            for (a, b) in EDGES {
+                let (x, y) = (en[a], en[b]);
+                if !nbr[x as usize].contains(&y) {
+                    nbr[x as usize].push(y);
+                }
+                if !nbr[y as usize].contains(&x) {
+                    nbr[y as usize].push(x);
+                }
+            }
+        }
+        // relax the displacement into two interior layers
+        for _ in 0..2 {
+            let prev = d.clone();
+            for n in 0..nn {
+                if pinned[n] {
+                    continue;
+                }
+                let moved: Vec<V3> = nbr[n].iter().map(|&m| prev[m as usize]).filter(|v| norm(*v) > 0.0).collect();
+                if !moved.is_empty() {
+                    let mut s = [0.0; 3];
+                    for v in &nbr[n] {
+                        s = add(s, prev[*v as usize]);
+                    }
+                    d[n] = scale(s, 0.5 / nbr[n].len() as f64);
+                }
+            }
+        }
+        // keep every element valid: min corner det J ≥ MIN_QUALITY × the cube's
+        let ne = self.elems.len();
+        let cube = (h / 2.0).powi(3);
+        let corners: Vec<V3> = CORNER.iter().map(|c| c.map(|v| 2.0 * v as f64 - 1.0)).collect();
+        let quality = |e: usize, d: &[V3]| -> f64 {
+            let x = self.elems[e].map(|n| add(base[n as usize], d[n as usize]));
+            corners.iter().map(|xi| hex_det_j(&x, *xi)).fold(f64::INFINITY, f64::min) / cube
+        };
+        let touched = |e: usize, d: &[V3]| self.elems[e].iter().any(|&n| norm(d[n as usize]) > 0.0);
+        let mut relaxed = vec![false; ne];
+        for round in 0..8 {
+            let bad: Vec<usize> = (0..ne).filter(|&e| touched(e, &d) && quality(e, &d) < MIN_QUALITY).collect();
+            if bad.is_empty() {
+                break;
+            }
+            for &e in &bad {
+                relaxed[e] = true;
+                for &n in &self.elems[e] {
+                    let n = n as usize;
+                    if prime.contains_key(&(n as u32)) {
+                        // voxel-surface node: keep ≥ 0.1 h of the inward step so the pillow has thickness
+                        let l = norm(d[n]);
+                        if l > 0.1 * h {
+                            d[n] = scale(d[n], (0.5f64).max(0.1 * h / l));
+                        }
+                    } else {
+                        d[n] = if round >= 6 { [0.0; 3] } else { scale(d[n], 0.5) };
+                    }
+                }
+            }
+        }
+        let mut rep = FitReport::default();
+        for n in 0..nn {
+            let m = norm(d[n]);
+            if m > 0.0 {
+                rep.moved_nodes += 1;
+                rep.max_move_mm = rep.max_move_mm.max(m);
+                self.nodes[n] = add(base[n], d[n]);
+            }
+        }
+        self.fitted = (0..ne).map(|e| touched(e, &d) || e >= ne - solid_faces.len()).collect();
+        rep.fitted_elements = self.fitted.iter().filter(|f| **f).count();
+        rep.relaxed_elements = relaxed.iter().filter(|r| **r).count();
+        // faces and patches follow the nodes
+        for f in self.faces.iter_mut() {
+            f.center = scale(f.nodes.iter().fold([0.0; 3], |a, &n| add(a, self.nodes[n as usize])), 0.25);
+        }
+        for p in self.patches.iter_mut() {
+            p.area_mm2 = 0.0;
+        }
+        for f in &self.faces {
+            let q = f.nodes.map(|n| self.nodes[n as usize]);
+            let a = scale(cross(sub(q[2], q[0]), sub(q[3], q[1])), 0.5);
+            self.patches[f.patch as usize].area_mm2 += norm(a);
+        }
+        rep
+    }
+
     /// Resolve face selectors into boundary face indices.
     /// Selectors: "body.patch" (CAD face), "body" (all faces of a body), "bbox.xmin" .. "bbox.zmax",
     /// "all" (whole outer surface).

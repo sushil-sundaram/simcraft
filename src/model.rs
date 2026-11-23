@@ -140,6 +140,9 @@ pub struct AnalysisSettings {
     /// Maximum pseudo-time iterations for CFD.
     #[serde(default = "cfd_it")]
     pub max_iterations: usize,
+    /// Static structural: move surface nodes onto the true (curved / off-grid) surfaces.
+    #[serde(default = "yes")]
+    pub boundary_fit: bool,
     /// CFD turbulence model: "laminar" or "lvel" (algebraic wall-distance model for electronics).
     #[serde(default = "laminar")]
     pub turbulence: String,
@@ -176,6 +179,9 @@ fn damp() -> f64 {
 }
 fn freq_steps() -> usize {
     300
+}
+fn yes() -> bool {
+    true
 }
 fn laminar() -> String {
     "laminar".into()
@@ -218,6 +224,7 @@ impl Default for AnalysisSettings {
             direction: Axis::Z,
             combination: "srss".into(),
             turbulence: "laminar".into(),
+            boundary_fit: true,
             frequency_hz: 2.45e9,
             em_boundary: "pec".into(),
             max_periods: 400,
@@ -490,6 +497,10 @@ impl Model {
     }
     pub fn has_enclosure(&self) -> bool {
         self.bodies.iter().any(|b| b.role == crate::geometry::Role::Enclosure)
+    }
+    /// Whether the current analysis uses a boundary-fitted mesh (static structural).
+    pub fn mesh_fitted(&self) -> bool {
+        self.analysis.boundary_fit && self.analysis.kind == AnalysisType::StaticStructural
     }
     /// Whether the mesh for the current analysis includes the enclosure region.
     pub fn mesh_with_enclosure(&self) -> bool {

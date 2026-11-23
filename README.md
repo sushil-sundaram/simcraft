@@ -107,12 +107,15 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | Natural convection, Ra 10⁴ / 10⁵: Nusselt | 2.257 / 4.556 | 2.243 / 4.519 (de Vahl Davis) |
 | Turbulent channel (LVEL), Re 20 000: dp/dx | 94.6 Pa/m | 83.2 Pa/m (Dean) |
 | Conjugate heat balance, heated block in a duct | 0.200 W carried | 0.200 W generated |
+| Plate with hole (d/W = 0.1) Kt, h = r/10 | fitted 3.08 / voxel 3.31 | 3.03 (Heywood) |
+| Lamé thick cylinder, bore hoop stress | fitted 16.95 / voxel 21.05 MPa | 16.67 MPa |
 | KiCad board, copper plane in-plane conduction | 0.034817 W | 0.034861 W (Σkt) |
 | KiCad board, through-plane with 40 thermal vias | 3.0395 W | 3.0333 W (series ∥ via copper) |
 
 ### Limitations
-- Curved surfaces are stair-stepped by the voxel mesh: global results stay accurate, peak stresses *on
-  curved surfaces* read high; refine the element size there.
+- Static Structural fits curved and off-grid surfaces (pillow layer + node projection, ~2 % peak
+  stress); other analyses use stair-stepped voxels — global results stay accurate, peaks on curved
+  surfaces read high.
 - Magnetostatics uses nodal elements: very high permeability contrasts (iron cores) are approximate.
 - CFD is steady and incompressible with laminar or LVEL turbulence (the solver reports when the flow
   does not settle, e.g. vortex shedding); no thermal radiation.

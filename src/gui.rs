@@ -1558,6 +1558,12 @@ impl SimApp {
                                 });
                             }
                         }
+                        if kind == AnalysisType::StaticStructural {
+                            let mut fit = st.boundary_fit;
+                            if ui.checkbox(&mut fit, "Fit curved surfaces").on_hover_text("Moves the surface nodes onto the true holes, fillets and off-grid faces (with a fitted surface layer) for accurate peak stresses. Off = plain voxels.").changed() {
+                                self.run("set_analysis", json!({"boundary_fit": fit}));
+                            }
+                        }
                         if kind == AnalysisType::ThermalStress {
                             let mut t = self.core.session.lock().unwrap().model.analysis.reference_temperature;
                             ui.horizontal(|ui| {
