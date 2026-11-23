@@ -144,6 +144,15 @@ Touching bodies merge into one connected part. Each body has its own material.
 **STL tips** — the mesh must be closed (watertight). Use the `scale` option if your file is in metres
 (scale 1000) or inches (25.4). Use **list_faces** (or hover in the viewport) to find the face names.
 
+**Editing what you made** — click a body in the Browser: the Properties panel shows its dimensions,
+position, material, add/subtract and name; change any of them and press **Apply** (renaming keeps
+the loads on its faces). Below it, **Transform** moves the body, makes a moved **copy**, a linear
+**pattern** (e.g. 6 fins every 7 mm) or a **mirror** across a plane (boxes, cylinders, spheres).
+Click a support or load to change its values or faces the same way. **Edit ▸ Undo / Redo** (Ctrl+Z,
+Ctrl+Shift+Z or Ctrl+Y) steps through every change to the model — geometry, materials, loads and
+analysis settings — whether you made it or an AI agent did. MCP: `edit_body`, `edit_load`,
+`transform_body`, `undo`, `redo`.
+
 **Face selectors** — wherever a load asks for faces you can use:
 
 - a face name: `Bracket.xmax`, `Hole.side`
@@ -204,6 +213,10 @@ plastic tangent modulus, thermal conductivity, expansion and specific heat, rela
 electrical conductivity, relative permeability and (for fluids) viscosity.
 
 - **MATERIAL** tab: pick a material and **Assign to all bodies**; the panel shows its key values.
+- **✏ New / edit material…** opens an editor pre-filled from the selected material: change any
+  property (stiffness, strength, density, thermal, electrical, dielectric loss, fatigue) and **Save
+  material** — it is added to the library of this project (`define_material` over MCP).
+- Per body: click the body in the Browser and pick its material in Properties.
 - Per body: via the MCP tool `set_material` with `bodies`.
 - Custom: `define_material` (start from an existing one with `based_on` and override values).
 
@@ -463,7 +476,11 @@ are ignored — that exchange is computed; use them on the enclosure's outer fac
 - **Step / time slider** — modes, buckling modes, or transient time points.
 - **Cut plane** — slice through the model along X, Y or Z and slide it; essential for fields in air
   and fluid flow.
-- **Probe** (MCP `probe`) — values at a point.
+- **🎯 Probe** (RESULTS ▸ TOOLS) — click the model to pin the value of the shown field at the nearest
+  node; up to 8 markers, cleared with **✖ Clear** or when you solve again. MCP: `probe`.
+- **📈 History** (RESULTS ▸ TOOLS) — chart of the result's history: transient response over time,
+  harmonic frequency response, load–displacement steps, heating curves; hover for values. Studies
+  with one parameter show each response against it in the study window (**📈 Chart**).
 - **Browser ▸ Solution** — maxima, reactions, frequencies, quantities (capacitance, resistance,
   drag, peak displacement…), warnings, solve time and which solver/GPU ran it.
 - **RESULTS ▸ Report** (or **File ▸ Export report**) — a self-contained HTML report: model, materials,

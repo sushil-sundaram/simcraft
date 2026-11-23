@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct Session {
+    /// Test hook: GUI state requested by the hidden `__ui` tool (consumed by the window).
+    pub ui_request: Option<Value>,
+    /// Model snapshots before each change (newest last) and undone ones, for undo / redo.
+    pub undo: Vec<Model>,
+    pub redo: Vec<Model>,
     /// Model as last saved / opened / created (JSON), to detect unsaved changes.
     pub saved_model: String,
     pub model: Model,
@@ -58,6 +63,9 @@ impl Default for Session {
             project_path: None,
             last_error: None,
             plan: None,
+            undo: Vec::new(),
+            ui_request: None,
+            redo: Vec::new(),
             saved_model: serde_json::to_string(&Model::default()).unwrap_or_default(),
             study: None,
             surrogate: None,
@@ -340,6 +348,41 @@ pub struct Core {
 
 pub type Shared = Arc<Core>;
 
+/// Shape moved by d [mm].
+fn shift_shape(shape: &Shape, d: [f64; 3]) -> Result<Shape> {
+    let add = |p: [f64; 3]| [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+    Ok(match shape.clone() {
+        Shape::Box { min, size } => Shape::Box { min: add(min), size },
+        Shape::Cylinder { base, axis, radius, height } => Shape::Cylinder { base: add(base), axis, radius, height },
+        Shape::Sphere { center, radius } => Shape::Sphere { center: add(center), radius },
+        Shape::Stl { path, scale, offset, .. } => {
+            let offset = add(offset);
+            let data = Some(Arc::new(load_stl(&path, scale, offset)?));
+            Shape::Stl { path, scale, offset, data }
+        }
+        Shape::Pcb { path, offset, data } => Shape::Pcb { path, offset: add(offset), data },
+    })
+}
+
+/// Shape mirrored across the plane {axis = at}.
+fn mirror_shape(shape: &Shape, a: usize, at: f64) -> Result<Shape> {
+    Ok(match shape.clone() {
+        Shape::Box { mut min, size } => {
+            min[a] = 2.0 * at - (min[a] + size[a]);
+            Shape::Box { min, size }
+        }
+        Shape::Cylinder { mut base, axis, radius, height } => {
+            base[a] = 2.0 * at - base[a] - if axis.idx() == a { height } else { 0.0 };
+            Shape::Cylinder { base, axis, radius, height }
+        }
+        Shape::Sphere { mut center, radius } => {
+            center[a] = 2.0 * at - center[a];
+            Shape::Sphere { center, radius }
+        }
+        _ => bail!("mirroring works on boxes, cylinders and spheres (STL parts and boards cannot be mirrored)"),
+    })
+}
+
 fn config_dir() -> std::path::PathBuf {
     crate::bridge::token_path().parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir)
 }
@@ -459,9 +502,29 @@ impl Core {
 
     /// Execute a tool by name. Used by the GUI, the TCP bridge and the MCP server.
     pub fn call(&self, tool: &str, args: &Value) -> Result<Output> {
+        // snapshot for undo (cheap: shape data is shared, only the description is copied)
+        let before = if matches!(tool, "undo" | "redo") {
+            None
+        } else {
+            let s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            serde_json::to_string(&s.model).ok().map(|j| (j, s.model.clone()))
+        };
         let r = self.call_inner(tool, args);
         {
             let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let (Ok(_), Some((json_before, model_before))) = (&r, before) {
+                if serde_json::to_string(&s.model).ok().is_some_and(|now| now != json_before) {
+                    if tool == "open_project" {
+                        s.undo.clear();
+                    } else {
+                        s.undo.push(model_before);
+                        if s.undo.len() > 100 {
+                            s.undo.remove(0);
+                        }
+                    }
+                    s.redo.clear();
+                }
+            }
             match &r {
                 Ok(_) => s.last_error = None,
                 Err(e) => {
@@ -486,6 +549,14 @@ impl Core {
                 let i = v.len() + 3;
                 Ok(Output::text(format!("{}", v[i])))
             });
+        }
+        if tool == "__ui" && std::env::var_os("SIMCRAFT_TEST_HOOKS").is_some() {
+            let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.ui_request = Some(a.clone());
+            s.revision += 1;
+            drop(s);
+            self.changed();
+            return Ok(Output::text("ok"));
         }
         if tool == "cancel" {
             if !self.is_busy() {
@@ -883,6 +954,181 @@ impl Core {
                 Ok(Output::text(format!(
                     "Added enclosure '{n}' ({mat}). Its outer faces are {n}.xmin … {n}.zmax (use them for inlets/outlets). It is only meshed for electrostatic, magnetostatic and fluid analyses."
                 )))
+            }
+            "undo" | "redo" => {
+                let undo = tool == "undo";
+                let prev = if undo { s.undo.pop() } else { s.redo.pop() };
+                let Some(prev) = prev else { bail!("nothing to {tool}") };
+                let cur = std::mem::replace(&mut s.model, prev);
+                if undo {
+                    s.redo.push(cur);
+                } else {
+                    s.undo.push(cur);
+                }
+                s.touch_geometry();
+                let msg = format!("{} — {} more undo, {} redo available", if undo { "Undid the last change" } else { "Redid the change" }, s.undo.len(), s.redo.len());
+                s.log(msg.clone());
+                Ok(Output::text(msg))
+            }
+            "edit_body" => {
+                let name = opt_str(a, "name").ok_or_else(|| anyhow!("missing 'name'"))?.to_string();
+                let bi = s.model.bodies.iter().position(|b| b.name.eq_ignore_ascii_case(&name)).ok_or_else(|| anyhow!("no body named '{name}'"))?;
+                let old = s.model.bodies[bi].clone();
+                let mut b = old.clone();
+                // shape fields
+                let mut sj = serde_json::to_value(&b.shape)?;
+                let mut changed_shape = false;
+                for key in ["min", "size", "base", "axis", "radius", "height", "center", "scale", "offset"] {
+                    if let Some(v) = a.get(key) {
+                        if sj.get(key).is_none() {
+                            bail!("a {} body has no '{key}' (it has: {})", sj["type"].as_str().unwrap_or("?"), sj.as_object().map(|o| o.keys().filter(|k| *k != "type" && *k != "path").cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
+                        }
+                        sj[key] = v.clone();
+                        changed_shape = true;
+                    }
+                }
+                if changed_shape {
+                    let mut shape: Shape = serde_json::from_value(sj).map_err(|e| anyhow!("bad shape values: {e}"))?;
+                    match (&mut shape, &old.shape) {
+                        (Shape::Stl { path, scale, offset, data }, _) => *data = Some(Arc::new(load_stl(path, *scale, *offset)?)),
+                        (Shape::Pcb { data, .. }, Shape::Pcb { data: od, .. }) => *data = od.clone(),
+                        _ => {}
+                    }
+                    shape.validate()?;
+                    b.shape = shape;
+                }
+                if let Some(m) = opt_str(a, "material") {
+                    b.material = s.resolve_material(m)?.name;
+                }
+                if let Some(o) = opt_str(a, "operation") {
+                    b.op = match o {
+                        "add" => Op::Add,
+                        "subtract" => Op::Subtract,
+                        _ => bail!("operation must be add or subtract"),
+                    };
+                }
+                let new_name = opt_str(a, "new_name").map(|n| n.trim().to_string()).filter(|n| !n.is_empty() && *n != old.name);
+                if let Some(n) = &new_name {
+                    if !n.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                        bail!("names may contain letters, digits, _ and - only");
+                    }
+                    if s.model.bodies.iter().any(|x| x.name.eq_ignore_ascii_case(n)) {
+                        bail!("a body named '{n}' already exists");
+                    }
+                    b.name = n.clone();
+                }
+                s.model.bodies[bi] = b.clone();
+                if let Some(n) = &new_name {
+                    // keep loads pointing at the renamed body
+                    let (op, np) = (format!("{}.", old.name), format!("{n}."));
+                    for it in s.model.loads.iter_mut() {
+                        let mut v = serde_json::to_value(&it.load)?;
+                        if let Some(fs) = v.get_mut("faces").and_then(|f| f.as_array_mut()) {
+                            for f in fs.iter_mut() {
+                                if let Some(t) = f.as_str() {
+                                    if t == old.name {
+                                        *f = json!(n);
+                                    } else if let Some(rest) = t.strip_prefix(&op) {
+                                        *f = json!(format!("{np}{rest}"));
+                                    }
+                                }
+                            }
+                        }
+                        if v.get("body").and_then(|x| x.as_str()) == Some(old.name.as_str()) {
+                            v["body"] = json!(n);
+                        }
+                        it.load = serde_json::from_value(v)?;
+                    }
+                }
+                s.touch_geometry();
+                s.log(format!("Edited body '{}'", b.name));
+                Ok(Output::json(json!({"edited": b.name, "shape": b.shape, "material": b.material, "operation": b.op})))
+            }
+            "edit_load" => {
+                let id = num(a, "id")? as u32;
+                let li = s.model.loads.iter().position(|l| l.id == id).ok_or_else(|| anyhow!("no load with id {id}"))?;
+                let mut v = serde_json::to_value(&s.model.loads[li].load)?;
+                let mut n = 0;
+                for (k, val) in a.as_object().into_iter().flatten() {
+                    if k == "id" || k == "kind" {
+                        continue;
+                    }
+                    if v.get(k).is_none() && !matches!(k.as_str(), "body" | "temperature" | "power" | "profile") {
+                        bail!("a {} load has no '{k}' (it has: {})", s.model.loads[li].load.label(), v.as_object().map(|o| o.keys().filter(|x| *x != "kind").cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
+                    }
+                    v[k] = val.clone();
+                    n += 1;
+                }
+                if n == 0 {
+                    bail!("give the fields to change, e.g. {{\"id\": {id}, \"value\": 5}}");
+                }
+                let load: Load = serde_json::from_value(v).map_err(|e| anyhow!("bad load values: {e}"))?;
+                if !load.faces().is_empty() {
+                    let m = s.ensure_mesh()?;
+                    m.resolve_faces(load.faces())?;
+                }
+                if let Some(b) = load.body() {
+                    if !s.model.bodies.iter().any(|x| x.name.eq_ignore_ascii_case(b)) {
+                        bail!("no body named '{b}'");
+                    }
+                }
+                s.model.loads[li].load = load.clone();
+                s.touch_setup();
+                s.log(format!("Edited load #{id}"));
+                Ok(Output::json(json!({"edited": id, "load": load, "summary": load.summary()})))
+            }
+            "transform_body" => {
+                let name = opt_str(a, "name").ok_or_else(|| anyhow!("missing 'name'"))?.to_string();
+                let src = s.model.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(&name)).cloned().ok_or_else(|| anyhow!("no body named '{name}'"))?;
+                let mode = opt_str(a, "mode").unwrap_or("move");
+                let mut made: Vec<String> = Vec::new();
+                match mode {
+                    "move" | "copy" => {
+                        let d = v3(a, "translate")?;
+                        let shape = shift_shape(&src.shape, d)?;
+                        if mode == "move" {
+                            let b = s.model.bodies.iter_mut().find(|b| b.name == src.name).unwrap();
+                            b.shape = shape;
+                            made.push(src.name.clone());
+                        } else {
+                            let n = s.unique_name(&format!("{}_copy", src.name));
+                            s.model.bodies.push(Body { name: n.clone(), shape, ..src.clone() });
+                            made.push(n);
+                        }
+                    }
+                    "pattern" => {
+                        let d = v3(a, "translate")?;
+                        let count = opt_num(a, "count").unwrap_or(2.0) as usize;
+                        if !(2..=200).contains(&count) {
+                            bail!("count must be 2..200 (total instances including the original)");
+                        }
+                        for i in 1..count {
+                            let shape = shift_shape(&src.shape, [d[0] * i as f64, d[1] * i as f64, d[2] * i as f64])?;
+                            let n = s.unique_name(&format!("{}_{}", src.name, i + 1));
+                            s.model.bodies.push(Body { name: n.clone(), shape, ..src.clone() });
+                            made.push(n);
+                        }
+                    }
+                    "mirror" => {
+                        let ax = axis(a)?.idx();
+                        let at = opt_num(a, "at").unwrap_or(0.0);
+                        let shape = mirror_shape(&src.shape, ax, at)?;
+                        if a.get("copy").and_then(|v| v.as_bool()).unwrap_or(true) {
+                            let n = s.unique_name(&format!("{}_mirror", src.name));
+                            s.model.bodies.push(Body { name: n.clone(), shape, ..src.clone() });
+                            made.push(n);
+                        } else {
+                            let b = s.model.bodies.iter_mut().find(|b| b.name == src.name).unwrap();
+                            b.shape = shape;
+                            made.push(src.name.clone());
+                        }
+                    }
+                    m => bail!("mode must be move, copy, pattern or mirror (got '{m}')"),
+                }
+                s.touch_geometry();
+                s.view_request = Some("fit".into());
+                s.log(format!("{mode}: {}", made.join(", ")));
+                Ok(Output::json(json!({"mode": mode, "bodies": made, "note": "copies have no loads of their own: add supports/loads to their faces if needed"})))
             }
             "remove_load" => {
                 let id = num(a, "id")? as u32;
@@ -1519,6 +1765,11 @@ pub fn tool_defs() -> Vec<Value> {
         t("add_sphere", "Add a sphere (mm). Face: <name>.surface.", json!({"name": name, "center": v3s("Centre mm"), "radius": {"type": "number"}, "operation": op, "material": mat}), &["radius"]),
         t("import_kicad", "Import a KiCad PCB (.kicad_pcb, KiCad 5–10): board outline and stack-up become a 'Board' body whose copper (tracks, pads, filled zones, vias) is homogenised per cell into orthotropic thermal conductivity; footprints larger than min_component_area_mm2 become component boxes named by reference (U1, Q2…). 'power' {reference: watts} adds heat sources. Then add convection/temperature boundaries (thermal) or an air enclosure + inlet (conjugate_heat_transfer). Board lies in XY, z from 0 to the thickness; top parts above, bottom parts below. Save the board in KiCad with zones filled.", json!({"path": {"type": "string"}, "name": {"type": "string", "description": "board body name (default Board)"}, "power": {"type": "object", "additionalProperties": {"type": "number"}, "description": "e.g. {\"U1\": 1.5, \"Q1\": 0.8} watts"}, "heights": {"type": "object", "additionalProperties": {"type": "number"}, "description": "component heights in mm by reference"}, "components": {"type": "boolean", "description": "create component boxes (default true)"}, "component_height_mm": {"type": "number", "description": "default component height (1 mm)"}, "min_component_area_mm2": {"type": "number", "description": "skip footprints smaller than this unless listed in power/heights (default 4)"}, "offset": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "material": {"type": "string", "description": "laminate (default FR-4)"}}), &["path"]),
         t("import_stl", "Import a closed STL solid (e.g. exported from SolidCraft / Fusion 360). Smooth regions become faces <name>.face0, face1 …", json!({"path": {"type": "string", "description": "Absolute path to .stl"}, "scale": {"type": "number", "description": "Multiply coordinates (use 1000 if the STL is in metres)"}, "offset": v3s("Translation mm"), "name": name, "operation": op, "material": mat}), &["path"]),
+        t("edit_body", "Change an existing body: any shape field (box: min, size; cylinder: base, axis, radius, height; sphere: center, radius; STL: scale, offset; board: offset), material, operation (add/subtract) or new_name (loads on it follow the rename). Undoable.", json!({"name": {"type": "string"}, "new_name": {"type": "string"}, "material": {"type": "string"}, "operation": {"type": "string", "enum": ["add", "subtract"]}, "min": v3s("box corner mm"), "size": v3s("box size mm"), "base": v3s("cylinder base centre mm"), "axis": {"type": "string", "enum": ["x", "y", "z"]}, "radius": {"type": "number"}, "height": {"type": "number"}, "center": v3s("sphere centre mm"), "scale": {"type": "number"}, "offset": v3s("STL / board offset mm")}), &["name"]),
+        t("edit_load", "Change an existing support or load by id (see get_model): any of its fields, e.g. {id: 3, vector: [0, 0, -500]}, {id: 2, value_mpa: 4}, {id: 5, faces: [\"Plate.xmax\"]}. Undoable.", json!({"id": {"type": "integer"}}), &["id"]),
+        t("transform_body", "Move, copy, pattern or mirror a body. move/copy/pattern use 'translate' [dx, dy, dz] mm (pattern: 'count' instances in total, each step 'translate' further); mirror uses 'axis' and the plane coordinate 'at' (copy: true by default). Copies get new names and no loads.", json!({"name": {"type": "string"}, "mode": {"type": "string", "enum": ["move", "copy", "pattern", "mirror"]}, "translate": v3s("offset mm"), "count": {"type": "integer"}, "axis": {"type": "string", "enum": ["x", "y", "z"]}, "at": {"type": "number", "description": "mirror plane coordinate mm"}, "copy": {"type": "boolean"}}), &["name", "mode"]),
+        t("undo", "Undo the last change to the model (geometry, materials, loads, analysis settings).", json!({}), &[]),
+        t("redo", "Redo the last undone change.", json!({}), &[]),
         t("remove_body", "Delete a body by name.", json!({"name": {"type": "string"}}), &["name"]),
         t("list_materials", "List the engineering materials library with properties.", json!({}), &[]),
         t("define_material", "Create or overwrite a custom material. Unspecified properties come from 'based_on' (default Structural Steel).", json!({"name": {"type": "string"}, "based_on": {"type": "string"}, "fatigue_strength_coefficient_mpa": {"type": "number", "description": "Basquin σf' (0 = estimate)"}, "fatigue_exponent": {"type": "number", "description": "Basquin b, negative (e.g. -0.09)"}, "endurance_limit_mpa": {"type": "number"}, "relative_permittivity": {"type": "number", "description": "εr"}, "electrical_conductivity": {"type": "number", "description": "S/m"}, "relative_permeability": {"type": "number", "description": "μr"}, "loss_tangent": {"type": "number", "description": "dielectric tan δ at the RF frequency (full-wave EM)"}, "youngs_modulus_gpa": {"type": "number"}, "poisson_ratio": {"type": "number"}, "density": {"type": "number", "description": "kg/m³"}, "yield_strength_mpa": {"type": "number"}, "ultimate_strength_mpa": {"type": "number"}, "thermal_conductivity": {"type": "number", "description": "W/(m·K)"}, "thermal_expansion": {"type": "number", "description": "1/K"}, "specific_heat": {"type": "number"}}), &["name"]),
