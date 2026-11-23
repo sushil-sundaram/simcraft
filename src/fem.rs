@@ -154,6 +154,118 @@ pub fn hex_elastic_unit(nu: f64) -> ElemUnit {
     ElemUnit { k, r }
 }
 
+fn inv3(j: &[[f64; 3]; 3]) -> ([[f64; 3]; 3], f64) {
+    let det = j[0][0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1]) - j[0][1] * (j[1][0] * j[2][2] - j[1][2] * j[2][0]) + j[0][2] * (j[1][0] * j[2][1] - j[1][1] * j[2][0]);
+    let id = 1.0 / det;
+    let m = [
+        [(j[1][1] * j[2][2] - j[1][2] * j[2][1]) * id, (j[0][2] * j[2][1] - j[0][1] * j[2][2]) * id, (j[0][1] * j[1][2] - j[0][2] * j[1][1]) * id],
+        [(j[1][2] * j[2][0] - j[1][0] * j[2][2]) * id, (j[0][0] * j[2][2] - j[0][2] * j[2][0]) * id, (j[0][2] * j[1][0] - j[0][0] * j[1][2]) * id],
+        [(j[1][0] * j[2][1] - j[1][1] * j[2][0]) * id, (j[0][1] * j[2][0] - j[0][0] * j[2][1]) * id, (j[0][0] * j[1][1] - j[0][1] * j[1][0]) * id],
+    ];
+    (m, det)
+}
+
+/// Jacobian J[a][b] = ∂x_a/∂ξ_b of a general hex (corners in CORNER order) at ξ.
+fn jacobian(x: &[[f64; 3]; 8], xi: [f64; 3]) -> [[f64; 3]; 3] {
+    let mut j = [[0.0; 3]; 3];
+    for i in 0..8 {
+        let g = dn_dxi(i, xi);
+        for a in 0..3 {
+            for b in 0..3 {
+                j[a][b] += x[i][a] * g[b];
+            }
+        }
+    }
+    j
+}
+
+/// grad_x = J⁻ᵀ grad_ξ
+fn map_grad(jinv: &[[f64; 3]; 3], g: [f64; 3]) -> [f64; 3] {
+    [0, 1, 2].map(|a| (0..3).map(|b| jinv[b][a] * g[b]).sum())
+}
+
+/// Strain matrices at ξ for a general hex: (Bu 24 columns, Ba 9 columns, det J). Incompatible
+/// modes use the centre Jacobian scaled by det J₀ / det J (Taylor, Beresford & Wilson), which
+/// keeps the element passing the patch test when distorted.
+fn general_b(x: &[[f64; 3]; 8], xi: [f64; 3], j0inv: &[[f64; 3]; 3], det0: f64) -> (Vec<[f64; 6]>, Vec<[f64; 6]>, f64) {
+    let (jinv, det) = inv3(&jacobian(x, xi));
+    let gu: Vec<[f64; 3]> = (0..8).map(|i| map_grad(&jinv, dn_dxi(i, xi))).collect();
+    let ga: Vec<[f64; 3]> = (0..3)
+        .map(|k| {
+            let mut g = [0.0; 3];
+            g[k] = -2.0 * xi[k];
+            map_grad(j0inv, g).map(|v| v * det0 / det)
+        })
+        .collect();
+    (bmat(&gu), bmat(&ga), det)
+}
+
+/// Condensed stiffness (E = 1, SI coordinates), recovery matrix and unit thermal load of a general
+/// (boundary-fitted) hexahedron.
+pub struct ElemGeneral {
+    pub k: Vec<f64>,
+    pub r: Vec<f64>,
+    /// nodal forces for E = 1, α·ΔT = 1 (24)
+    pub fth: Vec<f64>,
+}
+
+pub fn hex_elastic_general(x: &[[f64; 3]; 8], nu: f64) -> ElemGeneral {
+    let d = dmat(nu);
+    let (j0inv, det0) = inv3(&jacobian(x, [0.0; 3]));
+    let mut kuu = vec![0.0; 24 * 24];
+    let mut kua = vec![0.0; 24 * 9];
+    let mut kaa = vec![0.0; 9 * 9];
+    let mut fth = vec![0.0; 24];
+    let mut sig = [0.0; 6];
+    for i in 0..6 {
+        for j in 0..3 {
+            sig[i] += d[i][j];
+        }
+    }
+    for xi in gauss_points() {
+        let (bu, ba, det) = general_b(x, xi, &j0inv, det0);
+        btdb(&bu, &d, &bu, det, &mut kuu, 24);
+        btdb(&bu, &d, &ba, det, &mut kua, 9);
+        btdb(&ba, &d, &ba, det, &mut kaa, 9);
+        for (c, col) in bu.iter().enumerate() {
+            fth[c] += (0..6).map(|k| col[k] * sig[k]).sum::<f64>() * det;
+        }
+    }
+    let kinv = dense_inverse(&kaa, 9);
+    let mut t = vec![0.0; 24 * 9];
+    for i in 0..24 {
+        for j in 0..9 {
+            t[i * 9 + j] = (0..9).map(|k| kua[i * 9 + k] * kinv[k * 9 + j]).sum();
+        }
+    }
+    let mut k = kuu;
+    for i in 0..24 {
+        for j in 0..24 {
+            let s: f64 = (0..9).map(|m| t[i * 9 + m] * kua[j * 9 + m]).sum();
+            k[i * 24 + j] -= s;
+        }
+    }
+    for i in 0..24 {
+        for j in 0..i {
+            let a = 0.5 * (k[i * 24 + j] + k[j * 24 + i]);
+            k[i * 24 + j] = a;
+            k[j * 24 + i] = a;
+        }
+    }
+    let mut r = vec![0.0; 9 * 24];
+    for i in 0..9 {
+        for j in 0..24 {
+            r[i * 24 + j] = -(0..9).map(|q| kinv[i * 9 + q] * kua[j * 9 + q]).sum::<f64>();
+        }
+    }
+    ElemGeneral { k, r, fth }
+}
+
+/// Element corner coordinates in metres.
+pub fn elem_xyz_m(mesh: &Mesh, e: usize) -> [[f64; 3]; 8] {
+    mesh.elem_nodes(e).map(|p| p.map(|v| v * 1e-3))
+}
+
 /// Strain matrices (unit cube) at each corner node: (Bu columns 24, Ba columns 9).
 pub fn corner_bmats() -> Vec<(Vec<[f64; 6]>, Vec<[f64; 6]>)> {
     (0..8)
@@ -242,15 +354,17 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog) -> Result<Results> {
     crate::sparse::SOLVE_NANOS.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut res = Results::new(kind);
     res.warnings = mesh.warnings.clone();
-    let h = mesh.h * 1e-3;
     res.info.nodes = mesh.nodes.len();
     res.info.elements = mesh.elems.len();
     res.info.element_size_mm = mesh.h;
     res.info.mass_kg = (0..mesh.elems.len())
         .filter(|&e| mesh.elem_region[e] == crate::mesh::REGION_SOLID)
-        .map(|e| mesh.materials[mesh.elem_mat[e] as usize].density * h * h * h)
+        .map(|e| mesh.materials[mesh.elem_mat[e] as usize].density * mesh.elem_volume(e) * 1e-9)
         .sum();
 
+    if !mesh.fitted.is_empty() {
+        res.quantity("Boundary-fitted elements", mesh.fitted.iter().filter(|f| **f).count() as f64, "");
+    }
     for it in &model.loads {
         if !it.load.applies_to(kind) {
             res.warnings.push(format!("load #{} ({}) is ignored in a {} analysis", it.id, it.load.label(), kind.label()));
@@ -321,9 +435,16 @@ pub fn assemble_structural(model: &Model, mesh: &Mesh, prog: Prog) -> Result<(As
     prog(0.0, "assembling stiffness");
     let units: Vec<ElemUnit> = mesh.materials.iter().map(|m| hex_elastic_unit(m.poisson_ratio)).collect();
     let mut k = NodeSparse::new(nn, &mesh.elems, 3);
+    let general: Vec<Option<ElemGeneral>> = (0..mesh.elems.len())
+        .into_par_iter()
+        .map(|e| mesh.is_fitted(e).then(|| hex_elastic_general(&elem_xyz_m(mesh, e), mesh.materials[mesh.elem_mat[e] as usize].poisson_ratio)))
+        .collect();
     for (e, en) in mesh.elems.iter().enumerate() {
         let m = &mesh.materials[mesh.elem_mat[e] as usize];
-        k.add_element(en, &units[mesh.elem_mat[e] as usize].k, m.youngs_modulus_gpa * 1e9 * h);
+        match &general[e] {
+            Some(g) => k.add_element(en, &g.k, m.youngs_modulus_gpa * 1e9),
+            None => k.add_element(en, &units[mesh.elem_mat[e] as usize].k, m.youngs_modulus_gpa * 1e9 * h),
+        }
     }
     let mut fixed = vec![None; nn * 3];
     let mut support_nodes = Vec::new();
@@ -410,18 +531,41 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
             Load::Pressure { faces, value_mpa } => {
                 for &fi in &mesh.resolve_faces(faces)? {
                     let face = &mesh.faces[fi as usize];
-                    let nrm = dir_normal(face.dir);
-                    let q = value_mpa * 1e6 * h * h / 4.0;
-                    for &n in &face.nodes {
+                    // consistent nodal loads ∫ Nᵢ p n dA (exact for any bilinear, possibly
+                    // boundary-fitted quad; equals pA/4 per node on a square face)
+                    let shares: [V3; 4] = if mesh.fitted.is_empty() {
+                        [scale(dir_normal(face.dir), h * h / 4.0); 4]
+                    } else {
+                        let q = face.nodes.map(|n| mesh.nodes[n as usize].map(|v| v * 1e-3));
+                        let mut sh = [[0.0; 3]; 4];
+                        for (a, b) in [(-GP, -GP), (GP, -GP), (GP, GP), (-GP, GP)] {
+                            let nn = [(1.0 - a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 + b) / 4.0, (1.0 - a) * (1.0 + b) / 4.0];
+                            let da = [-(1.0 - b) / 4.0, (1.0 - b) / 4.0, (1.0 + b) / 4.0, -(1.0 + b) / 4.0];
+                            let db = [-(1.0 - a) / 4.0, -(1.0 + a) / 4.0, (1.0 + a) / 4.0, (1.0 - a) / 4.0];
+                            let mut ta = [0.0; 3];
+                            let mut tb = [0.0; 3];
+                            for k in 0..4 {
+                                ta = add(ta, scale(q[k], da[k]));
+                                tb = add(tb, scale(q[k], db[k]));
+                            }
+                            let dav = cross(ta, tb); // outward area density (nodes CCW from outside)
+                            for k in 0..4 {
+                                sh[k] = add(sh[k], scale(dav, nn[k]));
+                            }
+                        }
+                        sh
+                    };
+                    let p = value_mpa * 1e6;
+                    for (k, &n) in face.nodes.iter().enumerate() {
                         for c in 0..3 {
-                            f[n as usize * 3 + c] -= nrm[c] * q;
+                            f[n as usize * 3 + c] -= shares[k][c] * p;
                         }
                     }
                 }
             }
             Load::Gravity { acceleration } => {
                 for (e, en) in mesh.elems.iter().enumerate() {
-                    let m = mesh.materials[mesh.elem_mat[e] as usize].density * h * h * h / 8.0;
+                    let m = mesh.materials[mesh.elem_mat[e] as usize].density * mesh.elem_volume(e) * 1e-9 / 8.0;
                     for &n in en {
                         for c in 0..3 {
                             f[n as usize * 3 + c] += acceleration[c] * m;
@@ -436,10 +580,11 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
         for (e, en) in mesh.elems.iter().enumerate() {
             let mi = mesh.elem_mat[e] as usize;
             let m = &mesh.materials[mi];
-            let s = m.youngs_modulus_gpa * 1e9 * m.thermal_expansion * elem_dt(e) * h * h;
+            let eth = m.youngs_modulus_gpa * 1e9 * m.thermal_expansion * elem_dt(e);
+            let (s, ft) = if mesh.is_fitted(e) { (eth, hex_elastic_general(&elem_xyz_m(mesh, e), m.poisson_ratio).fth) } else { (eth * h * h, tunits[mi].clone()) };
             for a in 0..8 {
                 for c in 0..3 {
-                    f[en[a] as usize * 3 + c] += s * tunits[mi][a * 3 + c];
+                    f[en[a] as usize * 3 + c] += s * ft[a * 3 + c];
                 }
             }
         }
@@ -531,6 +676,9 @@ pub fn structural_post(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f6
             let mi = mesh.elem_mat[e] as usize;
             let m = &mesh.materials[mi];
             let ue: Vec<f64> = (0..24).map(|i| u[en[i / 3] as usize * 3 + i % 3]).collect();
+            if mesh.is_fitted(e) {
+                return general_post(mesh, e, m, &ue, m.thermal_expansion * elem_dt(e));
+            }
             let eu = &units[mi];
             let alpha: Vec<f64> = (0..9).map(|i| (0..24).map(|j| eu.r[i * 24 + j] * ue[j]).sum()).collect();
             let ath = m.thermal_expansion * elem_dt(e);
@@ -629,6 +777,60 @@ pub fn structural_post(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f6
     res.s3 = Some(princ.iter().map(|p| p.1).collect());
     res.safety = Some(safety);
     res.stress = Some(stress);
+}
+
+/// Corner stresses [MPa] and internal forces [N] of a boundary-fitted element.
+fn general_post(mesh: &Mesh, e: usize, m: &crate::material::Material, ue: &[f64], ath: f64) -> ([[f64; 6]; 8], [f64; 24]) {
+    let x = elem_xyz_m(mesh, e);
+    let g = hex_elastic_general(&x, m.poisson_ratio);
+    let (j0inv, det0) = inv3(&jacobian(&x, [0.0; 3]));
+    let alpha: Vec<f64> = (0..9).map(|i| (0..24).map(|j| g.r[i * 24 + j] * ue[j]).sum()).collect();
+    let d = dmat(m.poisson_ratio);
+    let e_pa = m.youngs_modulus_gpa * 1e9;
+    // stresses at the 2×2×2 Gauss points (well-behaved in distorted elements), then trilinear
+    // extrapolation to the corners
+    let gps = gauss_points();
+    let mut sig_g = [[0.0; 6]; 8];
+    for (gi, sig) in sig_g.iter_mut().enumerate() {
+        let (bu, ba, _) = general_b(&x, gps[gi], &j0inv, det0);
+        let mut eps = [0.0; 6];
+        for (c, col) in bu.iter().enumerate() {
+            for r in 0..6 {
+                eps[r] += col[r] * ue[c];
+            }
+        }
+        for (c, col) in ba.iter().enumerate() {
+            for r in 0..6 {
+                eps[r] += col[r] * alpha[c];
+            }
+        }
+        for v in eps.iter_mut().take(3) {
+            *v -= ath;
+        }
+        for r in 0..6 {
+            for c in 0..6 {
+                sig[r] += d[r][c] * eps[c] * e_pa * 1e-6;
+            }
+        }
+    }
+    let r3 = 3f64.sqrt();
+    let mut sigs = [[0.0; 6]; 8];
+    for (corner, sc) in sigs.iter_mut().enumerate() {
+        let eta = sgn(corner).map(|v| v * r3);
+        for (gi, sg) in sig_g.iter().enumerate() {
+            let s_g = gps[gi].map(|v| v.signum());
+            let w: f64 = (0..3).map(|k| (1.0 + s_g[k] * eta[k]) / 2.0).product();
+            for r in 0..6 {
+                sc[r] += w * sg[r];
+            }
+        }
+    }
+    let mut fi = [0.0; 24];
+    for i in 0..24 {
+        let s: f64 = (0..24).map(|j| g.k[i * 24 + j] * ue[j]).sum();
+        fi[i] = s * e_pa - e_pa * ath * g.fth[i];
+    }
+    (sigs, fi)
 }
 
 /// Cells and power density [W/m³] of a heat-generation load. A total `power` is spread over the

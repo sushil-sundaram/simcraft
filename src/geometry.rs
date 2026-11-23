@@ -248,6 +248,60 @@ impl Shape {
         }
     }
 
+    /// Closest point on surface patch `patch` (planes and cylinder/sphere surfaces are treated as
+    /// unbounded so alternating projections onto neighbouring patches converge to their edges).
+    /// None for shapes without an analytic surface (KiCad boards).
+    pub fn project(&self, patch: usize, p: V3) -> Option<V3> {
+        match self {
+            Shape::Box { min, size } => {
+                let a = patch / 2;
+                let mut q = p;
+                q[a] = if patch % 2 == 0 { min[a] } else { min[a] + size[a] };
+                Some(q)
+            }
+            Shape::Cylinder { base, axis, radius, height } => {
+                let a = axis.idx();
+                let mut q = p;
+                match patch {
+                    0 => {
+                        let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+                        let (rb, rc) = (p[b] - base[b], p[c] - base[c]);
+                        let r = (rb * rb + rc * rc).sqrt();
+                        if r < 1e-12 {
+                            return None;
+                        }
+                        q[b] = base[b] + rb / r * radius;
+                        q[c] = base[c] + rc / r * radius;
+                    }
+                    1 => q[a] = base[a],
+                    _ => q[a] = base[a] + height,
+                }
+                Some(q)
+            }
+            Shape::Sphere { center, radius } => {
+                let d = sub(p, *center);
+                let r = norm(d);
+                (r > 1e-12).then(|| add(*center, scale(d, radius / r)))
+            }
+            Shape::Stl { data, .. } => {
+                let d = data.as_ref()?;
+                let mut best: Option<(f64, V3)> = None;
+                for (i, tri) in d.tris.iter().enumerate() {
+                    if d.segment[i] as usize != patch {
+                        continue;
+                    }
+                    let q = closest_point_triangle(p, tri);
+                    let dist = norm(sub(p, q));
+                    if best.is_none_or(|b| dist < b.0) {
+                        best = Some((dist, q));
+                    }
+                }
+                best.map(|b| b.1)
+            }
+            Shape::Pcb { .. } => None,
+        }
+    }
+
     /// Best matching surface patch for a voxel boundary face at `p` with outward normal `n`.
     /// Returns (patch index, score); lower score is better.
     pub fn best_patch(&self, p: V3, n: V3, h: f64, subtract: bool) -> (usize, f64) {

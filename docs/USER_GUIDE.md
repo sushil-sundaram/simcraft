@@ -209,10 +209,19 @@ SimCraft fills the model with equal cubes ("voxels") of the **element size** you
 - Rule of thumb: at least **3–4 elements through the thinnest wall** you care about
   (e.g. 2.5 mm for a 10 mm thick plate in bending).
 - Halving the size gives 8× more elements; solve time grows faster than that.
-- Limit: 400 000 elements per mesh.
-- Curved surfaces come out stair-stepped. Global results (deflection, frequency, temperature,
-  capacitance) stay accurate; peak stress *on* a curved surface reads high — refine there, or read
-  stress a little away from the edge.
+- Limit: 400 000 elements per mesh (12 M for full-wave EM, which needs no matrix solve).
+- **Fit curved surfaces** (Static Structural, on by default — SOLVE ▸ settings, MCP
+  `set_analysis boundary_fit`): holes, fillets, spheres, STL surfaces and faces that do not line up
+  with the grid are fitted exactly. SimCraft keeps the cubes whose corners are all inside the part,
+  adds one layer of elements on every curved or off-grid surface and moves its outer nodes onto the
+  true surface (the voxel nodes underneath step in to make room); faces that already lie on the grid
+  are left alone. Those elements are general hexahedra (incompatible modes with Taylor's correction,
+  stresses from Gauss points), all others stay identical cubes, so solve time barely changes. Peak
+  stress at a hole drops from ~10–25 % error with plain voxels to ~2 % at the same element size
+  (plate with hole Kt and thick cylinder, see §15). The viewport shows the fitted mesh.
+- Other analyses (thermal, modal, vibration, EM, CFD, topology) use the plain voxel mesh, where curved
+  surfaces are stair-stepped: global results stay accurate, peak values *on* a curved surface read
+  high — refine there, or read a little away from the edge.
 - Size the cubes so thin layers line up with the grid (e.g. 1 mm cubes for a 4 mm dielectric):
   a 4 mm layer meshed with 1.5 mm cubes becomes 4.5 mm.
 
@@ -648,7 +657,7 @@ and frequency, Euler buckling, dynamic amplification, harmonic resonance amplifi
 spectrum vs. static 1 g, random-vibration RMS (Miles), Basquin/Goodman fatigue life, Steinberg damage,
 WR-340 guide wavelength, closed-cavity power balance, microwave-heating energy balance, plastic yielding, conduction, transient heating,
 thermal expansion, parallel-plate capacitance, resistance and Joule heating, ring-coil field,
-laminar channel flow, lid-driven cavity (Ghia), natural convection (de Vahl Davis), LVEL turbulent
+laminar channel flow, plate-with-hole stress concentration and Lamé thick cylinder (boundary-fitted), lid-driven cavity (Ghia), natural convection (de Vahl Davis), LVEL turbulent
 channel friction (Dean), conjugate-heat energy balance, contact reactions) and the GPU solver against the CPU. See the README for the
 numbers.
 
@@ -676,7 +685,7 @@ numbers.
 
 ## 17. Limitations
 
-- Voxel meshes stair-step curved surfaces (see §6).
+- Voxel meshes stair-step curved surfaces in all analyses except Static Structural, which fits them (see §6).
 - Magnetostatics uses nodal elements: very high permeability contrasts are approximate.
 - CFD is steady and incompressible; turbulence is the algebraic LVEL model (no k-ε / k-ω), and
   there is no thermal radiation between surfaces.

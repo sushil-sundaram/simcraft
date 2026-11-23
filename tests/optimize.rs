@@ -74,6 +74,7 @@ fn topology_reduces_material_and_exports_shape() {
     // the exported shape is a valid closed solid SimCraft can mesh again
     let c2 = new_core();
     call(&c2, "import_stl", json!({"path": path, "name": "Optimized"}));
+    call(&c2, "set_analysis", json!({"boundary_fit": false})); // count plain voxels
     let m = call(&c2, "set_mesh", json!({"element_size_mm": 2}));
     let e = m["elements"].as_u64().unwrap() as f64;
     println!("re-imported optimized shape: {e} elements (full plate 4000)");

@@ -282,6 +282,10 @@ impl Results {
         "Final".into()
     }
 
+    /// Number of nodes the nodal arrays refer to (None if there are none).
+    pub fn node_len(&self) -> Option<usize> {
+        self.disp.as_ref().map(|v| v.len()).or(self.temp.as_ref().map(|v| v.len())).or(self.vm.as_ref().map(|v| v.len())).or(self.extra.values().next().map(|v| v.len())).or(self.modes.first().map(|m| m.shape.len()))
+    }
     pub fn available_fields(&self) -> Vec<Field> {
         Field::all().into_iter().filter(|f| self.has(*f)).collect()
     }
