@@ -468,7 +468,7 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
         }
         let (ev, vecs) = sym_eigen(&c, p);
         let mut order: Vec<usize> = (0..p).collect();
-        order.sort_by(|&a, &b| ev[b].partial_cmp(&ev[a]).unwrap());
+        order.sort_by(|&a, &b| ev[b].total_cmp(&ev[a]));
         let mut q = vec![0.0; p * p];
         for (col, &o) in order.iter().enumerate() {
             mu[col] = ev[o];

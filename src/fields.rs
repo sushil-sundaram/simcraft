@@ -143,7 +143,7 @@ pub fn electrostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
     let vals: Vec<f64> = bc.sets.iter().map(|s| s.3).collect();
     let dv = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - vals.iter().cloned().fold(f64::INFINITY, f64::min);
     if dv > 0.0 {
-        let (ihi, _) = vals.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+        let (ihi, _) = vals.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
         res.quantity("Capacitance (high electrode)", charges[ihi].abs() / dv, "F");
         res.quantity("Capacitance (from energy)", 2.0 * energy / (dv * dv), "F");
     } else {

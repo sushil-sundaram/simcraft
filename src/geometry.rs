@@ -574,7 +574,7 @@ impl StlData {
                 xs.push(l0 * a[0] + l1 * b[0] + l2 * c[0]);
             }
         }
-        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        xs.sort_by(|a, b| a.total_cmp(b));
         xs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
         xs
     }

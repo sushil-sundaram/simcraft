@@ -358,7 +358,7 @@ impl Raster {
                         xs.push(a[0] + (y - a[1]) / (b[1] - a[1]) * (b[0] - a[0]));
                     }
                 }
-                xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                xs.sort_by(|a, b| a.total_cmp(b));
                 for pair in xs.chunks(2) {
                     if pair.len() < 2 {
                         continue;

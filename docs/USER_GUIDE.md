@@ -89,6 +89,14 @@ Command-line options:
   dot and the light/dark switch (remembered between runs).
 - **OPTIMIZE** tab — parameter studies, design optimization and topology optimization (§10).
 - **Examples** menu — ready-made models for every kind of analysis; open one and press Solve.
+- **Status bar** — progress of the running solve or study with **■ Stop** (the SOLVE tab's Solve
+  button also turns into Stop): the job stops at its next progress step and its results are discarded.
+  Over MCP: `cancel`.
+- **Saving your work** — the header shows **● unsaved** when the model has changes. New, Open,
+  examples and closing the window ask *Save / Don't save / Cancel* first. **File ▸ Open recent**
+  lists the last 10 projects. While there are unsaved changes SimCraft autosaves every 2 minutes to
+  `~/.config/simcraft/autosave.simcraft`; after a crash it offers **File ▸ Recover autosave** on the
+  next start.
 
 Model colours before solving: grey = solid, blue = fixed support, purple = displacement, light blue =
 compression-only, red = force, orange = pressure, pink = temperature, yellow = heat flux, cyan =
@@ -694,7 +702,9 @@ numbers.
 | CFD "did not reach a steady state" | Lower the velocity, enlarge the domain, or accept a snapshot of unsteady flow. |
 | Nonlinear step "did not converge" | The structure is collapsing at that load; reduce the load or add support. |
 | Results look blocky | Use a smaller element size. |
-| Solve is slow | Use a coarser mesh first; try Compute ▸ GPU for very large models. |
+| Solve is slow | Use a coarser mesh first; try Compute ▸ GPU for very large models; ■ Stop cancels a running job. |
+| "internal error during solve: …" | A solver hit an unexpected condition; the model is unchanged and you can keep working. Please report it with the project file. |
+| "the solution is not finite" | A part has no stiffness/conductivity, extreme property values, or a load on a part not connected to a support. |
 | GPU warning in results | GPU unavailable or out of memory; the CPU was used instead. |
 | Planner "cannot reach the local model server" | Install/start Ollama, or set `SIMCRAFT_LLM_URL`. |
 | Planner "no local models" | `ollama pull qwen2.5:7b`. |

@@ -594,7 +594,7 @@ impl Gpu {
         let fault: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
         let f2 = fault.clone();
         device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
-            *f2.lock().unwrap() = Some(e.to_string());
+            *f2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.to_string());
         }));
         let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let val = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -648,11 +648,11 @@ impl Gpu {
         if let Some(err) = pollster::block_on(oom.pop()) {
             bail!("not enough free GPU memory for the FDTD grid ({} MB): {err}", (f * 9) / 1_000_000);
         }
-        *crate::gpu::LAST_DEVICE.lock().unwrap() = Some(info.name.clone());
+        *crate::gpu::LAST_DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(info.name.clone());
         Ok(Gpu { device, queue, pipes, bind, params, dbuf: d, staging, groups: (gx, gy), params_data, name: info.name, fault })
     }
     fn check(&self) -> Result<()> {
-        if let Some(e) = self.fault.lock().unwrap().take() {
+        if let Some(e) = self.fault.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
             bail!("GPU error during FDTD: {e}");
         }
         Ok(())

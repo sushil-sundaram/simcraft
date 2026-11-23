@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct Session {
+    /// Model as last saved / opened / created (JSON), to detect unsaved changes.
+    pub saved_model: String,
     pub model: Model,
     pub mesh: Option<Arc<Mesh>>,
     mesh_rev: u64,
@@ -56,6 +58,7 @@ impl Default for Session {
             project_path: None,
             last_error: None,
             plan: None,
+            saved_model: serde_json::to_string(&Model::default()).unwrap_or_default(),
             study: None,
             surrogate: None,
         }
@@ -254,6 +257,21 @@ impl Session {
         })
     }
 
+    /// True when the model differs from the last saved / opened / new one.
+    pub fn is_dirty(&self) -> bool {
+        serde_json::to_string(&self.model).map(|m| m != self.saved_model).unwrap_or(false)
+    }
+    pub fn mark_saved(&mut self) {
+        self.saved_model = serde_json::to_string(&self.model).unwrap_or_default();
+    }
+    /// Write the model to the autosave file (does not change the project path or saved state).
+    pub fn autosave(&self) -> Result<()> {
+        let p = autosave_path();
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        self.save(&p.to_string_lossy())
+    }
     pub fn save(&self, path: &str) -> Result<()> {
         let v = json!({"simcraft": 1, "model": self.model, "display": self.display, "plan": self.plan});
         std::fs::write(path, serde_json::to_string_pretty(&v)?)?;
@@ -313,6 +331,8 @@ pub struct Core {
     pub session: Mutex<Session>,
     pub progress: Mutex<Progress>,
     busy: AtomicBool,
+    /// Set by `cancel` (Stop button): the running job stops at its next progress update.
+    cancel: AtomicBool,
     pub notify: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Set by the GUI so `screenshot_gui` can capture the window.
     pub gui_ctx: Mutex<Option<eframe::egui::Context>>,
@@ -320,8 +340,48 @@ pub struct Core {
 
 pub type Shared = Arc<Core>;
 
+fn config_dir() -> std::path::PathBuf {
+    crate::bridge::token_path().parent().map(|p| p.to_path_buf()).unwrap_or_else(std::env::temp_dir)
+}
+/// Autosave file (crash recovery).
+pub fn autosave_path() -> std::path::PathBuf {
+    config_dir().join("autosave.simcraft")
+}
+/// Recently opened / saved projects, newest first (existing files only).
+pub fn recent_files() -> Vec<String> {
+    std::fs::read_to_string(config_dir().join("recent.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<String>>(&t).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| std::path::Path::new(p).exists())
+        .collect()
+}
+fn push_recent(path: &str) {
+    let abs = std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| path.to_string());
+    let mut v: Vec<String> = recent_files().into_iter().filter(|p| *p != abs).collect();
+    v.insert(0, abs);
+    v.truncate(10);
+    let _ = std::fs::create_dir_all(config_dir());
+    let _ = std::fs::write(config_dir().join("recent.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
+}
+
+/// Unwind payload used to stop a job when the user cancels it.
+struct Cancelled;
+
+/// Clears the busy flag and the progress bar when a job ends — also when it panics or is cancelled.
+struct JobGuard<'a>(&'a Core);
+impl Drop for JobGuard<'_> {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::SeqCst);
+        self.0.cancel.store(false, Ordering::SeqCst);
+        self.0.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).running = false;
+        self.0.changed();
+    }
+}
+
 pub fn new_core() -> Shared {
-    Arc::new(Core { session: Mutex::new(Session::default()), progress: Mutex::new(Progress::default()), busy: AtomicBool::new(false), notify: Mutex::new(None), gui_ctx: Mutex::new(None) })
+    Arc::new(Core { session: Mutex::new(Session::default()), progress: Mutex::new(Progress::default()), busy: AtomicBool::new(false), cancel: AtomicBool::new(false), notify: Mutex::new(None), gui_ctx: Mutex::new(None) })
 }
 
 // ---------- argument helpers ----------
@@ -388,7 +448,7 @@ fn field_arg(a: &Value) -> Result<Option<Field>> {
 
 impl Core {
     fn changed(&self) {
-        if let Some(f) = self.notify.lock().unwrap().as_ref() {
+        if let Some(f) = self.notify.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
             f();
         }
     }
@@ -401,7 +461,7 @@ impl Core {
     pub fn call(&self, tool: &str, args: &Value) -> Result<Output> {
         let r = self.call_inner(tool, args);
         {
-            let mut s = self.session.lock().unwrap();
+            let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             match &r {
                 Ok(_) => s.last_error = None,
                 Err(e) => {
@@ -419,6 +479,21 @@ impl Core {
         if tool == "solve" {
             return self.solve();
         }
+        if tool == "__panic" && std::env::var_os("SIMCRAFT_TEST_HOOKS").is_some() {
+            // test hook: a solver that panics half-way
+            return self.run_job("solve", || -> Result<Output> {
+                let v: Vec<f64> = vec![];
+                let i = v.len() + 3;
+                Ok(Output::text(format!("{}", v[i])))
+            });
+        }
+        if tool == "cancel" {
+            if !self.is_busy() {
+                return Ok(Output::text("Nothing is running."));
+            }
+            self.cancel.store(true, Ordering::SeqCst);
+            return Ok(Output::text("Stopping the running job at its next progress step…"));
+        }
         if tool == "screenshot_gui" {
             return self.screenshot_gui();
         }
@@ -435,14 +510,14 @@ impl Core {
         if self.is_busy() && !matches!(tool, "get_model" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets") {
             bail!("a solve is running; wait for it to finish (use get_status)");
         }
-        let mut guard = self.session.lock().unwrap();
+        let mut guard = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let s = &mut *guard;
         match tool {
             "get_model" => Ok(Output::json(s.model_json())),
             "list_tools" => Ok(Output::json(json!(tool_defs()))),
             "get_status" => {
-                let p = self.progress.lock().unwrap().clone();
-                Ok(Output::json(json!({"solving": p.running, "progress": p.fraction, "message": p.message, "last_error": s.last_error, "recent_log": s.log.iter().rev().take(8).rev().collect::<Vec<_>>()})))
+                let p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                Ok(Output::json(json!({"solving": p.running, "progress": p.fraction, "message": p.message, "last_error": s.last_error, "unsaved_changes": s.is_dirty(), "project": s.project_path, "recent_log": s.log.iter().rev().take(8).rev().collect::<Vec<_>>()})))
             }
             "new_model" => {
                 let rev = s.revision;
@@ -956,12 +1031,24 @@ impl Core {
                 let path = opt_str(a, "path").map(String::from).or(s.project_path.clone()).ok_or_else(|| anyhow!("missing 'path'"))?;
                 s.save(&path)?;
                 s.project_path = Some(path.clone());
+                s.mark_saved();
+                push_recent(&path);
+                let _ = std::fs::remove_file(autosave_path());
                 s.log(format!("Saved {path}"));
                 Ok(Output::text(format!("Saved project to {path}.")))
             }
             "open_project" => {
                 let path = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path'"))?;
                 s.open(path)?;
+                s.mark_saved();
+                if std::path::Path::new(path) != autosave_path() {
+                    push_recent(path);
+                    s.project_path = Some(path.to_string());
+                } else {
+                    // a recovered autosave has no project file yet and is unsaved work
+                    s.project_path = None;
+                    s.saved_model.clear();
+                }
                 Ok(Output::json(s.model_json()))
             }
             "get_selection" => Ok(Output::json(json!({"selected_faces": s.selection}))),
@@ -1141,26 +1228,21 @@ impl Core {
 
     /// Long-running optimization jobs: run on a copy of the model without holding the lock.
     fn study_job(&self, tool: &str, a: &Value) -> Result<Output> {
-        if self.busy.swap(true, Ordering::SeqCst) {
-            bail!("a solve or study is already running");
-        }
-        let r = self.study_inner(tool, a);
-        self.busy.store(false, Ordering::SeqCst);
-        self.progress.lock().unwrap().running = false;
-        r
+        self.run_job(tool, || self.study_inner(tool, a))
     }
 
     fn study_inner(&self, tool: &str, a: &Value) -> Result<Output> {
         let (model, mesh, project) = {
-            let mut s = self.session.lock().unwrap();
+            let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mesh = if tool == "topology_optimize" { Some(s.ensure_plain_mesh()?) } else { None };
             (s.model.clone(), mesh, s.project_path.clone())
         };
-        *self.progress.lock().unwrap() = Progress { running: true, fraction: 0.0, message: "starting study".into() };
+        *self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Progress { running: true, fraction: 0.0, message: "starting study".into() };
         self.changed();
         let prog = |f: f64, msg: &str| {
+            self.check_cancel();
             {
-                let mut p = self.progress.lock().unwrap();
+                let mut p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 p.fraction = f;
                 p.message = msg.to_string();
             }
@@ -1185,7 +1267,7 @@ impl Core {
                 let mut want = vec![objective.response.clone()];
                 want.extend(constraints.iter().map(|c| c.response.clone()));
                 let prior: Vec<crate::study::Run> = {
-                    let s = self.session.lock().unwrap();
+                    let s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     match &s.study {
                         Some(st) if st.parameters.iter().map(|p| (&p.target, p.min, p.max)).eq(params.iter().map(|p| (&p.target, p.min, p.max))) && a.get("reuse").and_then(|v| v.as_bool()).unwrap_or(true) => {
                             let idx: Option<Vec<usize>> = want.iter().map(|w| st.responses.iter().position(|r| r == w)).collect();
@@ -1230,7 +1312,7 @@ impl Core {
                     }
                 };
                 let ntri = crate::topo::write_stl(&mesh, &tr.density, 0.5, &path)?;
-                let mut s = self.session.lock().unwrap();
+                let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.results = Some(Arc::new(tr.results));
                 s.results_stale = false;
                 s.display.field = Field::Density;
@@ -1257,7 +1339,7 @@ impl Core {
             }
         };
         let out = study_json(&study);
-        let mut s = self.session.lock().unwrap();
+        let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         s.log(study.message.clone());
         s.study = Some(study);
         s.revision += 1;
@@ -1273,14 +1355,14 @@ impl Core {
                 crate::assistant::default_model(&models).ok_or_else(|| anyhow!("no local models installed; run `ollama pull qwen2.5:7b`"))?
             }
         };
-        *self.progress.lock().unwrap() = Progress { running: true, fraction: 0.0, message: format!("Planning with {model}…") };
+        *self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Progress { running: true, fraction: 0.0, message: format!("Planning with {model}…") };
         self.changed();
         let r = crate::assistant::plan(&goal, &model);
-        self.progress.lock().unwrap().running = false;
+        self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).running = false;
         let p = r?;
         let md = crate::assistant::to_markdown(&p);
         {
-            let mut s = self.session.lock().unwrap();
+            let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             s.plan = Some(p);
             s.revision += 1;
             s.log(format!("Planner: drafted a to-do list with {model}"));
@@ -1293,8 +1375,8 @@ impl Core {
         // the bridge comes up slightly before the window finishes opening: wait for it
         let mut ctx = None;
         for _ in 0..50 {
-            ctx = self.gui_ctx.lock().unwrap().clone();
-            if ctx.is_some() || self.notify.lock().unwrap().is_none() && !crate::bridge::gui_running() {
+            ctx = self.gui_ctx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            if ctx.is_some() || self.notify.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_none() && !crate::bridge::gui_running() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1328,37 +1410,57 @@ impl Core {
     }
 
     fn solve(&self) -> Result<Output> {
+        self.run_job("solve", || self.solve_inner())
+    }
+
+    /// Run a long job: one at a time, cancellable, and a panic inside a solver becomes an error
+    /// instead of leaving the app stuck "busy".
+    fn run_job(&self, what: &str, f: impl FnOnce() -> Result<Output>) -> Result<Output> {
         if self.busy.swap(true, Ordering::SeqCst) {
-            bail!("a solve is already running");
+            bail!("a solve or study is already running (stop it with the Stop button / cancel)");
         }
-        let out = self.solve_inner();
-        self.busy.store(false, Ordering::SeqCst);
-        {
-            let mut p = self.progress.lock().unwrap();
-            p.running = false;
+        self.cancel.store(false, Ordering::SeqCst);
+        let _guard = JobGuard(self);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(r) => r,
+            Err(payload) if payload.is::<Cancelled>() => {
+                self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).log(format!("{what} cancelled"));
+                bail!("{what} cancelled")
+            }
+            Err(payload) => {
+                let msg = payload.downcast_ref::<String>().cloned().or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "unknown error".into());
+                bail!("internal error during {what}: {msg}. The model is unchanged; please report this (with the project file) if it repeats")
+            }
         }
-        out
+    }
+
+    /// Called from progress callbacks: unwinds the running job if the user pressed Stop.
+    fn check_cancel(&self) {
+        if self.cancel.load(Ordering::SeqCst) {
+            std::panic::resume_unwind(Box::new(Cancelled));
+        }
     }
 
     fn solve_inner(&self) -> Result<Output> {
         let (model, mesh, rev) = {
-            let mut s = self.session.lock().unwrap();
+            let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let lbl = s.model.analysis.kind.label();
             s.log(format!("Solving {lbl}…"));
             let m = s.ensure_mesh()?;
             (s.model.clone(), m, s.geom_rev)
         };
-        *self.progress.lock().unwrap() = Progress { running: true, fraction: 0.0, message: "starting".into() };
+        *self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Progress { running: true, fraction: 0.0, message: "starting".into() };
         self.changed();
         let prog = |f: f64, msg: &str| {
-            let mut p = self.progress.lock().unwrap();
+            self.check_cancel();
+            let mut p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             p.fraction = f;
             p.message = msg.to_string();
             drop(p);
             self.changed();
         };
         let res = fem::solve(&model, &mesh, &prog)?;
-        let mut s = self.session.lock().unwrap();
+        let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.geom_rev != rev {
             bail!("geometry changed during the solve; solve again");
         }
@@ -1409,6 +1511,7 @@ pub fn tool_defs() -> Vec<Value> {
     let t = |n: &str, d: &str, props: Value, req: &[&str]| json!({"name": n, "description": d, "inputSchema": {"type": "object", "properties": props, "required": req}});
     vec![
         t("get_model", "Get the whole model: bodies, materials, analysis type, supports/loads, mesh status, display state and faces the user has selected in the GUI.", json!({}), &[]),
+        t("cancel", "Stop the running solve or study (it stops at its next progress step; results of a cancelled solve are discarded).", json!({}), &[]),
         t("get_status", "Solver progress, last error and recent log lines.", json!({}), &[]),
         t("new_model", "Discard everything and start an empty model.", json!({}), &[]),
         t("add_box", "Add a rectangular block (mm). Faces: <name>.xmin/xmax/ymin/ymax/zmin/zmax.", json!({"name": name, "min": v3s("Min corner [x,y,z] mm (default origin)"), "size": v3s("Size [dx,dy,dz] mm"), "operation": op, "material": mat}), &["size"]),
