@@ -109,6 +109,8 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | Conjugate heat balance, heated block in a duct | 0.200 W carried | 0.200 W generated |
 | Plate with hole (d/W = 0.1) Kt, h = r/10 | fitted 3.08 / voxel 3.31 | 3.03 (Heywood) |
 | Lamé thick cylinder, bore hoop stress | fitted 16.95 / voxel 21.05 MPa | 16.67 MPa |
+| Surrogate what-if (6 designs), beam deflection at unseen thickness | 0.65 % from the real solve | — |
+| Bayesian optimisation, lightest beam with σ ≤ 150 MPa | 10 solves, σ = 149.1 MPa | direct search: 24 evaluations |
 | KiCad board, copper plane in-plane conduction | 0.034817 W | 0.034861 W (Σkt) |
 | KiCad board, through-plane with 40 thermal vias | 3.0395 W | 3.0333 W (series ∥ via copper) |
 
@@ -163,7 +165,7 @@ Tools: `get_model`, `new_model`, `add_box`, `add_cylinder`, `add_sphere`, `impor
 `import_kicad`, `add_port`, `clear_loads`, `set_mesh`, `solve`, `fatigue_life`, `make_report`, `get_results`, `probe`, `set_display` (incl. cut plane, dark mode),
 `render_image` (PNG), `screenshot_gui` (PNG of the window), `export_vtk`, `save_project`, `open_project`,
 `get_selection`, `get_status`, `launch_gui`, `plan_simulation`, `get_plan`, `set_plan_step`,
-`list_local_models`, `list_parameter_targets`, `run_parameter_study`, `optimize_design`,
+`list_local_models`, `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`, `fit_surrogate`, `predict_surrogate`,
 `topology_optimize`, `get_study`, `apply_design`.
 
 Example prompt: *"In SimCraft, make a 150×30×8 mm aluminium bracket with two 6 mm holes, fix the left

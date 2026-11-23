@@ -17,7 +17,7 @@ Order is by value for effort. Efforts assume one developer.
 | §4 Electronics cooling (CHT + turbulence) | ✅ done — conjugate heat transfer, Boussinesq buoyancy, LVEL, moving walls, multigrid pressure; validated in `tests/cfd.rs` (Ghia, de Vahl Davis, Dean). Still open: radiation, transient CFD, k-ε |
 | §5 KiCad PCB import | ✅ done — outline/cut-outs, stack-up, tracks/arcs/pads/zones/vias rasterised, orthotropic homogenised conductivity, component boxes with power; validated in `tests/kicad.rs`. Still open: electrical (trace resistance / IPC-2152), warpage, 3D models |
 | §6 Accurate curved surfaces | ✅ done for Static Structural — conservative voxels + pillow layer on curved/off-grid patches, nodes projected onto the true surfaces with tangential smoothing, general hex8 with Taylor-corrected incompatible modes, consistent face loads; validated in `tests/fitting.rs` (patch test, Kirsch 1.7 %, Lamé 1.7 %). Still open: fitted meshes for thermal/modal/vibration |
-| §7 Surrogates | next |
+| §7 Surrogates | ✅ done — Gaussian-process response surfaces (ARD kernel, marginal likelihood, closed-form LOO/Q²), what-if sliders and `predict_surrogate`, Bayesian optimisation (EI × probability of feasibility) with every proposal verified by a real solve; validated in `tests/surrogate.rs`. Still open: field-level surrogates |
 
 
 ## 0. Do first: security of the local bridge (S)

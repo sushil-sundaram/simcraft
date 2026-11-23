@@ -23,6 +23,7 @@ pub mod results;
 pub mod session;
 pub mod sparse;
 pub mod study;
+pub mod surrogate;
 pub mod topo;
 pub mod vibration;
 pub mod vtk;

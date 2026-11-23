@@ -401,6 +401,12 @@ struct OptUi {
     /// (response, is "<=", value)
     constraints: Vec<(String, bool, f64)>,
     max_evals: usize,
+    /// optimiser: Bayesian (surrogate) instead of direct search
+    bayes: bool,
+    /// what-if slider values (parameter order of the current study) and the last prediction
+    whatif: Vec<f64>,
+    whatif_key: String,
+    whatif_pred: Option<Value>,
     vf: f64,
     iters: usize,
     show_results: bool,
@@ -536,7 +542,7 @@ impl SimApp {
             dark,
             p: pal(dark),
             show_mcp: std::env::var_os("SIMCRAFT_OPEN_CONNECT").is_some(),
-            opt: OptUi { max_evals: 30, vf: 0.4, iters: 40, objective: "mass".into(), ..Default::default() },
+            opt: OptUi { max_evals: 12, bayes: true, vf: 0.4, iters: 40, objective: "mass".into(), ..Default::default() },
             planner: Planner { open: std::env::var_os("SIMCRAFT_OPEN_PLANNER").is_some(), ..Default::default() },
             copied: None,
         }
@@ -866,7 +872,12 @@ impl SimApp {
                         self.opt.constraints.push(("min:safety_factor".into(), false, 2.0));
                     }
                     ui.horizontal(|ui| {
-                        ui.label("Max evaluations");
+                        ui.label("Method");
+                        ui.selectable_value(&mut self.opt.bayes, true, "Surrogate (Bayesian)").on_hover_text("Gaussian-process surrogates pick each next design; every proposal is verified with a real solve. Fewest solves.");
+                        ui.selectable_value(&mut self.opt.bayes, false, "Direct search").on_hover_text("Latin hypercube + Nelder–Mead on real solves only.");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(if self.opt.bayes { "Max real solves" } else { "Max evaluations" });
                         ui.add(egui::DragValue::new(&mut self.opt.max_evals).range(5..=400));
                     });
                 });
@@ -874,10 +885,12 @@ impl SimApp {
                 if ui.add_enabled(ready, primary(&p, "Optimize")).clicked() {
                     let params: Vec<Value> = self.opt.params.iter().map(|(t, lo, hi, _)| json!({"target": t, "min": lo, "max": hi})).collect();
                     let cons: Vec<Value> = self.opt.constraints.iter().map(|(r, le, v)| json!({"response": r, "op": if *le { "<=" } else { ">=" }, "value": v})).collect();
-                    self.start_job(
-                        "optimize_design",
-                        json!({"parameters": params, "objective": {"response": self.opt.objective, "goal": if self.opt.maximize { "maximize" } else { "minimize" }}, "constraints": cons, "max_evaluations": self.opt.max_evals}),
-                    );
+                    let goal = json!({"response": self.opt.objective, "goal": if self.opt.maximize { "maximize" } else { "minimize" }});
+                    if self.opt.bayes {
+                        self.start_job("surrogate_optimize", json!({"parameters": params, "objective": goal, "constraints": cons, "max_solves": self.opt.max_evals}));
+                    } else {
+                        self.start_job("optimize_design", json!({"parameters": params, "objective": goal, "constraints": cons, "max_evaluations": self.opt.max_evals}));
+                    }
                 }
             }
             _ => {
@@ -926,6 +939,8 @@ impl SimApp {
         if sig != self.opt.seen {
             self.opt.seen = sig;
             self.opt.show_results = true;
+            self.opt.whatif.clear();
+            self.opt.whatif_key.clear();
         }
         if !self.opt.show_results {
             return;
@@ -935,6 +950,7 @@ impl SimApp {
         let mut actions: Vec<(String, Value)> = Vec::new();
         let title = match st.kind.as_str() {
             "optimization" => "🎯 Optimization results",
+            "surrogate_optimization" => "🎯 Surrogate optimization results",
             "topology" => "🦴 Topology optimization",
             _ => "📊 Parameter study",
         };
@@ -980,6 +996,47 @@ impl SimApp {
                     });
                     return;
                 }
+                // ---- what-if from the surrogate
+                if st.runs.iter().filter(|r| r.error.is_none()).count() >= 3 {
+                    egui::CollapsingHeader::new(RichText::new("🔮 What-if (surrogate estimate)").strong()).default_open(true).show(ui, |ui| {
+                        if self.opt.whatif.len() != st.parameters.len() {
+                            self.opt.whatif = st.best.and_then(|b| st.runs.get(b)).map(|r| r.values.clone()).unwrap_or_else(|| st.parameters.iter().map(|q| (q.min + q.max) / 2.0).collect());
+                        }
+                        for (k, q) in st.parameters.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(&q.target).color(p.accent));
+                                ui.add(egui::Slider::new(&mut self.opt.whatif[k], q.min..=q.max));
+                            });
+                        }
+                        let key = format!("{}|{}|{:?}", st.runs.len(), st.seconds, self.opt.whatif);
+                        if key != self.opt.whatif_key {
+                            self.opt.whatif_key = key;
+                            let vals: serde_json::Map<String, Value> = st.parameters.iter().zip(&self.opt.whatif).map(|(q, v)| (q.target.clone(), json!(v))).collect();
+                            self.opt.whatif_pred = self.core.call("predict_surrogate", &json!({"values": vals})).ok().and_then(|o| serde_json::from_str(&o.text).ok());
+                        }
+                        if let Some(pred) = &self.opt.whatif_pred {
+                            egui::Grid::new("whatif").num_columns(2).show(ui, |ui| {
+                                for row in pred["predictions"].as_array().into_iter().flatten() {
+                                    ui.label(row["response"].as_str().unwrap_or(""));
+                                    match row["estimate"].as_f64() {
+                                        Some(v) => ui.label(RichText::new(format!("{} ± {}", render::fmt_val(v), render::fmt_val(row["plus_minus_2sigma"].as_f64().unwrap_or(0.0)))).strong()),
+                                        None => ui.label("—"),
+                                    };
+                                    ui.end_row();
+                                }
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Surrogate estimate, not verified (±2σ).").small().color(p.warn));
+                            if ui.small_button("Verify with a real solve").on_hover_text("Applies these values to the model and solves").clicked() {
+                                let vals: serde_json::Map<String, Value> = st.parameters.iter().zip(&self.opt.whatif).map(|(q, v)| (q.target.clone(), json!(v))).collect();
+                                actions.push(("apply_design".into(), json!({"values": vals})));
+                                actions.push(("__solve".into(), json!({})));
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
                 egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                     egui::Grid::new("studytable").striped(true).show(ui, |ui| {
                         ui.label(RichText::new("#").strong());
@@ -1002,7 +1059,7 @@ impl SimApp {
                                 ui.label(mark(v.map(render::fmt_val).unwrap_or_else(|| "—".into())));
                             }
                             ui.horizontal(|ui| {
-                                if st.kind == "optimization" && !run.feasible {
+                                if (st.kind == "optimization" || st.kind == "surrogate_optimization") && !run.feasible {
                                     ui.label(RichText::new("violates").small().color(p.warn));
                                 }
                                 if let Some(e) = &run.error {
@@ -1017,6 +1074,10 @@ impl SimApp {
                 });
             });
         for (t, a) in actions {
+            if t == "__solve" {
+                self.solve();
+                continue;
+            }
             self.run(&t, a);
             if t == "import_stl" {
                 self.need_fit = true;

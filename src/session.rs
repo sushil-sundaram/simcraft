@@ -32,6 +32,8 @@ pub struct Session {
     pub last_error: Option<String>,
     /// To-do list from the simulation planner.
     pub plan: Option<crate::assistant::Plan>,
+    /// Surrogates fitted to the current study: (runs, parameters, responses) key and the set.
+    pub surrogate: Option<((usize, Vec<crate::study::Parameter>, Vec<String>), Arc<crate::study::SurrogateSet>)>,
     /// Last parameter study / optimization / topology run.
     pub study: Option<crate::study::Study>,
 }
@@ -55,6 +57,7 @@ impl Default for Session {
             last_error: None,
             plan: None,
             study: None,
+            surrogate: None,
         }
     }
 }
@@ -419,7 +422,7 @@ impl Core {
         if tool == "screenshot_gui" {
             return self.screenshot_gui();
         }
-        if matches!(tool, "run_parameter_study" | "optimize_design" | "topology_optimize") {
+        if matches!(tool, "run_parameter_study" | "optimize_design" | "topology_optimize" | "surrogate_optimize") {
             return self.study_job(tool, a);
         }
         if tool == "plan_simulation" {
@@ -1028,6 +1031,60 @@ impl Core {
                 s.log("Fatigue evaluated".to_string());
                 Ok(Output::json(json!({"quantities": qs, "warnings": warns, "fields": ["fatigue_life", "fatigue_damage", "fatigue_safety"]})))
             }
+            "fit_surrogate" | "predict_surrogate" => {
+                let st = s.study.clone().ok_or_else(|| anyhow!("no study yet: run run_parameter_study, optimize_design or surrogate_optimize first"))?;
+                let key = (st.runs.len(), st.parameters.clone(), st.responses.clone());
+                let fresh = s.surrogate.as_ref().is_some_and(|(k, _)| *k == key);
+                if !fresh {
+                    let set = crate::study::fit_surrogates(&st)?;
+                    s.surrogate = Some((key, Arc::new(set)));
+                }
+                let set = s.surrogate.as_ref().unwrap().1.clone();
+                if tool == "fit_surrogate" {
+                    let rows: Vec<Value> = set.responses.iter().zip(&set.gps).map(|(r, g)| match g {
+                        Some(g) => json!({
+                            "response": r,
+                            "designs": g.x.len(),
+                            "loo_rmse": crate::results::float(g.loo_rmse),
+                            "q2": crate::results::float(g.q2),
+                            "quality": if g.q2 > 0.9 { "good" } else if g.q2 > 0.6 { "fair — add designs" } else { "poor — add designs or narrow the ranges" },
+                            "relevance": set.parameters.iter().zip(g.relevance()).map(|(p, w)| json!({"parameter": p.target, "weight": crate::results::float(w)})).collect::<Vec<_>>(),
+                        }),
+                        None => json!({"response": r, "note": "fewer than 3 solved designs"}),
+                    }).collect();
+                    return Ok(Output::json(json!({"surrogates": rows, "from_designs": set.n_runs, "note": "Gaussian-process response surfaces of the current study. Q² is the leave-one-out prediction quality (1 = perfect); relevance shows which parameters drive each response."})));
+                }
+                // prediction at the given values (missing parameters: middle of their range)
+                let vals = a.get("values").ok_or_else(|| anyhow!("missing 'values' {{parameter target: value}}"))?;
+                let mut x = Vec::new();
+                let mut outside = Vec::new();
+                for p in &set.parameters {
+                    let v = match vals {
+                        Value::Object(m) => m.get(&p.target).and_then(|v| v.as_f64()),
+                        Value::Array(arr) => arr.get(x.len()).and_then(|v| v.as_f64()),
+                        _ => None,
+                    }
+                    .unwrap_or((p.min + p.max) / 2.0);
+                    if v < p.min - 1e-9 || v > p.max + 1e-9 {
+                        outside.push(p.target.clone());
+                    }
+                    x.push(v);
+                }
+                let pred = set.predict(&x);
+                let rows: Vec<Value> = set.responses.iter().zip(pred).zip(&set.gps).map(|((r, p), g)| match p {
+                    Some((m, sd)) => json!({"response": r, "estimate": crate::results::float(m), "plus_minus_2sigma": crate::results::float(2.0 * sd), "loo_rmse": crate::results::float(g.as_ref().unwrap().loo_rmse)}),
+                    None => json!({"response": r, "estimate": null}),
+                }).collect();
+                let mut out = json!({
+                    "label": "surrogate estimate, not verified — use apply_design with these values and solve to confirm",
+                    "values": set.parameters.iter().zip(&x).map(|(p, v)| (p.target.clone(), json!(crate::results::float(*v)))).collect::<serde_json::Map<String, Value>>(),
+                    "predictions": rows,
+                });
+                if !outside.is_empty() {
+                    out["warning"] = json!(format!("{} outside the studied range: extrapolation is unreliable", outside.join(", ")));
+                }
+                Ok(Output::json(out))
+            }
             "get_study" => match &s.study {
                 Some(st) => Ok(Output::json(study_json(st))),
                 None => Ok(Output::text("No study yet. Use run_parameter_study, optimize_design or topology_optimize.")),
@@ -1036,6 +1093,21 @@ impl Core {
                 let st = s.study.clone().ok_or_else(|| anyhow!("no study yet"))?;
                 if st.kind == "topology" {
                     bail!("for topology results use the exported STL (import_stl {:?})", st.stl_path);
+                }
+                if let Some(Value::Object(vals)) = a.get("values") {
+                    let mut v = Vec::new();
+                    for p in &st.parameters {
+                        v.push(match vals.get(&p.target).and_then(|x| x.as_f64()) {
+                            Some(x) => x,
+                            None => crate::study::get_value(&s.model, &p.target)?,
+                        });
+                    }
+                    let m = crate::study::apply(&s.model, &st.parameters, &v)?;
+                    s.model = m;
+                    s.touch_geometry();
+                    let desc: Vec<String> = st.parameters.iter().zip(&v).map(|(p, x)| format!("{} = {}", p.target, crate::results::float(*x))).collect();
+                    s.log(format!("Applied design: {}", desc.join(", ")));
+                    return Ok(Output::text(format!("Applied {}. Solve to verify the surrogate estimate.", desc.join(", "))));
                 }
                 let idx = match opt_num(a, "run") {
                     Some(r) => (r as usize).checked_sub(1).ok_or_else(|| anyhow!("run numbers start at 1"))?,
@@ -1103,6 +1175,29 @@ impl Core {
                 let responses: Vec<String> = serde_json::from_value(a.get("responses").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'responses': {e}"))?;
                 let samples = opt_num(a, "samples").map(|v| v as usize);
                 crate::study::parameter_study(&model, parse_params()?, responses, samples, &prog)?
+            }
+            "surrogate_optimize" => {
+                let objective: crate::study::Objective = serde_json::from_value(a.get("objective").cloned().ok_or_else(|| anyhow!("missing 'objective' {{response, goal}}"))?).map_err(|e| anyhow!("bad 'objective': {e}"))?;
+                let constraints: Vec<crate::study::Constraint> = serde_json::from_value(a.get("constraints").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'constraints': {e}"))?;
+                let budget = opt_num(a, "max_solves").unwrap_or(12.0) as usize;
+                let params = parse_params()?;
+                // reuse the previous study's verified designs when it covered the same question
+                let mut want = vec![objective.response.clone()];
+                want.extend(constraints.iter().map(|c| c.response.clone()));
+                let prior: Vec<crate::study::Run> = {
+                    let s = self.session.lock().unwrap();
+                    match &s.study {
+                        Some(st) if st.parameters.iter().map(|p| (&p.target, p.min, p.max)).eq(params.iter().map(|p| (&p.target, p.min, p.max))) && a.get("reuse").and_then(|v| v.as_bool()).unwrap_or(true) => {
+                            let idx: Option<Vec<usize>> = want.iter().map(|w| st.responses.iter().position(|r| r == w)).collect();
+                            match idx {
+                                Some(idx) => st.runs.iter().map(|r| crate::study::Run { values: r.values.clone(), responses: idx.iter().map(|&i| r.responses.get(i).copied().flatten()).collect(), feasible: false, error: r.error.clone(), phase: "prior".into() }).collect(),
+                                None => vec![],
+                            }
+                        }
+                        _ => vec![],
+                    }
+                };
+                crate::study::surrogate_optimize(&model, params, objective, constraints, budget, prior, &prog)?
             }
             "optimize_design" => {
                 let objective: crate::study::Objective = serde_json::from_value(a.get("objective").cloned().ok_or_else(|| anyhow!("missing 'objective' {{response, goal}}"))?).map_err(|e| anyhow!("bad 'objective': {e}"))?;
@@ -1361,12 +1456,15 @@ pub fn tool_defs() -> Vec<Value> {
         t("screenshot_gui", "Screenshot of the whole SimCraft window (ribbon, browser, viewport) when the GUI is open.", json!({}), &[]),
         t("list_parameter_targets", "Numbers in the current model that studies can vary (e.g. Bracket.size.z, Hole.radius, load2.vector.z, element_size) with current values, plus suggested responses.", json!({}), &[]),
         t("run_parameter_study", "Sweep parameters (full grid, or Latin hypercube with 'samples') and tabulate responses such as mass, max:von_mises, min:safety_factor, frequency:1.", json!({"parameters": {"type": "array", "items": {"type": "object", "properties": {"target": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}, "steps": {"type": "integer"}}, "required": ["target", "min", "max"]}}, "responses": {"type": "array", "items": {"type": "string"}}, "samples": {"type": "integer", "description": "Latin-hypercube sample count instead of a grid"}}), &["parameters", "responses"]),
+        t("surrogate_optimize", "Bayesian optimisation with surrogates: Gaussian-process response surfaces of the objective and constraints choose each next design (expected improvement × probability of meeting the constraints), and every proposal is verified with a real solve — usually finds the optimum in far fewer solves than optimize_design. Reuses the current study's designs when the parameters match.", json!({"parameters": {"type": "array", "items": {"type": "object", "properties": {"target": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}}, "required": ["target", "min", "max"]}}, "objective": {"type": "object", "properties": {"response": {"type": "string"}, "goal": {"type": "string", "enum": ["minimize", "maximize"]}}, "required": ["response"]}, "constraints": {"type": "array", "items": {"type": "object", "properties": {"response": {"type": "string"}, "op": {"type": "string", "enum": ["<=", ">="]}, "value": {"type": "number"}}, "required": ["response", "op", "value"]}}, "max_solves": {"type": "integer", "description": "real solves allowed (default 12)"}, "reuse": {"type": "boolean", "description": "reuse matching designs of the current study (default true)"}}), &["parameters", "objective"]),
+        t("fit_surrogate", "Fit Gaussian-process response surfaces to the current study's designs and report their quality (leave-one-out RMSE and Q²) and which parameters drive each response.", json!({}), &[]),
+        t("predict_surrogate", "Instant what-if: estimate every study response at new parameter values from the surrogate (with ±2σ uncertainty), without solving. Labelled 'not verified'; confirm with apply_design {values} + solve.", json!({"values": {"type": "object", "additionalProperties": {"type": "number"}, "description": "{parameter target: value}; missing parameters use the middle of their range"}}), &["values"]),
         t("optimize_design", "Find parameter values that minimise or maximise a response subject to constraints, e.g. minimise mass with min:safety_factor >= 2. Latin-hypercube exploration + bounded Nelder-Mead. Use apply_design to adopt the result.", json!({"parameters": {"type": "array", "items": {"type": "object", "properties": {"target": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}}, "required": ["target", "min", "max"]}}, "objective": {"type": "object", "properties": {"response": {"type": "string"}, "goal": {"type": "string", "enum": ["minimize", "maximize"]}}, "required": ["response"]}, "constraints": {"type": "array", "items": {"type": "object", "properties": {"response": {"type": "string"}, "op": {"type": "string", "enum": ["<=", ">="]}, "value": {"type": "number"}}, "required": ["response", "op", "value"]}}, "max_evaluations": {"type": "integer", "description": "default 30"}}), &["parameters", "objective"]),
         t("topology_optimize", "SIMP topology optimization of the current Static Structural setup: keeps the stiffest material layout at the given volume fraction; regions under loads/supports stay solid. Shows the density field and exports the shape as an STL.", json!({"volume_fraction": {"type": "number", "description": "fraction of material to keep (default 0.4)"}, "iterations": {"type": "integer", "description": "default 40"}, "filter_radius_mm": {"type": "number", "description": "default 1.6 × element size"}, "export_path": {"type": "string"}}), &[]),
         t("fatigue_life", "Stress-life (S-N) fatigue of the current stress result: adds Fatigue Life [cycles], Fatigue Damage and Fatigue Safety Factor fields. Static results: the solved load is cycled (fully_reversed, zero_based or stress ratio R) with a mean-stress correction. Harmonic / response spectrum results are amplitudes (fully reversed). Random vibration uses Steinberg's 3-band method over exposure_time_s. S-N data comes from the material (σf', b, endurance limit) or is estimated from the ultimate strength.", json!({"loading": {"type": "string", "enum": ["fully_reversed", "zero_based", "ratio"]}, "ratio": {"type": "number", "description": "stress ratio σmin/σmax for loading=ratio (e.g. 0.1)"}, "correction": {"type": "string", "enum": ["goodman", "gerber", "soderberg", "none"], "description": "mean-stress correction (default goodman)"}, "scale": {"type": "number", "description": "multiplier on the solved stresses (default 1)"}, "design_life": {"type": "number", "description": "required cycles for the safety factor (default 1e6)"}, "exposure_time_s": {"type": "number", "description": "random vibration exposure time in seconds (default 3600)"}}), &[]),
         t("make_report", "Write a self-contained HTML report (model, materials, loads, mesh, rendered views, results, pass/fail checks, study tables and charts). Default check: yield safety factor >= 1.", json!({"path": {"type": "string", "description": "default: next to the project, or ~/SimCraft/report-<time>.html"}, "title": {"type": "string"}, "checks": {"type": "array", "items": {"type": "object", "properties": {"response": {"type": "string"}, "op": {"type": "string", "enum": ["<=", ">="]}, "value": {"type": "number"}}, "required": ["response", "op", "value"]}, "description": "e.g. [{response: 'max:von_mises', op: '<=', value: 150}]"}}), &[]),
         t("get_study", "Results of the last parameter study / optimization / topology run.", json!({}), &[]),
-        t("apply_design", "Apply a study design to the model (default: the optimizer's best; or 'run' = 1-based row).", json!({"run": {"type": "integer"}}), &[]),
+        t("apply_design", "Apply a study design to the model (default: the optimizer's best; 'run' = 1-based row; or 'values' {parameter target: value} for any design, e.g. one you explored with predict_surrogate).", json!({"run": {"type": "integer"}, "values": {"type": "object", "additionalProperties": {"type": "number"}}}), &[]),
         t("plan_simulation", "Draft a step-by-step to-do list for simulating something in SimCraft (e.g. 'EMI on my PCB', 'food heating in a microwave') using a LOCAL model via Ollama. Marks each step ready / workaround / missing-in-SimCraft and lists inputs and missing capabilities. Takes 10-120 s.", json!({"goal": {"type": "string"}, "model": {"type": "string", "description": "Ollama model name (default: best installed)"}}), &["goal"]),
         t("get_plan", "The current simulation to-do list (markdown + JSON), including which steps are done.", json!({}), &[]),
         t("set_plan_step", "Tick (or untick) a to-do step by its 1-based index.", json!({"index": {"type": "integer"}, "done": {"type": "boolean"}}), &["index"]),
@@ -1405,7 +1503,7 @@ fn study_json(st: &crate::study::Study) -> Value {
             for (k, v) in st.responses.iter().zip(&r.responses) {
                 o.insert(k.clone(), json!(v.map(crate::results::float)));
             }
-            if st.kind == "optimization" {
+            if st.kind == "optimization" || st.kind == "surrogate_optimization" {
                 o.insert("feasible".into(), json!(r.feasible));
             }
             if let Some(e) = &r.error {
