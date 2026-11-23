@@ -362,6 +362,16 @@ struct RenderKey {
     dark: bool,
 }
 
+/// An action that discards the current model; asks first when there are unsaved changes.
+#[derive(Clone, Debug)]
+enum Pending {
+    New,
+    Open,
+    OpenPath(String),
+    Example(&'static str),
+    Quit,
+}
+
 pub struct SimApp {
     core: Shared,
     cam: Camera,
@@ -370,6 +380,13 @@ pub struct SimApp {
     f: Forms,
     tex: Option<egui::TextureHandle>,
     key: Option<RenderKey>,
+    /// action waiting for the "save changes?" answer
+    confirm: Option<Pending>,
+    allow_close: bool,
+    last_autosave: f64,
+    recovery_offered: bool,
+    /// Scene (geometry + colours) cached across camera moves: (rev, sel, anim, mesh) → scene
+    scene: Option<((u64, u64, i64, usize), Arc<render::Scene>)>,
     face_buf: Vec<u32>,
     buf_size: (usize, usize),
     render_scale: f32,
@@ -515,10 +532,10 @@ impl SimApp {
         install_style(&cc.egui_ctx);
         let dark = load_dark_pref().unwrap_or_else(|| cc.egui_ctx.system_theme() == Some(egui::Theme::Dark));
         cc.egui_ctx.set_theme(if dark { egui::ThemePreference::Dark } else { egui::ThemePreference::Light });
-        core.session.lock().unwrap().display.dark = dark;
-        *core.gui_ctx.lock().unwrap() = Some(cc.egui_ctx.clone());
+        core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).display.dark = dark;
+        *core.gui_ctx.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cc.egui_ctx.clone());
         let ctx = cc.egui_ctx.clone();
-        *core.notify.lock().unwrap() = Some(Box::new(move || ctx.request_repaint()));
+        *core.notify.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || ctx.request_repaint()));
         SimApp {
             core,
             cam: Camera::default(),
@@ -527,6 +544,11 @@ impl SimApp {
             f: Forms::default(),
             tex: None,
             key: None,
+            confirm: None,
+            allow_close: false,
+            last_autosave: 0.0,
+            recovery_offered: false,
+            scene: None,
             face_buf: vec![],
             buf_size: (0, 0),
             render_scale: 1.0,
@@ -573,7 +595,7 @@ impl SimApp {
     }
 
     fn current_mesh(&self) -> Option<Arc<Mesh>> {
-        let s = self.core.session.lock().unwrap();
+        let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.mesh_valid() { s.mesh.clone() } else { None }
     }
 
@@ -589,7 +611,7 @@ impl SimApp {
     }
 
     fn sync_theme(&mut self, ctx: &egui::Context) {
-        let want = self.core.session.lock().unwrap().display.dark;
+        let want = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).display.dark;
         if want != self.dark {
             self.dark = want;
             self.p = pal(want);
@@ -604,51 +626,54 @@ impl SimApp {
         ui.horizontal(|ui| {
             logo(ui, 24.0);
             ui.label(RichText::new("SimCraft").size(15.0).strong().color(p.text));
+            if self.dirty() {
+                ui.label(RichText::new("● unsaved").small().color(p.warn)).on_hover_text("The model has changes that are not saved (autosaved every 2 minutes)");
+            }
             ui.add_space(10.0);
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| self.file_menu(ui));
                 ui.menu_button("Examples", |ui| {
                     if ui.button("🔩  Cantilever bracket with hole").clicked() {
                         ui.close();
-                        self.example_bracket();
+                        self.guard(Pending::Example("bracket"));
                     }
                     if ui.button("🌡  Heat sink (thermal)").clicked() {
                         ui.close();
-                        self.example_heatsink();
+                        self.guard(Pending::Example("heatsink"));
                     }
                     if ui.button("🎵  Tuning fork (modal)").clicked() {
                         ui.close();
-                        self.example_fork();
+                        self.guard(Pending::Example("fork"));
                     }
                     if ui.button("🏛  Column buckling").clicked() {
                         ui.close();
-                        self.example_buckling();
+                        self.guard(Pending::Example("buckling"));
                     }
                     ui.separator();
                     if ui.button("⚡  Parallel-plate capacitor (electrostatic)").clicked() {
                         ui.close();
-                        self.example_capacitor();
+                        self.guard(Pending::Example("capacitor"));
                     }
                     if ui.button("🔌  Bus bar Joule heating (thermal-electric)").clicked() {
                         ui.close();
-                        self.example_busbar();
+                        self.guard(Pending::Example("busbar"));
                     }
                     if ui.button("🌀  Coil with iron core (magnetostatic)").clicked() {
                         ui.close();
-                        self.example_coil();
+                        self.guard(Pending::Example("coil"));
                     }
                     if ui.button("📡  Microwave oven heating (full-wave EM)").clicked() {
                         ui.close();
-                        self.example_microwave();
+                        self.guard(Pending::Example("microwave"));
                     }
                     ui.separator();
                     if ui.button("🔥  Heat sink in a duct (conjugate heat transfer)").clicked() {
                         ui.close();
-                        self.example_heatsink_cht();
+                        self.guard(Pending::Example("heatsink_cht"));
                     }
                     if ui.button("💨  Flow past a cylinder (CFD)").clicked() {
                         ui.close();
-                        self.example_cfd();
+                        self.guard(Pending::Example("cfd"));
                     }
                 });
                 if ui.button("Connect AI").on_hover_text("Control SimCraft from Claude Code, Antigravity or any MCP client").clicked() {
@@ -670,7 +695,7 @@ impl SimApp {
                 if ui.add(egui::Label::new(RichText::new(t).size(11.5).color(c)).sense(Sense::click())).on_hover_text("Connect an AI agent").clicked() {
                     self.show_mcp = true;
                 }
-                let name = self.core.session.lock().unwrap().project_path.clone();
+                let name = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).project_path.clone();
                 if let Some(n) = name {
                     let f = std::path::Path::new(&n).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or(n);
                     ui.label(RichText::new(f).size(12.0).color(p.weak));
@@ -682,19 +707,31 @@ impl SimApp {
     fn file_menu(&mut self, ui: &mut egui::Ui) {
         if ui.button("New").clicked() {
             ui.close();
-            self.run("new_model", json!({}));
-            self.need_fit = true;
+            self.guard(Pending::New);
         }
         if ui.button("Open project…").clicked() {
             ui.close();
-            if let Some(p) = rfd::FileDialog::new().add_filter("SimCraft", &["simcraft", "json"]).pick_file() {
-                self.run("open_project", json!({"path": p.to_string_lossy()}));
-                self.need_fit = true;
-            }
+            self.guard(Pending::Open);
+        }
+        let recent = crate::session::recent_files();
+        ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.menu_button("Open recent", |ui| {
+                for path in recent {
+                    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
+                    if ui.button(name).on_hover_text(&path).clicked() {
+                        ui.close();
+                        self.guard(Pending::OpenPath(path));
+                    }
+                }
+            });
+        });
+        if crate::session::autosave_path().exists() && ui.button("Recover autosave").on_hover_text("Open the model SimCraft saved automatically (e.g. before a crash)").clicked() {
+            ui.close();
+            self.guard(Pending::OpenPath(crate::session::autosave_path().to_string_lossy().to_string()));
         }
         if ui.button("Save").clicked() {
             ui.close();
-            let has = self.core.session.lock().unwrap().project_path.is_some();
+            let has = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).project_path.is_some();
             if has {
                 self.run("save_project", json!({}));
             } else {
@@ -751,7 +788,7 @@ impl SimApp {
         let (core, out, tool) = (self.core.clone(), slot.clone(), tool.to_string());
         std::thread::spawn(move || {
             let r = core.call(&tool, &args).map(|_| ()).map_err(|e| format!("{e:#}"));
-            *out.lock().unwrap() = Some(r);
+            *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
         });
         self.opt.job = Some(slot);
         self.opt.error = None;
@@ -760,7 +797,7 @@ impl SimApp {
     /// Forms for parameter studies, optimization and topology optimization.
     fn opt_form(&mut self, ui: &mut egui::Ui, form: Form) {
         let p = self.p;
-        let model = self.core.session.lock().unwrap().model.clone();
+        let model = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.clone();
         let targets = crate::study::list_targets(&model);
         let mut responses = crate::study::suggested_responses(&model);
         for r in self.opt.responses.iter().chain(std::iter::once(&self.opt.objective)) {
@@ -924,7 +961,7 @@ impl SimApp {
 
     /// Table of study runs with the best design highlighted.
     fn study_window(&mut self, ctx: &egui::Context) {
-        let finished = self.opt.job.as_ref().map(|job| job.lock().unwrap().take());
+        let finished = self.opt.job.as_ref().map(|job| job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take());
         match finished {
             Some(Some(r)) => {
                 self.opt.error = r.err();
@@ -934,7 +971,7 @@ impl SimApp {
             Some(None) => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
             None => {}
         }
-        let Some(st) = self.core.session.lock().unwrap().study.clone() else { return };
+        let Some(st) = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).study.clone() else { return };
         let sig = format!("{}|{}|{}", st.kind, st.message, st.seconds);
         if sig != self.opt.seen {
             self.opt.seen = sig;
@@ -984,7 +1021,7 @@ impl SimApp {
                         }
                         if let Some(path) = &st.stl_path {
                             if ui.add(primary(&p, "Open optimized shape")).on_hover_text(path).clicked() {
-                                let mat = self.core.session.lock().unwrap().model.bodies.iter().find(|b| b.role == crate::geometry::Role::Solid).map(|b| b.material.clone()).unwrap_or_default();
+                                let mat = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.bodies.iter().find(|b| b.role == crate::geometry::Role::Solid).map(|b| b.material.clone()).unwrap_or_default();
                                 actions.push(("new_model".into(), json!({})));
                                 actions.push(("import_stl".into(), json!({"path": path, "name": "Optimized"})));
                                 if !mat.is_empty() {
@@ -1103,7 +1140,7 @@ impl SimApp {
         // finished job?
         let mut finished = None;
         if let Some(job) = &self.planner.job {
-            if let Some(r) = job.lock().unwrap().take() {
+            if let Some(r) = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
                 finished = Some(r);
             }
         }
@@ -1115,7 +1152,7 @@ impl SimApp {
         if busy {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
-        let plan = self.core.session.lock().unwrap().plan.clone();
+        let plan = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).plan.clone();
         let now = ctx.input(|i| i.time);
         let mut open = true;
         let mut actions: Vec<(String, Value)> = Vec::new();
@@ -1156,7 +1193,7 @@ impl SimApp {
                             let (core, goal, model, out) = (self.core.clone(), self.planner.goal.clone(), self.planner.model.clone(), slot.clone());
                             std::thread::spawn(move || {
                                 let r = core.call("plan_simulation", &json!({"goal": goal, "model": model})).map(|_| ()).map_err(|e| format!("{e:#}"));
-                                *out.lock().unwrap() = Some(r);
+                                *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
                             });
                             self.planner.job = Some(slot);
                             self.planner.error = None;
@@ -1355,7 +1392,7 @@ impl SimApp {
             }
         });
         ui.add_space(6.0);
-        let kind = self.core.session.lock().unwrap().model.analysis.kind;
+        let kind = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.kind;
         ui.horizontal(|ui| match self.tab {
             Tab::Geometry => {
                 group(ui, &p, "CREATE", |ui| {
@@ -1395,7 +1432,7 @@ impl SimApp {
                 });
             }
             Tab::Material => {
-                let lib = self.core.session.lock().unwrap().model.materials();
+                let lib = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.materials();
                 group(ui, &p, "ASSIGN", |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(6.0);
@@ -1463,7 +1500,7 @@ impl SimApp {
                         }
                     });
                 }
-                if kind.requires_enclosure() && !self.core.session.lock().unwrap().model.has_enclosure() {
+                if kind.requires_enclosure() && !self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.has_enclosure() {
                     ui.vertical(|ui| {
                         ui.add_space(16.0);
                         ui.label(RichText::new("⚠ This analysis needs an enclosure").color(p.warn));
@@ -1485,11 +1522,11 @@ impl SimApp {
                     }
                     if tool(ui, &p, "✨", "Auto", None, true) {
                         self.run("set_mesh", json!({}));
-                        self.f.mesh_size = self.core.session.lock().unwrap().element_size();
+                        self.f.mesh_size = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).element_size();
                     }
                 });
                 group(ui, &p, "DISPLAY", |ui| {
-                    let mut sm = self.core.session.lock().unwrap().display.show_mesh;
+                    let mut sm = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).display.show_mesh;
                     ui.vertical(|ui| {
                         ui.add_space(14.0);
                         if ui.checkbox(&mut sm, "Element edges").changed() {
@@ -1503,9 +1540,16 @@ impl SimApp {
                 group(ui, &p, "RUN", |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(8.0);
-                        let b = egui::Button::new(RichText::new("⚡  Solve").size(15.0).strong().color(Color32::WHITE)).fill(p.accent).min_size(vec2(120.0, 40.0));
-                        if ui.add_enabled(!busy, b).clicked() {
-                            self.solve();
+                        if busy {
+                            let b = egui::Button::new(RichText::new("■  Stop").size(15.0).strong().color(Color32::WHITE)).fill(p.err).min_size(vec2(120.0, 40.0));
+                            if ui.add(b).on_hover_text("Stop the running solve or study").clicked() {
+                                let _ = self.core.call("cancel", &json!({}));
+                            }
+                        } else {
+                            let b = egui::Button::new(RichText::new("⚡  Solve").size(15.0).strong().color(Color32::WHITE)).fill(p.accent).min_size(vec2(120.0, 40.0));
+                            if ui.add(b).clicked() {
+                                self.solve();
+                            }
                         }
                     });
                 });
@@ -1513,7 +1557,7 @@ impl SimApp {
                     ui.vertical(|ui| {
                         ui.add_space(4.0);
                         ui.label(RichText::new(kind.label()).strong());
-                        let st = self.core.session.lock().unwrap().model.analysis.clone();
+                        let st = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.clone();
                         let num = |ui: &mut egui::Ui, label: &str, v: f64, key: &str, speed: f64, suffix: &str, run: &mut Vec<(String, f64)>| {
                             let mut x = v;
                             ui.horizontal(|ui| {
@@ -1580,7 +1624,7 @@ impl SimApp {
                             }
                         });
                         if kind == AnalysisType::Modal {
-                            let mut m = self.core.session.lock().unwrap().model.analysis.modes as u32;
+                            let mut m = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.modes as u32;
                             ui.horizontal(|ui| {
                                 ui.label("Modes");
                                 if ui.add(egui::DragValue::new(&mut m).range(1..=20)).changed() {
@@ -1626,7 +1670,7 @@ impl SimApp {
                             }
                         }
                         if kind == AnalysisType::ThermalStress {
-                            let mut t = self.core.session.lock().unwrap().model.analysis.reference_temperature;
+                            let mut t = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.reference_temperature;
                             ui.horizontal(|ui| {
                                 ui.label("Reference temp.");
                                 if ui.add(egui::DragValue::new(&mut t).suffix(" °C")).changed() {
@@ -1637,7 +1681,7 @@ impl SimApp {
                     });
                 });
                 if matches!(kind, AnalysisType::ResponseSpectrum | AnalysisType::RandomVibration) {
-                    let (st_table, spectrum) = (self.core.session.lock().unwrap().model.analysis.table.clone(), kind == AnalysisType::ResponseSpectrum);
+                    let (st_table, spectrum) = (self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.table.clone(), kind == AnalysisType::ResponseSpectrum);
                     if st_table != self.f.table_src {
                         self.f.table_text = st_table.iter().map(|r| format!("{} {}", r[0], r[1])).collect::<Vec<_>>().join("\n");
                         self.f.table_src = st_table;
@@ -1677,7 +1721,7 @@ impl SimApp {
             }
             Tab::Results => self.results_ribbon(ui),
             Tab::Optimize => {
-                let kind = self.core.session.lock().unwrap().model.analysis.kind;
+                let kind = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.kind;
                 group(ui, &p, "STUDIES", |ui| {
                     if tool(ui, &p, "📊", "Parameters", None, true) {
                         self.form = Form::Study;
@@ -1692,7 +1736,7 @@ impl SimApp {
                     }
                 });
                 group(ui, &p, "RESULTS", |ui| {
-                    let has = self.core.session.lock().unwrap().study.is_some();
+                    let has = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).study.is_some();
                     if tool(ui, &p, "📋", "Study results", Some(p.weak), has) {
                         self.opt.show_results = true;
                     }
@@ -1705,7 +1749,7 @@ impl SimApp {
         if !self.f.fat_open {
             return;
         }
-        let kind = self.core.session.lock().unwrap().results.as_ref().map(|r| r.analysis);
+        let kind = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).results.as_ref().map(|r| r.analysis);
         let mut open = true;
         let mut go = false;
         egui::Window::new("Fatigue (stress-life)").open(&mut open).resizable(false).collapsible(false).show(ctx, |ui| {
@@ -1779,7 +1823,7 @@ impl SimApp {
     fn results_ribbon(&mut self, ui: &mut egui::Ui) {
         let p = self.p;
         let (res, disp) = {
-            let s = self.core.session.lock().unwrap();
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (s.results.clone(), s.display.clone())
         };
         let Some(r) = res else {
@@ -1852,7 +1896,7 @@ impl SimApp {
                         ui.label(RichText::new(r.step_label(i)).small());
                     });
                 }
-                if self.core.session.lock().unwrap().mesh.as_ref().is_some_and(|m| m.with_enclosure) || disp.section.is_some() {
+                if self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).mesh.as_ref().is_some_and(|m| m.with_enclosure) || disp.section.is_some() {
                     ui.horizontal(|ui| {
                         let mut on = disp.section.is_some();
                         if ui.checkbox(&mut on, "Cut plane").changed() {
@@ -1897,6 +1941,123 @@ impl SimApp {
         });
     }
 
+    fn dirty(&self) -> bool {
+        self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_dirty()
+    }
+    /// Run an action that replaces the model, asking to save unsaved changes first.
+    fn guard(&mut self, a: Pending) {
+        if self.dirty() {
+            self.confirm = Some(a);
+        } else {
+            self.perform(a);
+        }
+    }
+    fn perform(&mut self, a: Pending) {
+        match a {
+            Pending::New => {
+                self.run("new_model", json!({}));
+            }
+            Pending::Open => {
+                if let Some(p) = rfd::FileDialog::new().add_filter("SimCraft", &["simcraft", "json"]).pick_file() {
+                    self.run("open_project", json!({"path": p.to_string_lossy()}));
+                }
+            }
+            Pending::OpenPath(p) => {
+                self.run("open_project", json!({"path": p}));
+            }
+            Pending::Example(name) => match name {
+                "bracket" => self.example_bracket(),
+                "heatsink" => self.example_heatsink(),
+                "fork" => self.example_fork(),
+                "buckling" => self.example_buckling(),
+                "capacitor" => self.example_capacitor(),
+                "busbar" => self.example_busbar(),
+                "coil" => self.example_coil(),
+                "microwave" => self.example_microwave(),
+                "heatsink_cht" => self.example_heatsink_cht(),
+                _ => self.example_cfd(),
+            },
+            Pending::Quit => {
+                let _ = std::fs::remove_file(crate::session::autosave_path());
+                self.allow_close = true;
+                if let Some(ctx) = self.core.gui_ctx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        self.need_fit = true;
+    }
+    /// "Save changes?" dialog, autosave and crash-recovery offer.
+    fn safety_ui(&mut self, ctx: &egui::Context) {
+        // window close with unsaved work
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            if self.dirty() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm = Some(Pending::Quit);
+            } else {
+                let _ = std::fs::remove_file(crate::session::autosave_path());
+            }
+        }
+        // autosave every 2 minutes while there are unsaved changes
+        let now = ctx.input(|i| i.time);
+        if now - self.last_autosave > 120.0 {
+            self.last_autosave = now;
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if s.is_dirty() && !s.model.bodies.is_empty() {
+                let _ = s.autosave();
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs(30));
+        // offer recovery once at start-up
+        if !self.recovery_offered {
+            self.recovery_offered = true;
+            if crate::session::autosave_path().exists() {
+                self.toast = Some(("SimCraft found unsaved work from last time — File ▸ Recover autosave".into(), false, 10.0));
+            }
+        }
+        let Some(pending) = self.confirm.clone() else { return };
+        let p = self.p;
+        let name = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).project_path.clone().and_then(|p| std::path::Path::new(&p).file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| "this model".into());
+        let mut choice = None;
+        egui::Modal::new(egui::Id::new("save-changes")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(RichText::new(format!("Save changes to {name}?")).strong().size(15.0));
+            ui.label(RichText::new("Your changes will be lost if you don't save them.").color(p.weak));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.add(primary(&p, "Save")).clicked() {
+                    choice = Some(0);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(1);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(2);
+                }
+            });
+        });
+        match choice {
+            Some(0) => {
+                let has = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).project_path.is_some();
+                if has {
+                    self.run("save_project", json!({}));
+                } else {
+                    self.save_as();
+                }
+                self.confirm = None;
+                if !self.dirty() {
+                    self.perform(pending);
+                }
+            }
+            Some(1) => {
+                self.confirm = None;
+                self.perform(pending);
+            }
+            Some(2) => self.confirm = None,
+            _ => {}
+        }
+    }
+
     fn save_as(&mut self) {
         if let Some(p) = rfd::FileDialog::new().add_filter("SimCraft", &["simcraft"]).set_file_name("model.simcraft").save_file() {
             self.run("save_project", json!({"path": p.to_string_lossy()}));
@@ -1914,7 +2075,7 @@ impl SimApp {
                     self.toast = Some((format!("Imported {} × {} mm board with {parts} components. Add Heat Generation (W) on the parts and a convection or airflow boundary.{warn}", v["size_mm"][0], v["size_mm"][1]), !warn.is_empty(), 8.0));
                     // the copper must be resolved through the thickness: suggest ≤ half the board
                     let t = v["thickness_mm"].as_f64().unwrap_or(1.6);
-                    let cur = self.core.session.lock().unwrap().model.element_size;
+                    let cur = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.element_size;
                     if cur.is_none_or(|h| h > t / 2.0) {
                         self.run("set_mesh", json!({"element_size_mm": (t / 2.0 * 10.0).floor() / 10.0}));
                         self.f.mesh_size = (t / 2.0 * 10.0).floor() / 10.0;
@@ -1936,7 +2097,7 @@ impl SimApp {
     fn browser(&mut self, ui: &mut egui::Ui) {
         let p = self.p;
         let (model, mesh, res, stale) = {
-            let s = self.core.session.lock().unwrap();
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (s.model.clone(), if s.mesh_valid() { s.mesh.clone() } else { None }, s.results.clone(), s.results_stale)
         };
         ui.add_space(4.0);
@@ -2245,7 +2406,7 @@ impl SimApp {
         });
         let sel = self.selected_names(mesh);
         if k.needs_body() {
-            let bodies: Vec<String> = self.core.session.lock().unwrap().model.bodies.iter().filter(|b| b.role == crate::geometry::Role::Solid && b.op == Op::Add).map(|b| b.name.clone()).collect();
+            let bodies: Vec<String> = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.bodies.iter().filter(|b| b.role == crate::geometry::Role::Solid && b.op == Op::Add).map(|b| b.name.clone()).collect();
             if !bodies.contains(&self.f.body) {
                 self.f.body = bodies.first().cloned().unwrap_or_default();
             }
@@ -2333,7 +2494,7 @@ impl SimApp {
                     } else {
                         ui.add(egui::DragValue::new(&mut self.f.value).speed(1000.0).suffix(" W/m³"));
                     }
-                    let bodies: Vec<String> = self.core.session.lock().unwrap().model.bodies.iter().filter(|b| b.role == crate::geometry::Role::Solid && b.op == Op::Add).map(|b| b.name.clone()).collect();
+                    let bodies: Vec<String> = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.bodies.iter().filter(|b| b.role == crate::geometry::Role::Solid && b.op == Op::Add).map(|b| b.name.clone()).collect();
                     ui.horizontal(|ui| {
                         ui.label("In");
                         let shown = if self.f.heat_body.is_empty() { "Whole model".to_string() } else { self.f.heat_body.clone() };
@@ -2379,7 +2540,7 @@ impl SimApp {
                 LoadKind::Inlet => {
                     ui.add(egui::DragValue::new(&mut self.f.velocity).speed(0.01).suffix(" m/s"));
                     ui.label(RichText::new("Uniform velocity into the domain.").small().color(p.weak));
-                    if self.core.session.lock().unwrap().model.analysis.kind == AnalysisType::ConjugateHeatTransfer {
+                    if self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.kind == AnalysisType::ConjugateHeatTransfer {
                         ui.horizontal(|ui| {
                             ui.label("Inflow temperature");
                             ui.add(egui::DragValue::new(&mut self.f.ambient).speed(0.5).suffix(" °C"));
@@ -2442,7 +2603,7 @@ impl SimApp {
                 LoadKind::Magnet => ("add_magnet", json!({"body": self.f.body, "remanence": self.f.remanence})),
                 LoadKind::Inlet => {
                     let mut a = json!({"faces": fa, "velocity": self.f.velocity});
-                    if self.core.session.lock().unwrap().model.analysis.kind == AnalysisType::ConjugateHeatTransfer {
+                    if self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.kind == AnalysisType::ConjugateHeatTransfer {
                         a["temperature"] = json!(self.f.ambient);
                     }
                     ("add_inlet", a)
@@ -2466,7 +2627,7 @@ impl SimApp {
         let painter = ui.painter_at(rect);
 
         let (mesh, model, results, display, rev, view_req, stale) = {
-            let mut s = self.core.session.lock().unwrap();
+            let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mesh = if s.model.bodies.is_empty() || self.mesh_err.as_ref().is_some_and(|(r, _)| *r == s.geom_rev) {
                 None
             } else {
@@ -2505,7 +2666,7 @@ impl SimApp {
         }
         {
             let names = self.selected_names(Some(&mesh));
-            let mut s = self.core.session.lock().unwrap();
+            let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if s.selection != names {
                 s.selection = names;
             }
@@ -2566,7 +2727,15 @@ impl SimApp {
         let h = ((rect.height() * self.render_scale) as usize).max(16);
         let key = RenderKey { rev, cam: self.cam, w, h, sel: self.sel_version, anim: (anim * 1000.0) as i64, mesh: mptr, dark: self.dark };
         if self.key.as_ref() != Some(&key) {
-            let scene = render::build_scene(&mesh, &model, results.as_deref(), &display, &self.selected, anim);
+            let skey = (key.rev, key.sel, key.anim, key.mesh);
+            let scene = match &self.scene {
+                Some((k, sc)) if *k == skey => sc.clone(),
+                _ => {
+                    let sc = Arc::new(render::build_scene(&mesh, &model, results.as_deref(), &display, &self.selected, anim));
+                    self.scene = Some((skey, sc.clone()));
+                    sc
+                }
+            };
             let mut cam = self.cam;
             cam.zoom *= self.render_scale as f64;
             let frame = render::rasterize(&scene, &cam, w, h, display.show_mesh && !anim_on, self.dark);
@@ -2723,14 +2892,17 @@ impl SimApp {
     // ------------------------------------------------ status bar
     fn status(&mut self, ui: &mut egui::Ui) {
         let p = self.p;
-        let pr = self.core.progress.lock().unwrap().clone();
+        let pr = self.core.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let (last, err) = {
-            let s = self.core.session.lock().unwrap();
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (s.log.last().cloned().unwrap_or_default(), s.last_error.clone())
         };
         ui.horizontal(|ui| {
             if pr.running {
                 ui.add(egui::ProgressBar::new(pr.fraction as f32).desired_width(240.0).desired_height(14.0).text(RichText::new(pr.message.clone()).small()).fill(p.accent));
+                if ui.small_button(RichText::new("■ Stop").color(p.err)).on_hover_text("Stop the running solve or study").clicked() {
+                    let _ = self.core.call("cancel", &json!({}));
+                }
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             }
             match err {
@@ -2902,6 +3074,7 @@ impl eframe::App for SimApp {
         self.mcp_dialog(&ctx);
         self.planner_window(&ctx);
         self.study_window(&ctx);
+        self.safety_ui(&ctx);
         self.fatigue_window(&ctx);
         if let Some((msg, err, ttl)) = &mut self.toast {
             *ttl -= (ui.input(|i| i.stable_dt) as f64).min(0.1);

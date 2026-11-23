@@ -411,6 +411,16 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog) -> Result<Results> {
         Magnetostatic => crate::fields::magnetostatic(model, mesh, prog, &mut res)?,
         Fluid | ConjugateHeatTransfer => crate::cfd::solve(model, mesh, prog, &mut res)?,
     }
+    // a non-finite field means a degenerate model (zero stiffness, extreme properties, unstable
+    // explicit run): report it instead of showing garbage
+    let bad = |v: &[f64]| v.iter().any(|x| !x.is_finite());
+    let nonfinite = res.disp.as_ref().is_some_and(|d| d.iter().any(|p| !(p[0].is_finite() && p[1].is_finite() && p[2].is_finite())))
+        || res.temp.as_ref().is_some_and(|t| bad(t))
+        || res.vm.as_ref().is_some_and(|t| bad(t))
+        || res.extra.values().any(|v| bad(v));
+    if nonfinite {
+        bail!("the solution is not finite (NaN or infinity): check for parts without material stiffness or conductivity, extreme property values, or loads on a part that is not connected to any support");
+    }
     if let Some(w) = crate::gpu::take_fallback() {
         res.warnings.push(w);
     }
@@ -1192,7 +1202,7 @@ pub fn modal_basis(model: &Model, mesh: &Mesh, nmodes: usize, prog: Prog, res: &
         }
         let (ev, vecs) = sym_eigen(&c, p);
         let mut order: Vec<usize> = (0..p).collect();
-        order.sort_by(|&a, &b| ev[a].partial_cmp(&ev[b]).unwrap());
+        order.sort_by(|&a, &b| ev[a].total_cmp(&ev[b]));
         // Q = L^-T V
         let mut q = vec![0.0; p * p];
         for (col, &o) in order.iter().enumerate() {

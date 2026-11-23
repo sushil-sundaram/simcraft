@@ -2,6 +2,7 @@
 //! Z-buffered rasterisation, ANSYS-style banded contours, mesh edges and a face-id buffer
 //! used for picking.
 
+use rayon::prelude::*;
 use crate::geometry::*;
 use crate::mesh::Mesh;
 use crate::model::{Load, Model};
@@ -361,21 +362,20 @@ pub fn background(dark: bool) -> ([f32; 3], [f32; 3]) {
 pub fn rasterize(scene: &Scene, cam: &Camera, w: usize, h: usize, show_mesh: bool, dark: bool) -> Frame {
     let (bg_top, bg_bottom) = background(dark);
     let mut rgba = vec![0u8; w * h * 4];
-    for y in 0..h {
+    rgba.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
         let t = y as f32 / h.max(1) as f32;
         let c: Vec<u8> = (0..3).map(|k| ((bg_top[k] * (1.0 - t) + bg_bottom[k] * t) * 255.0) as u8).collect();
-        for x in 0..w {
-            let i = (y * w + x) * 4;
-            rgba[i..i + 3].copy_from_slice(&c);
-            rgba[i + 3] = 255;
+        for px in row.chunks_mut(4) {
+            px[..3].copy_from_slice(&c);
+            px[3] = 255;
         }
-    }
+    });
     let mut zbuf = vec![f64::INFINITY; w * h];
     let mut face_id = vec![u32::MAX; w * h];
     let (_, _, fwd) = cam.basis();
     let light = normalize(sub(scale(fwd, -1.0), add(scale(cam.basis().0, 0.35), scale(cam.basis().1, -0.45))));
     let (wf, hf) = (w as f64, h as f64);
-    let proj: Vec<(f64, f64, f64)> = scene.pos.iter().map(|p| cam.project(*p, wf, hf)).collect();
+    let proj: Vec<(f64, f64, f64)> = scene.pos.par_iter().map(|p| cam.project(*p, wf, hf)).collect();
 
     // ghost of undeformed shape (wireframe-ish) drawn first, faint
     if !scene.undeformed.is_empty() {
@@ -388,83 +388,119 @@ pub fn rasterize(scene: &Scene, cam: &Camera, w: usize, h: usize, show_mesh: boo
         }
     }
 
-    for (qi, quad) in proj.chunks(4).enumerate() {
-        let p = &scene.pos[qi * 4..qi * 4 + 4];
-        let nrm = normalize(cross(sub(p[1], p[0]), sub(p[3], p[0])));
-        match scene.kind.get(qi).copied().unwrap_or(0) {
-            0 if dot(nrm, fwd) > 0.05 => continue,  // back face of a solid
-            1 if dot(nrm, fwd) < -0.05 => continue, // near enclosure wall: see through it
-            _ => {}
-        }
-        let shade = 0.38 + 0.62 * dot(nrm, light).abs();
-        let edge_px = {
-            let a = (quad[1].0 - quad[0].0).hypot(quad[1].1 - quad[0].1);
-            let b = (quad[3].0 - quad[0].0).hypot(quad[3].1 - quad[0].1);
-            a.min(b).max(1e-6)
-        };
-        let draw_edges = show_mesh && edge_px > 6.0;
-        let thick = 0.9 / edge_px;
-        let uv = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-        for tri in [[0usize, 1, 2], [0, 2, 3]] {
-            let v: Vec<(f64, f64, f64)> = tri.iter().map(|&i| quad[i]).collect();
-            let minx = v.iter().map(|a| a.0).fold(f64::INFINITY, f64::min).floor().max(0.0) as i64;
-            let maxx = v.iter().map(|a| a.0).fold(f64::NEG_INFINITY, f64::max).ceil().min(wf - 1.0) as i64;
-            let miny = v.iter().map(|a| a.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as i64;
-            let maxy = v.iter().map(|a| a.1).fold(f64::NEG_INFINITY, f64::max).ceil().min(hf - 1.0) as i64;
-            if minx > maxx || miny > maxy {
-                continue;
+    // per-quad setup (visibility, shading, edges, screen rows) in parallel
+    struct Q {
+        qi: usize,
+        shade: f64,
+        draw_edges: bool,
+        thick: f64,
+        y0: i64,
+        y1: i64,
+    }
+    let quads: Vec<Q> = proj
+        .par_chunks(4)
+        .enumerate()
+        .filter_map(|(qi, quad)| {
+            let p = &scene.pos[qi * 4..qi * 4 + 4];
+            let nrm = normalize(cross(sub(p[1], p[0]), sub(p[3], p[0])));
+            match scene.kind.get(qi).copied().unwrap_or(0) {
+                0 if dot(nrm, fwd) > 0.05 => return None,  // back face of a solid
+                1 if dot(nrm, fwd) < -0.05 => return None, // near enclosure wall: see through it
+                _ => {}
             }
-            let area = (v[1].0 - v[0].0) * (v[2].1 - v[0].1) - (v[2].0 - v[0].0) * (v[1].1 - v[0].1);
-            if area.abs() < 1e-12 {
-                continue;
-            }
-            for py in miny..=maxy {
-                for px in minx..=maxx {
-                    let (x, y) = (px as f64 + 0.5, py as f64 + 0.5);
-                    let w0 = ((v[1].0 - x) * (v[2].1 - y) - (v[2].0 - x) * (v[1].1 - y)) / area;
-                    let w1 = ((v[2].0 - x) * (v[0].1 - y) - (v[0].0 - x) * (v[2].1 - y)) / area;
-                    let w2 = 1.0 - w0 - w1;
-                    if w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9 {
-                        continue;
-                    }
-                    let z = w0 * v[0].2 + w1 * v[1].2 + w2 * v[2].2;
-                    let idx = py as usize * w + px as usize;
-                    if z >= zbuf[idx] {
-                        continue;
-                    }
-                    zbuf[idx] = z;
-                    face_id[idx] = scene.face[qi];
-                    let g = |k: usize| qi * 4 + tri[k];
-                    let t0 = scene.t[g(0)];
-                    let mut col = if t0.is_nan() {
-                        let c = scene.color[g(0)];
-                        [c[0] as f64, c[1] as f64, c[2] as f64]
-                    } else {
-                        let t = w0 * t0 + w1 * scene.t[g(1)] + w2 * scene.t[g(2)];
-                        let c = band_color(t);
-                        [c[0] as f64, c[1] as f64, c[2] as f64]
-                    };
-                    for c in col.iter_mut() {
-                        *c *= shade;
-                    }
-                    if draw_edges {
-                        let u = w0 * uv[tri[0]].0 + w1 * uv[tri[1]].0 + w2 * uv[tri[2]].0;
-                        let vv = w0 * uv[tri[0]].1 + w1 * uv[tri[1]].1 + w2 * uv[tri[2]].1;
-                        let e = u.min(1.0 - u).min(vv).min(1.0 - vv);
-                        if e < thick {
-                            for c in col.iter_mut() {
-                                *c *= 0.55;
-                            }
-                        }
-                    }
-                    let o = idx * 4;
-                    rgba[o] = col[0] as u8;
-                    rgba[o + 1] = col[1] as u8;
-                    rgba[o + 2] = col[2] as u8;
-                }
-            }
+            let shade = 0.38 + 0.62 * dot(nrm, light).abs();
+            let edge_px = {
+                let a = (quad[1].0 - quad[0].0).hypot(quad[1].1 - quad[0].1);
+                let b = (quad[3].0 - quad[0].0).hypot(quad[3].1 - quad[0].1);
+                a.min(b).max(1e-6)
+            };
+            let y0 = quad.iter().map(|a| a.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as i64;
+            let y1 = quad.iter().map(|a| a.1).fold(f64::NEG_INFINITY, f64::max).ceil().min(hf - 1.0) as i64;
+            (y0 <= y1).then_some(Q { qi, shade, draw_edges: show_mesh && edge_px > 6.0, thick: 0.9 / edge_px, y0, y1 })
+        })
+        .collect();
+    // horizontal bands rendered in parallel; each band owns its rows of every buffer
+    let band = (h / (rayon::current_num_threads() * 4).max(1)).max(8);
+    let nb = h.div_ceil(band);
+    let mut bins: Vec<Vec<u32>> = vec![Vec::new(); nb];
+    for (k, q) in quads.iter().enumerate() {
+        for b in (q.y0 as usize / band)..=((q.y1 as usize / band).min(nb - 1)) {
+            bins[b].push(k as u32);
         }
     }
+    rgba.par_chunks_mut(band * w * 4)
+        .zip(zbuf.par_chunks_mut(band * w))
+        .zip(face_id.par_chunks_mut(band * w))
+        .enumerate()
+        .for_each(|(bi, ((rgba, zbuf), face_id))| {
+            let row0 = (bi * band) as i64;
+            let row1 = row0 + (zbuf.len() / w) as i64 - 1;
+            let uv = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+            for &k in &bins[bi] {
+                let q = &quads[k as usize];
+                let qi = q.qi;
+                let quad = &proj[qi * 4..qi * 4 + 4];
+                for tri in [[0usize, 1, 2], [0, 2, 3]] {
+                    let v = [quad[tri[0]], quad[tri[1]], quad[tri[2]]];
+                    let minx = v.iter().map(|a| a.0).fold(f64::INFINITY, f64::min).floor().max(0.0) as i64;
+                    let maxx = v.iter().map(|a| a.0).fold(f64::NEG_INFINITY, f64::max).ceil().min(wf - 1.0) as i64;
+                    let miny = (v.iter().map(|a| a.1).fold(f64::INFINITY, f64::min).floor().max(0.0) as i64).max(row0);
+                    let maxy = (v.iter().map(|a| a.1).fold(f64::NEG_INFINITY, f64::max).ceil().min(hf - 1.0) as i64).min(row1);
+                    if minx > maxx || miny > maxy {
+                        continue;
+                    }
+                    let area = (v[1].0 - v[0].0) * (v[2].1 - v[0].1) - (v[2].0 - v[0].0) * (v[1].1 - v[0].1);
+                    if area.abs() < 1e-12 {
+                        continue;
+                    }
+                    for py in miny..=maxy {
+                        for px in minx..=maxx {
+                            let (x, y) = (px as f64 + 0.5, py as f64 + 0.5);
+                            let w0 = ((v[1].0 - x) * (v[2].1 - y) - (v[2].0 - x) * (v[1].1 - y)) / area;
+                            let w1 = ((v[2].0 - x) * (v[0].1 - y) - (v[0].0 - x) * (v[2].1 - y)) / area;
+                            let w2 = 1.0 - w0 - w1;
+                            if w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9 {
+                                continue;
+                            }
+                            let z = w0 * v[0].2 + w1 * v[1].2 + w2 * v[2].2;
+                            let idx = (py - row0) as usize * w + px as usize;
+                            if z >= zbuf[idx] {
+                                continue;
+                            }
+                            zbuf[idx] = z;
+                            face_id[idx] = scene.face[qi];
+                            let g = |k: usize| qi * 4 + tri[k];
+                            let t0 = scene.t[g(0)];
+                            let mut col = if t0.is_nan() {
+                                let c = scene.color[g(0)];
+                                [c[0] as f64, c[1] as f64, c[2] as f64]
+                            } else {
+                                let t = w0 * t0 + w1 * scene.t[g(1)] + w2 * scene.t[g(2)];
+                                let c = band_color(t);
+                                [c[0] as f64, c[1] as f64, c[2] as f64]
+                            };
+                            for c in col.iter_mut() {
+                                *c *= q.shade;
+                            }
+                            if q.draw_edges {
+                                let u = w0 * uv[tri[0]].0 + w1 * uv[tri[1]].0 + w2 * uv[tri[2]].0;
+                                let vv = w0 * uv[tri[0]].1 + w1 * uv[tri[1]].1 + w2 * uv[tri[2]].1;
+                                let e = u.min(1.0 - u).min(vv).min(1.0 - vv);
+                                if e < q.thick {
+                                    for c in col.iter_mut() {
+                                        *c *= 0.55;
+                                    }
+                                }
+                            }
+                            let o = idx * 4;
+                            rgba[o] = col[0] as u8;
+                            rgba[o + 1] = col[1] as u8;
+                            rgba[o + 2] = col[2] as u8;
+                        }
+                    }
+                }
+            }
+        });
     Frame { w, h, rgba, face_id }
 }
 

@@ -124,11 +124,11 @@ fn launch_gui(local: &Shared) -> Value {
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("gui");
-    let has_model = !local.session.lock().unwrap().model.bodies.is_empty();
+    let has_model = !local.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.bodies.is_empty();
     if has_model {
         let path = std::env::temp_dir().join(format!("simcraft-handoff-{}.simcraft", std::process::id()));
         let p = path.to_string_lossy().to_string();
-        if let Err(e) = local.session.lock().unwrap().save(&p) {
+        if let Err(e) = local.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save(&p) {
             return content(false, format!("could not hand over model: {e}"), None);
         }
         cmd.arg(&p);

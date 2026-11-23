@@ -135,7 +135,7 @@ pub fn harmonic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Re
             }
         }
     }
-    freqs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    freqs.sort_by(|a, b| a.total_cmp(b));
     freqs.dedup_by(|a, b| (*a - *b).abs() < 1e-12 * a.abs());
     let nn = mesh.nodes.len();
     let nm = b.omega.len();
@@ -184,7 +184,7 @@ pub fn harmonic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Re
     let n = nn * 3;
     let ure: Vec<f64> = (0..n).map(|d| (0..nm).map(|i| b.phi[i][d] * q[i].0).sum()).collect();
     let uim: Vec<f64> = (0..n).map(|d| (0..nm).map(|i| b.phi[i][d] * q[i].1).sum()).collect();
-    let dmax = (0..n).max_by(|&a, &c| (ure[a].hypot(uim[a])).partial_cmp(&ure[c].hypot(uim[c])).unwrap()).unwrap_or(0);
+    let dmax = (0..n).max_by(|&a, &c| (ure[a].hypot(uim[a])).total_cmp(&ure[c].hypot(uim[c]))).unwrap_or(0);
     let th = -uim[dmax].atan2(ure[dmax]);
     let u: Vec<f64> = (0..n).map(|d| ure[d] * th.cos() - uim[d] * th.sin()).collect();
     set_stress_fields(mesh, nodal_stress(model, mesh, &u, &b.fixed), res);
@@ -300,7 +300,7 @@ pub fn random(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resu
             }
         }
     }
-    fs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    fs.sort_by(|a, b| a.total_cmp(b));
     fs.dedup_by(|a, b| (*a - *b).abs() < 1e-12 * a.abs());
     // modal covariance C_ij = ∫ Γ_i Γ_j Re(H_i H_j*) S_a df and C2_ij = ∫ … ω² … (for crossing rate)
     prog(0.65, "integrating PSD");
@@ -354,7 +354,7 @@ pub fn random(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resu
     let n = mesh.nodes.len() * 3;
     let u: Vec<f64> = (0..n).into_par_iter().map(|dof| quad(&|i| b.phi[i][dof], &c).sqrt()).collect();
     // zero-crossing frequency of the most-responding dof
-    let dmax = (0..n).max_by(|&a, &bb| u[a].partial_cmp(&u[bb]).unwrap()).unwrap_or(0);
+    let dmax = (0..n).max_by(|&a, &bb| u[a].total_cmp(&u[bb])).unwrap_or(0);
     let nu0 = (quad(&|i| b.phi[i][dmax], &c2) / quad(&|i| b.phi[i][dmax], &c).max(1e-300)).sqrt() / TWO_PI;
     prog(0.8, "modal stresses");
     let ms: Vec<Vec<[f64; 6]>> = (0..nm).map(|i| nodal_stress(model, mesh, &b.phi[i], &b.fixed)).collect();

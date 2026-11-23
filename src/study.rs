@@ -528,7 +528,7 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
         .iter()
         .enumerate()
         .filter(|(_, r)| r.feasible)
-        .min_by(|a, b| (sign * a.1.responses[0].unwrap()).partial_cmp(&(sign * b.1.responses[0].unwrap())).unwrap())
+        .min_by(|a, b| (sign * a.1.responses[0].unwrap()).total_cmp(&(sign * b.1.responses[0].unwrap())))
         .map(|(i, _)| i)
         .or_else(|| runs.iter().enumerate().min_by(|a, b| merit(a.1, s).partial_cmp(&merit(b.1, s)).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i));
     let feasible = best_idx.is_some_and(|i| runs[i].feasible);
@@ -709,7 +709,7 @@ pub fn surrogate_optimize(model: &Model, params: Vec<Parameter>, objective: Obje
         .iter()
         .enumerate()
         .filter(|(_, r)| r.feasible)
-        .min_by(|a, b| (sign * a.1.responses[0].unwrap()).partial_cmp(&(sign * b.1.responses[0].unwrap())).unwrap())
+        .min_by(|a, b| (sign * a.1.responses[0].unwrap()).total_cmp(&(sign * b.1.responses[0].unwrap())))
         .map(|(i, _)| i);
     let message = match best_idx {
         Some(i) => {

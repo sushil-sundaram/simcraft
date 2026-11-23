@@ -990,7 +990,7 @@ impl Mesh {
             .par_iter()
             .enumerate()
             .map(|(i, n)| (i, dot(sub(*n, p), sub(*n, p))))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|x| x.0)
             .unwrap_or(0)
     }

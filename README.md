@@ -1,5 +1,7 @@
 # SimCraft
 
+[![CI](https://github.com/sushil-sundaram/simcraft/actions/workflows/ci.yml/badge.svg)](https://github.com/sushil-sundaram/simcraft/actions/workflows/ci.yml)
+
 A finite-element simulation app written in Rust, with a simple Fusion-style UI and an MCP
 server so AI agents (Claude Code, Antigravity, Cursor, …) can build models, run
 simulations and look at the results.

@@ -29,10 +29,10 @@ static FALLBACK: Mutex<Option<String>> = Mutex::new(None);
 
 /// Record why a requested GPU solve fell back to the CPU (reported as a result warning).
 pub fn note_fallback(msg: String) {
-    *FALLBACK.lock().unwrap() = Some(msg);
+    *FALLBACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(msg);
 }
 pub fn take_fallback() -> Option<String> {
-    FALLBACK.lock().unwrap().take()
+    FALLBACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
 pub fn set_mode(m: ComputeMode) {
@@ -47,7 +47,7 @@ pub fn mode() -> ComputeMode {
 }
 /// Name of the GPU used by the last GPU solve (None if no GPU solve has run).
 pub fn last_device() -> Option<String> {
-    LAST_DEVICE.lock().unwrap().clone()
+    LAST_DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 const WG: u32 = 256;
@@ -280,7 +280,7 @@ impl GpuSystem {
         let fault: std::sync::Arc<Mutex<Option<String>>> = Default::default();
         let f2 = fault.clone();
         device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
-            *f2.lock().unwrap() = Some(e.to_string());
+            *f2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.to_string());
         }));
         let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let val_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -357,7 +357,7 @@ impl GpuSystem {
         let staging_sc = staging(64);
         let staging_x = staging((n * 8) as u64);
         let device_name = info.name.clone();
-        *LAST_DEVICE.lock().unwrap() = Some(device_name.clone());
+        *LAST_DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(device_name.clone());
         if let Some(e) = pollster::block_on(val_scope.pop()) {
             bail!("GPU setup failed: {e}");
         }
@@ -415,7 +415,7 @@ impl GpuSystem {
             enc.copy_buffer_to_buffer(&self.bufs[10], 0, &self.staging_sc, 0, 64);
             q.submit(Some(enc.finish()));
             let sc = read_f64(&self.device, &self.staging_sc, 8)?;
-            if let Some(e) = self.fault.lock().unwrap().take() {
+            if let Some(e) = self.fault.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
                 bail!("GPU error during solve: {e}");
             }
             it += BATCH;

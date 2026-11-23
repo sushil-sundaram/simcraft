@@ -261,7 +261,7 @@ pub fn dense_inverse(a: &[f64], n: usize) -> Vec<f64> {
         inv[i * n + i] = 1.0;
     }
     for col in 0..n {
-        let piv = (col..n).max_by(|&i, &j| m[i * n + col].abs().partial_cmp(&m[j * n + col].abs()).unwrap()).unwrap();
+        let piv = (col..n).max_by(|&i, &j| m[i * n + col].abs().total_cmp(&m[j * n + col].abs())).unwrap();
         if piv != col {
             for k in 0..n {
                 m.swap(col * n + k, piv * n + k);
