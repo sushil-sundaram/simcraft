@@ -278,6 +278,16 @@ pub enum Load {
     Temperature { faces: Vec<String>, value: f64 },
     HeatFlux { faces: Vec<String>, value: f64 },
     Convection { faces: Vec<String>, coefficient: f64, ambient: f64 },
+    /// Thermal radiation from the faces: to the surroundings at `ambient` °C, or — with
+    /// `enclosure` — between all enclosure faces (view factors), the rest of their view seeing the
+    /// ambient.
+    Radiation {
+        faces: Vec<String>,
+        emissivity: f64,
+        ambient: f64,
+        #[serde(default)]
+        enclosure: bool,
+    },
     /// Internal heat [W/m³] in one body, or in the whole model when `body` is omitted. With
     /// `power` [W] the total is spread over the body's cells (exact on any mesh) and `value` is unused.
     HeatGeneration {
@@ -348,6 +358,8 @@ impl Load {
             Load::Temperature { .. } => "Temperature",
             Load::HeatFlux { .. } => "Heat Flux",
             Load::Convection { .. } => "Convection",
+            Load::Radiation { enclosure: true, .. } => "Radiation (enclosure)",
+            Load::Radiation { .. } => "Radiation",
             Load::HeatGeneration { .. } => "Internal Heat Generation",
             Load::Voltage { .. } => "Voltage",
             Load::Current { .. } => "Current",
@@ -370,6 +382,7 @@ impl Load {
             | Load::Temperature { faces, .. }
             | Load::HeatFlux { faces, .. }
             | Load::Convection { faces, .. }
+            | Load::Radiation { faces, .. }
             | Load::Voltage { faces, .. }
             | Load::Current { faces, .. }
             | Load::Inlet { faces, .. }
@@ -402,7 +415,7 @@ impl Load {
         matches!(self, Load::FixedSupport { .. } | Load::Displacement { .. } | Load::CompressionOnly { .. } | Load::Symmetry { .. })
     }
     pub fn is_thermal(&self) -> bool {
-        matches!(self, Load::Temperature { .. } | Load::HeatFlux { .. } | Load::Convection { .. } | Load::HeatGeneration { .. })
+        matches!(self, Load::Temperature { .. } | Load::HeatFlux { .. } | Load::Convection { .. } | Load::Radiation { .. } | Load::HeatGeneration { .. })
     }
     /// Whether this load takes part in the given analysis.
     pub fn applies_to(&self, kind: AnalysisType) -> bool {
@@ -437,6 +450,7 @@ impl Load {
             Load::Temperature { faces, value } => format!("{value} °C on {}", f(faces)),
             Load::HeatFlux { faces, value } => format!("{value} W/m² on {}", f(faces)),
             Load::Convection { faces, coefficient, ambient } => format!("h={coefficient} W/m²K, T∞={ambient} °C on {}", f(faces)),
+            Load::Radiation { faces, emissivity, ambient, enclosure } => format!("ε={emissivity}, T∞={ambient} °C{} on {}", if *enclosure { ", surface-to-surface" } else { "" }, f(faces)),
             Load::HeatGeneration { value, body, power } => match (power, body) {
                 (Some(p), Some(b)) => format!("{p} W in {b}"),
                 (Some(p), None) => format!("{p} W in all solids"),

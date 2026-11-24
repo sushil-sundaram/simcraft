@@ -53,6 +53,45 @@ pub struct Material {
     /// Orthotropic thermal conductivity [kx, ky, kz] W/(m·K) (homogenised PCBs); None = isotropic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conductivity_xyz: Option<[f64; 3]>,
+    /// Thermal conductivity vs temperature [[°C, W/(m·K)], …] (linear between points, constant
+    /// outside); empty = constant `thermal_conductivity`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conductivity_table: Vec<[f64; 2]>,
+    /// Specific heat vs temperature [[°C, J/(kg·K)], …]; empty = constant `specific_heat`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub specific_heat_table: Vec<[f64; 2]>,
+}
+
+fn interp(table: &[[f64; 2]], t: f64) -> f64 {
+    let n = table.len();
+    if t <= table[0][0] {
+        return table[0][1];
+    }
+    if t >= table[n - 1][0] {
+        return table[n - 1][1];
+    }
+    let i = table.windows(2).position(|w| t <= w[1][0]).unwrap_or(n - 2);
+    let (a, b) = (table[i], table[i + 1]);
+    let w = if b[0] > a[0] { (t - a[0]) / (b[0] - a[0]) } else { 0.0 };
+    a[1] + w * (b[1] - a[1])
+}
+
+impl Material {
+    /// k(T) / k as a factor (1 without a table); orthotropic conductivities scale with it.
+    pub fn k_factor(&self, t: f64) -> f64 {
+        if self.conductivity_table.is_empty() || self.thermal_conductivity <= 0.0 {
+            1.0
+        } else {
+            interp(&self.conductivity_table, t) / self.thermal_conductivity
+        }
+    }
+    /// Specific heat at temperature t [J/(kg·K)].
+    pub fn cp_at(&self, t: f64) -> f64 {
+        if self.specific_heat_table.is_empty() { self.specific_heat } else { interp(&self.specific_heat_table, t) }
+    }
+    pub fn temperature_dependent(&self) -> bool {
+        !self.conductivity_table.is_empty() || !self.specific_heat_table.is_empty()
+    }
 }
 fn one() -> f64 {
     1.0
@@ -112,6 +151,8 @@ fn m(name: &str, e: f64, nu: f64, rho: f64, sy: f64, su: f64, k: f64, a: f64, cp
         endurance_limit_mpa: 0.0,
         loss_tangent: 0.0,
         conductivity_xyz: None,
+        conductivity_table: Vec::new(),
+        specific_heat_table: Vec::new(),
     }
 }
 

@@ -93,10 +93,13 @@ MATERIALS: {}; custom materials can be defined (E, ν, density, yield, conductiv
 FULL-WAVE EM: full_wave_em (FDTD at one frequency: E field, absorbed power density, SAR, power per body; metal cavity or open absorbing boundary; RF port with a power in W) \
 and microwave_heating (full_wave_em then transient heating of the solids: food in a microwave oven, dielectric heating, RF absorption). Element size ≤ wavelength in the densest material / 10 \
 (food at 2.45 GHz: ≤ 1.7 mm). Materials have a loss tangent; 'Food (water-rich, 2.45 GHz)' and Water are lossy.\n\
-NOT AVAILABLE (must be marked missing): far-field / radiated-emission (EMI) post-processing, antenna gain, S-parameters, \
+THERMAL RADIATION: add_radiation (emissivity, surroundings °C) to the surroundings, or enclosure: true for surface-to-surface exchange by view factors \
+(fins, lids, sealed boxes); in conjugate_heat_transfer to the surroundings only. Materials may have conductivity / specific-heat tables vs temperature.\n\
+EMI: full_wave_em with em_boundary open reports radiated power, directivity / gain and the field at 3 m / 10 m against FCC / CISPR 32 class B (free-space estimate).\n\
+NOT AVAILABLE (must be marked missing): S-parameters and broadband sweeps, sub-cell PCB traces in FDTD, \
 time-harmonic eddy currents and induction heating, contact between two deformable bodies and friction, compressible / supersonic flow, transient (time-accurate) CFD, \
-radiation heat transfer, phase change (melting/boiling/evaporation), moisture transport, strain-life (low-cycle) fatigue and crack growth, composites layups, \
-acoustics, electrochemistry, temperature-dependent material properties, moving or rotating parts. \
+surface-to-surface radiation across a CFD fluid, phase change (melting/boiling/evaporation), moisture transport, strain-life (low-cycle) fatigue and crack growth, composites layups, \
+acoustics, electrochemistry, moving or rotating parts. \
 Workarounds are allowed when honest, e.g. an estimated absorbed power applied as internal heat generation, or a convection coefficient instead of CFD.\n\
 WORKFLOW in SimCraft: GEOMETRY tab (bodies) → MATERIAL tab → SETUP tab (analysis + loads/supports, click faces) → MESH tab → SOLVE → RESULTS (contours, cut plane, probe). \
 Everything can also be driven by an AI agent through the SimCraft MCP tools.",
@@ -108,10 +111,12 @@ Everything can also be driven by an AI agent through the SimCraft MCP tools.",
 /// Rule-based check for physics SimCraft cannot do, so small models cannot gloss over it.
 pub fn known_gaps(goal: &str) -> Vec<String> {
     let g = goal.to_lowercase();
-    let has = |ws: &[&str]| ws.iter().any(|w| g.contains(w));
+    let words: Vec<&str> = g.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    // short acronyms match whole words only ("emi" must not match "emissivity")
+    let has = |ws: &[&str]| ws.iter().any(|w| if w.len() <= 3 { words.contains(w) } else { g.contains(w) });
     let mut out = Vec::new();
     if has(&["emi", "emc", "antenna", "radiated", "far field", "far-field", "s-parameter", "radar", "cispr"]) {
-        out.push("Far-field / radiated-emission post-processing (near-to-far-field transform, CISPR limits, antenna gain, S-parameters) and sub-cell PCB trace models — full_wave_em gives near fields only.".into());
+        out.push("S-parameters / broadband sweeps and sub-cell PCB trace models — full_wave_em runs one frequency (its far field and FCC / CISPR margins are free-space estimates).".into());
     }
     if has(&["induction", "eddy"]) {
         out.push("Time-harmonic eddy currents / induction heating (low-frequency magnetic losses in conductors).".into());
@@ -120,13 +125,13 @@ pub fn known_gaps(goal: &str) -> Vec<String> {
         out.push("Microwave turntable rotation (approximate by averaging several food positions).".into());
     }
     if has(&["food", "cook", "thaw", "defrost", "melt", "boil", "evaporat", "steam", "freez"]) {
-        out.push("Temperature-dependent dielectric/thermal properties and phase change (thawing, boiling, moisture loss) for food or water-rich materials.".into());
+        out.push("Temperature-dependent dielectric properties and phase change (thawing, boiling, moisture loss) for food or water-rich materials (thermal conductivity / specific heat tables are available).".into());
     }
     if has(&["high speed", "supersonic", "compressib", "shock wave", "mach"]) {
         out.push("Compressible / high-speed CFD (SimCraft's CFD is incompressible).".into());
     }
-    if has(&["radiat"]) && has(&["heat", "thermal", "cool", "hot"]) {
-        out.push("Thermal radiation between surfaces (only conduction and convection are modelled).".into());
+    if has(&["radiat"]) && has(&["heat", "thermal", "cool", "hot"]) && has(&["airflow", "fan", "cfd", "flow"]) {
+        out.push("Surface-to-surface radiation across the air in a CFD model (conjugate heat transfer radiates to the surroundings only; a thermal model without flow supports both).".into());
     }
     if has(&["crack", "low-cycle", "low cycle", "strain-life", "weld fatigue"]) {
         out.push("Crack growth / strain-life (low-cycle) fatigue (stress-life S-N fatigue is available).".into());
@@ -136,9 +141,6 @@ pub fn known_gaps(goal: &str) -> Vec<String> {
     }
     if has(&["acoustic", "noise", "sound", "vibration of air"]) {
         out.push("Acoustics solver.".into());
-    }
-    if has(&["radiation heat", "radiative", "infrared", "emissivity"]) {
-        out.push("Thermal radiation (surface-to-surface / emissivity) boundary conditions.".into());
     }
     if has(&["rotat", "spinning", "moving", "turntable", "motor"]) {
         out.push("Moving / rotating parts (e.g. a microwave turntable or motor rotor) — approximate with several static positions.".into());

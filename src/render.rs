@@ -139,6 +139,7 @@ pub fn load_color(l: &Load) -> [u8; 3] {
         Load::Temperature { .. } => [230, 60, 120],
         Load::HeatFlux { .. } => [230, 190, 20],
         Load::Convection { .. } => [20, 180, 200],
+        Load::Radiation { .. } => [245, 190, 40],
         Load::CompressionOnly { .. } => [40, 160, 230],
         Load::Symmetry { .. } => [120, 130, 210],
         Load::Voltage { .. } => [170, 60, 220],

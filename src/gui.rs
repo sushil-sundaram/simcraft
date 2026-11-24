@@ -135,6 +135,7 @@ enum LoadKind {
     Temperature,
     HeatFlux,
     Convection,
+    Radiation,
     HeatGen,
     Voltage,
     Current,
@@ -147,7 +148,7 @@ enum LoadKind {
 }
 impl LoadKind {
     const STRUCTURAL: [LoadKind; 7] = [LoadKind::Fixed, LoadKind::Displacement, LoadKind::CompressionOnly, LoadKind::Symmetry, LoadKind::Force, LoadKind::Pressure, LoadKind::Gravity];
-    const THERMAL: [LoadKind; 4] = [LoadKind::Temperature, LoadKind::HeatFlux, LoadKind::Convection, LoadKind::HeatGen];
+    const THERMAL: [LoadKind; 5] = [LoadKind::Temperature, LoadKind::HeatFlux, LoadKind::Convection, LoadKind::Radiation, LoadKind::HeatGen];
     const ELECTRO: [LoadKind; 5] = [LoadKind::Voltage, LoadKind::Current, LoadKind::Coil, LoadKind::Magnet, LoadKind::Port];
     const FLUID: [LoadKind; 5] = [LoadKind::Inlet, LoadKind::Outlet, LoadKind::Symmetry, LoadKind::MovingWall, LoadKind::Gravity];
     fn label(self) -> &'static str {
@@ -162,6 +163,7 @@ impl LoadKind {
             LoadKind::Temperature => "Temperature",
             LoadKind::HeatFlux => "Heat Flux",
             LoadKind::Convection => "Convection",
+            LoadKind::Radiation => "Radiation",
             LoadKind::HeatGen => "Heat Gen.",
             LoadKind::Voltage => "Voltage",
             LoadKind::Current => "Current",
@@ -188,6 +190,7 @@ impl LoadKind {
             LoadKind::Temperature => "🌡",
             LoadKind::HeatFlux => "☀",
             LoadKind::Convection => "💨",
+            LoadKind::Radiation => "🔆",
             LoadKind::HeatGen => "🔥",
             LoadKind::Voltage => "⚡",
             LoadKind::Current => "🔌",
@@ -212,6 +215,7 @@ impl LoadKind {
             LoadKind::Temperature => Load::Temperature { faces: f, value: 0.0 },
             LoadKind::HeatFlux => Load::HeatFlux { faces: f, value: 0.0 },
             LoadKind::Convection => Load::Convection { faces: f, coefficient: 0.0, ambient: 0.0 },
+            LoadKind::Radiation => Load::Radiation { faces: f, emissivity: 0.9, ambient: 0.0, enclosure: false },
             LoadKind::HeatGen => Load::HeatGeneration { value: 0.0, body: None, power: None },
             LoadKind::Voltage => Load::Voltage { faces: f, value: 0.0 },
             LoadKind::Current => Load::Current { faces: f, value: 0.0 },
@@ -270,6 +274,8 @@ struct Forms {
     value: f64,
     coef: f64,
     ambient: f64,
+    rad_eps: f64,
+    rad_enclosure: bool,
     dcomp: [(bool, f64); 3],
     grav: [f64; 3],
     material: String,
@@ -322,6 +328,8 @@ impl Default for Forms {
             vector: [0.0, 0.0, -1000.0],
             value: 1.0,
             coef: 20.0,
+            rad_eps: 0.9,
+            rad_enclosure: false,
             ambient: 22.0,
             dcomp: [(true, 0.0), (false, 0.0), (false, 0.0)],
             grav: [0.0, 0.0, -9.80665],
@@ -374,6 +382,7 @@ struct RenderKey {
 const MAT_KEYS: &[&str] = &[
     "youngs_modulus_gpa", "poisson_ratio", "density", "yield_strength_mpa", "ultimate_strength_mpa", "thermal_conductivity", "thermal_expansion", "specific_heat",
     "relative_permittivity", "electrical_conductivity", "relative_permeability", "loss_tangent", "fatigue_strength_coefficient_mpa", "fatigue_exponent", "endurance_limit_mpa",
+    "conductivity_table", "specific_heat_table",
 ];
 
 /// Edit the fields of a JSON object in place: numbers, [x,y,z] vectors, text, face lists, switches.
@@ -400,6 +409,25 @@ fn json_editor(ui: &mut egui::Ui, v: &mut Value, mats: &[String], id: &str) -> b
                     if ui.add(egui::DragValue::new(&mut x).speed(sp).custom_formatter(|v, _| render::fmt_val(v))).changed() {
                         *val = json!(x);
                         changed = true;
+                    }
+                }
+                Value::Array(a) if k.ends_with("_table") => {
+                    // property vs temperature as "T: value; T: value"
+                    let mut t = a.iter().filter_map(|r| Some(format!("{}: {}", render::fmt_val(r[0].as_f64()?), render::fmt_val(r[1].as_f64()?)))).collect::<Vec<_>>().join("; ");
+                    let resp = ui.add(egui::TextEdit::singleline(&mut t).desired_width(170.0).hint_text("°C: value; °C: value")).on_hover_text("Value against temperature, e.g. 20: 167; 200: 180 (linear between points, constant outside). Empty = constant.");
+                    if resp.changed() {
+                        let rows: Option<Vec<[f64; 2]>> = t
+                            .split(';')
+                            .filter(|x| !x.trim().is_empty())
+                            .map(|p| {
+                                let (a, b) = p.split_once(':')?;
+                                Some([a.trim().parse().ok()?, b.trim().parse().ok()?])
+                            })
+                            .collect();
+                        if let Some(rows) = rows {
+                            *val = json!(rows);
+                            changed = true;
+                        }
                     }
                 }
                 Value::Array(a) if a.len() == 3 && a.iter().all(|e| e.is_number()) => {
@@ -1903,6 +1931,8 @@ impl SimApp {
                                 for k in MAT_KEYS {
                                     if let Some(x) = full.get(*k) {
                                         v[*k] = x.clone();
+                                    } else if k.ends_with("_table") {
+                                        v[*k] = json!([]);
                                     }
                                 }
                                 self.mat_edit = Some((m.name.clone(), v));
@@ -3603,6 +3633,18 @@ impl SimApp {
                         ui.end_row();
                     });
                 }
+                LoadKind::Radiation => {
+                    egui::Grid::new("rad").num_columns(2).show(ui, |ui| {
+                        ui.label("Emissivity ε");
+                        ui.add(egui::DragValue::new(&mut self.f.rad_eps).speed(0.01).range(0.01..=1.0)).on_hover_text("Polished aluminium ≈ 0.05, oxidised metal 0.3–0.6, anodised / painted / FR-4 0.8–0.95");
+                        ui.end_row();
+                        ui.label("Surroundings");
+                        ui.add(egui::DragValue::new(&mut self.f.ambient).speed(0.5).suffix(" °C"));
+                        ui.end_row();
+                    });
+                    ui.checkbox(&mut self.f.rad_enclosure, "Faces see each other (enclosure)").on_hover_text("Surface-to-surface: these faces (and those of other enclosure radiation loads) exchange radiation by view factors; parts block each other. Off = each face radiates to the surroundings only.");
+                    ui.label(RichText::new("Non-linear: the solver iterates. Combine with Convection on the same faces for natural cooling.").small().color(p.weak));
+                }
                 LoadKind::HeatGen => {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.f.heat_watts, true, "Total power");
@@ -3707,6 +3749,7 @@ impl SimApp {
                 LoadKind::Temperature => ("add_temperature", json!({"faces": fa, "value": self.f.value})),
                 LoadKind::HeatFlux => ("add_heat_flux", json!({"faces": fa, "value": self.f.value})),
                 LoadKind::Convection => ("add_convection", json!({"faces": fa, "coefficient": self.f.coef, "ambient": self.f.ambient})),
+                LoadKind::Radiation => ("add_radiation", json!({"faces": fa, "emissivity": self.f.rad_eps, "ambient": self.f.ambient, "enclosure": self.f.rad_enclosure})),
                 LoadKind::HeatGen => {
                     if self.f.heat_watts {
                         ("add_heat_generation", json!({"power": self.f.heat_power, "body": self.f.heat_body}))
@@ -4264,6 +4307,8 @@ impl eframe::App for SimApp {
                     for k in MAT_KEYS {
                         if let Some(x) = full.get(*k) {
                             v[*k] = x.clone();
+                        } else if k.ends_with("_table") {
+                            v[*k] = json!([]);
                         }
                     }
                     self.mat_edit = Some((mat.name.clone(), v));

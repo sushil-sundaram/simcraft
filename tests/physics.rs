@@ -205,7 +205,9 @@ fn new_model_and_open_keep_theme() {
 #[test]
 fn planner_gap_detection() {
     use simcraft::assistant::known_gaps;
-    assert!(known_gaps("simulate EMI on my PCB").iter().any(|g| g.contains("radiated-emission")));
+    assert!(known_gaps("simulate EMI on my PCB").iter().any(|g| g.contains("S-parameters")));
+    // radiation and temperature-dependent conduction are available now
+    assert!(known_gaps("heat sink radiation cooling with emissivity 0.9").is_empty());
     // microwave heating itself is supported now; only phase change remains a gap for food
     let mw = known_gaps("food heating in a microwave");
     assert!(mw.iter().all(|g| !g.contains("Full-wave")), "{mw:?}");

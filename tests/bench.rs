@@ -14,7 +14,7 @@ fn cases_are_well_formed() {
             assert!(ids.insert(m.id), "duplicate metric id {}", m.id);
         }
     }
-    assert!(cases.len() >= 24, "{} cases", cases.len());
+    assert!(cases.len() >= 27, "{} cases", cases.len());
     assert!(cases.iter().filter(|c| c.quick).count() >= 15);
     // the comparison template lists every metric
     let t = bench::template();

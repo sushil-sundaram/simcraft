@@ -61,6 +61,10 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
         bail!("end time must be positive");
     }
     prog(0.0, "assembling");
+    let rad = crate::radiation::Radiation::new(model, mesh, &|m| prog(0.0, m))?;
+    if rad.is_some() || mesh.materials.iter().any(|m| m.temperature_dependent()) {
+        return transient_thermal_nl(model, mesh, elem_q, sel, rad, prog, res);
+    }
     let tprof = std::time::Instant::now();
     let profile = std::env::var_os("SIMCRAFT_PROFILE").is_some();
     let sys = crate::fem::assemble_thermal_sel(model, mesh, elem_q, sel.map(|s| (s, st.initial_temperature)))?;
@@ -119,6 +123,100 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
     thermal_post(mesh, &t, None, res);
     if profile {
         eprintln!("[thermal] post {:.2} s", tprof.elapsed().as_secs_f64());
+    }
+    res.temp = Some(t);
+    prog(1.0, "done");
+    Ok(())
+}
+
+/// Transient conduction with radiation and / or temperature-dependent k and c: implicit Euler,
+/// Picard iterations within each step (k, c and the radiation linearisation at the current iterate).
+fn transient_thermal_nl(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Option<&[f64]>, sel: Option<&[bool]>, rad: Option<crate::radiation::Radiation>, prog: Prog, res: &mut Results) -> Result<()> {
+    let nn = mesh.nodes.len();
+    let st = &model.analysis;
+    let steps = st.time_steps.clamp(1, 5000);
+    let dt = st.end_time / steps as f64;
+    let selr = sel.map(|s| (s, st.initial_temperature));
+    let base = crate::fem::assemble_thermal_k(model, mesh, elem_q, selr, None)?;
+    let on = |e: usize| sel.is_none_or(|s| s[e]);
+    let nv: Vec<[f64; 8]> = (0..mesh.elems.len()).map(|e| crate::fem::node_volumes(mesh, e)).collect();
+    let cap_at = |t: &[f64]| -> Vec<f64> {
+        let mut cap = vec![0.0; nn];
+        for (e, en) in mesh.elems.iter().enumerate() {
+            if !on(e) {
+                continue;
+            }
+            let m = &mesh.materials[mesh.elem_mat[e] as usize];
+            let rc = m.density * m.cp_at(en.iter().map(|&n| t[n as usize]).sum::<f64>() / 8.0);
+            for (a, &n) in en.iter().enumerate() {
+                cap[n as usize] += rc * nv[e][a];
+            }
+        }
+        cap
+    };
+    let mut t: Vec<f64> = base.fixed.iter().map(|g| g.unwrap_or(st.initial_temperature)).collect();
+    let stride = frame_stride(steps);
+    let tmax = |t: &[f64]| t.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    res.frames.push(TimeFrame { time: 0.0, disp: None, temp: Some(t.clone()) });
+    res.history.push((0.0, tmax(&t)));
+    res.info.dofs = nn;
+    let mut worst = 0.0f64;
+    for step in 1..=steps {
+        let told = t.clone();
+        let mut cur = t.clone();
+        let mut change = f64::INFINITY;
+        for _ in 0..8 {
+            let ks = crate::fem::elem_kscale(mesh, &cur);
+            let mut s = match &ks {
+                Some(v) => crate::fem::assemble_thermal_k(model, mesh, elem_q, selr, Some(v))?,
+                None => base.clone(),
+            };
+            let cap = cap_at(&cur);
+            for i in 0..nn {
+                if cap[i] != 0.0 {
+                    s.k.add_diag(i, cap[i] / dt);
+                    s.f[i] += cap[i] / dt * told[i];
+                }
+            }
+            if let Some(r) = &rad {
+                let lin = r.linearize(&cur);
+                for i in 0..nn {
+                    if lin.diag[i] != 0.0 {
+                        s.k.add_diag(i, lin.diag[i]);
+                    }
+                    s.f[i] += lin.rhs[i];
+                }
+            }
+            let mut f = s.f.clone();
+            s.k.apply_dirichlet(&s.fixed, &mut f);
+            let solver = Solver::new(&s.k)?;
+            res.info.solver = solver.name().to_string();
+            let mut tn = cur.clone();
+            res.info.iterations += solver.solve(&s.k, &f, &mut tn, 1e-10, &|_| {})?;
+            change = tn.iter().zip(&cur).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            cur = tn;
+            if change < 1e-4 {
+                break;
+            }
+        }
+        worst = worst.max(change);
+        t = cur;
+        let time = step as f64 * dt;
+        res.history.push((time, tmax(&t)));
+        if step % stride == 0 || step == steps {
+            res.frames.push(TimeFrame { time, disp: None, temp: Some(t.clone()) });
+        }
+        if step % 5 == 0 {
+            prog(0.05 + 0.9 * step as f64 / steps as f64, &format!("time step {step}/{steps}"));
+        }
+    }
+    if worst > 1e-2 {
+        res.warnings.push(format!("radiation / temperature-dependent properties: some time steps did not fully converge (ΔT {worst:.2e} K): use more time steps"));
+    }
+    res.history_label = "max temperature [°C]".into();
+    thermal_post(mesh, &t, None, res);
+    if let Some(r) = &rad {
+        crate::fem::radiation_quantities(r, &t, res);
     }
     res.temp = Some(t);
     prog(1.0, "done");

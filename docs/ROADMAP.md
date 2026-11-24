@@ -41,7 +41,7 @@ Sizes: **S** ≈ one session, **M** ≈ 2–3, **L** ≈ 4–6, **XL** > 6.
 |---|---|---|---|---|
 | P2.0 | Benchmark suite (`simcraft bench`): 24 reference cases, mesh sweeps, HTML report, other-solver column, CI gate | S–M | measures every later item against references and Ansys | done |
 | P2.0b | Fix the fitting defects the benchmark found (see below) | S–M | wrong peak stresses at some element sizes; must come before more physics | done |
-| P2.1 | Thermal radiation + temperature-dependent properties | M | biggest missing physics for electronics cooling; self-contained | planned |
+| P2.1 | Thermal radiation + temperature-dependent properties | M | biggest missing physics for electronics cooling; self-contained | done |
 | P2.2 | Path plots, cylindrical results, mesh-convergence assistant | S–M | cheap, raises trust in every result | planned |
 | P2.3 | STEP import (spike first) | M–L | unlocks real CAD parts and assemblies | planned |
 | P2.4 | Contact, bolt pretension, springs, remote points | L | assemblies; best after P2.3 | planned |
@@ -87,7 +87,16 @@ all 27 benchmark metrics pass with no convergence anomalies. Original findings:
 
 Done when `simcraft bench` passes LE1 and shows no convergence anomalies.
 
-### P2.1 Thermal radiation + temperature-dependent properties (M)
+### P2.1 Thermal radiation + temperature-dependent properties (M) — done
+
+`radiation.rs` (radiation to ambient in secant form; enclosure radiation: patches ≤ 1 500, BVH ray
+casting from every patch against all boundary faces, reciprocity, LU-factorised grey radiosity),
+`Load::Radiation` (`add_radiation`, SETUP ▸ THERMAL ▸ Radiation), material `conductivity_table` /
+`specific_heat_table`, Picard iterations in steady and transient thermal (also thermal stress and
+microwave heating), radiation to ambient in conjugate heat transfer. Validated in
+`tests/radiation.rs` and three bench cases: radiating cube 0.02 %, black plates 0.10 %, grey plates
+0.23 %, k(T) slab exact, c(T) 0.05 %, radiative cooling 0.4 %, CHT energy balance exact. Still open:
+surface-to-surface radiation across the CHT fluid, spectral / specular surfaces. Original plan:
 
 - **Radiation to ambient**: new `Load::Radiation { faces, emissivity, ambient }`,
   q = εσ(T⁴ − T∞⁴), linearised per iteration (h_r = εσ(T²+T∞²)(T+T∞)) in steady and transient
