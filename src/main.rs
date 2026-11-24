@@ -1,4 +1,4 @@
-use simcraft::{bridge, gui, mcp, session};
+use simcraft::{bench, bridge, gui, mcp, session};
 
 const HELP: &str = "SimCraft — FEA simulation
 
@@ -7,6 +7,10 @@ USAGE:
   simcraft mcp                        run the MCP server on stdio (for Claude Code, Antigravity, …)
   simcraft serve [--port N]           headless server for scripts (pysimcraft), no window
   simcraft schema                     print every tool with its JSON schema
+  simcraft bench [--quick] [--filter TEXT] [--out DIR] [--compare FILE] [--template]
+                                      run the benchmark suite (bench.json + bench.html in DIR,
+                                      default bench-out); --compare adds another solver's results
+                                      (JSON from --template); exits 1 if a case fails
   simcraft --help
 
 ENV:
@@ -40,6 +44,35 @@ fn main() {
                 Err(e) => {
                     eprintln!("cannot start server: {e}");
                     std::process::exit(1);
+                }
+            }
+        }
+        Some("bench") => {
+            if args.iter().any(|a| a == "--template") {
+                println!("{}", serde_json::to_string_pretty(&bench::template()).unwrap());
+                return;
+            }
+            let val = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+            let opts = bench::Options { quick: args.iter().any(|a| a == "--quick"), filter: val("--filter"), out_dir: val("--out").unwrap_or_else(|| "bench-out".into()), ansys: val("--compare") };
+            match bench::run(&opts, &|m| eprintln!("  {m}")) {
+                Ok(r) => {
+                    for c in r["cases"].as_array().cloned().unwrap_or_default() {
+                        for m in c["metrics"].as_array().cloned().unwrap_or_default() {
+                            let err = m["error"].as_f64().map(|e| format!("{:6.2} %", 100.0 * e)).unwrap_or("  error ".into());
+                            println!("{} {:<20} {:<34} {err}  (tol {:.1} %)", if m["pass"].as_bool() == Some(true) { "PASS" } else { "FAIL" }, c["id"].as_str().unwrap_or(""), m["title"].as_str().unwrap_or(""), 100.0 * m["tolerance"].as_f64().unwrap_or(0.0));
+                            for a in m["anomalies"].as_array().cloned().unwrap_or_default() {
+                                println!("       ⚠ {}", a.as_str().unwrap_or(""));
+                            }
+                        }
+                    }
+                    println!("{} passed, {} failed in {:.0} s — report: {}/bench.html", r["passed"], r["failed"], r["seconds"].as_f64().unwrap_or(0.0), opts.out_dir);
+                    if r["failed"].as_u64().unwrap_or(0) > 0 {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("bench: {e:#}");
+                    std::process::exit(2);
                 }
             }
         }

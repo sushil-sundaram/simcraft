@@ -1,6 +1,7 @@
 //! SimCraft — finite-element simulation (structural, thermal, electromagnetic, fluid) with a
 //! simple desktop UI and an MCP server for AI agents.
 pub mod assistant;
+pub mod bench;
 pub mod bridge;
 pub mod cfd;
 pub mod dynamics;

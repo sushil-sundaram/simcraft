@@ -129,6 +129,12 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | KiCad board, copper plane in-plane conduction | 0.034817 W | 0.034861 W (Σkt) |
 | KiCad board, through-plane with 40 thermal vias | 3.0395 W | 3.0333 W (series ∥ via copper) |
 
+### Benchmarks (`simcraft bench`)
+24 reference cases (NAFEMS LE1 and T4, closed forms, Ghia, de Vahl Davis, Dean, waveguide and dipole
+fields, KiCad copper), each at several mesh sizes → `bench-out/bench.html` with error-vs-unknowns
+plots and convergence order. `--quick` (19 cases, ≈ 20 s) gates every CI run; `--template` /
+`--compare FILE` put another solver's results (e.g. Ansys) next to SimCraft's in the same report.
+
 ### Limitations
 - Structural, thermal, modal and vibration analyses fit curved and off-grid surfaces (pillow layer +
   node projection, ~2 % peak stress); buckling, plasticity, EM, CFD and topology use stair-stepped
