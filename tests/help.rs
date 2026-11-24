@@ -46,3 +46,18 @@ fn get_help_tool() {
     assert!(q["results"].as_array().is_some_and(|r| !r.is_empty()));
     assert!(c.call("get_help", &json!({"topic": "quantum chromodynamics"})).is_err());
 }
+
+#[test]
+fn tutorials_follow_the_guide() {
+    let s = help::sections();
+    let tuts = help::tutorials();
+    println!("{:?}", tuts.iter().map(|t| &t.1).collect::<Vec<_>>());
+    assert_eq!(tuts.len(), 7);
+    assert!(tuts.iter().all(|(i, _)| help::is_tutorial(*i)));
+    // asking for a tutorial finds it; reference topics still go to the guide
+    assert!(s[help::find("Tutorial 4").unwrap()].title.contains("KiCad"));
+    assert!(s[help::find("tutorial").unwrap()].title == "Tutorials");
+    assert!(!help::is_tutorial(help::find("fatigue").unwrap()));
+    // every tutorial has numbered steps
+    assert!(tuts.iter().all(|(i, _)| s[*i].body.contains("\n1. ") || s[*i].body.contains("1. **")));
+}

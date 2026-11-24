@@ -1,9 +1,11 @@
-//! In-app help: the user guide (docs/USER_GUIDE.md) compiled into the binary, split into
-//! sections, searchable, and shared by the Help window and the `get_help` MCP tool.
+//! In-app help: the user guide (docs/USER_GUIDE.md) and the tutorials (docs/TUTORIALS.md) compiled
+//! into the binary, split into sections, searchable, and shared by the Help window and the
+//! `get_help` MCP tool.
 
 use std::sync::OnceLock;
 
 pub const GUIDE: &str = include_str!("../docs/USER_GUIDE.md");
+pub const TUTORIALS: &str = include_str!("../docs/TUTORIALS.md");
 
 #[derive(Debug, Clone)]
 pub struct Section {
@@ -14,10 +16,31 @@ pub struct Section {
     pub body: String,
 }
 
-/// All sections of the guide, in order (headings inside code blocks are ignored).
+/// All sections of the guide followed by the tutorials, in order (headings inside code blocks are
+/// ignored).
 pub fn sections() -> &'static [Section] {
     static S: OnceLock<Vec<Section>> = OnceLock::new();
-    S.get_or_init(|| parse(GUIDE))
+    S.get_or_init(|| {
+        let mut v = parse(GUIDE);
+        v.extend(parse(TUTORIALS));
+        v
+    })
+}
+
+/// Whether section `i` belongs to the tutorials (they follow the guide).
+pub fn is_tutorial(i: usize) -> bool {
+    static N: OnceLock<usize> = OnceLock::new();
+    i >= *N.get_or_init(|| parse(GUIDE).len())
+}
+
+/// Tutorial sections: (index, short title without the "Tutorial n — " prefix).
+pub fn tutorials() -> Vec<(usize, String)> {
+    sections()
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.level == 2 && s.title.starts_with("Tutorial "))
+        .map(|(i, s)| (i, s.title.split_once(" — ").map(|x| x.1.to_string()).unwrap_or_else(|| s.title.clone())))
+        .collect()
 }
 
 pub fn parse(text: &str) -> Vec<Section> {
@@ -74,13 +97,13 @@ pub fn find(topic: &str) -> Option<usize> {
     if let Ok(n) = t.trim_end_matches('.').parse::<u32>() {
         return s.iter().position(|x| x.title.starts_with(&format!("{n}. ")));
     }
-    // title match (shortest title containing the topic wins), then best search hit
-    s.iter()
-        .enumerate()
-        .filter(|(_, x)| norm(&x.title).contains(&t))
-        .min_by_key(|(_, x)| x.title.len())
-        .map(|(i, _)| i)
-        .or_else(|| search(topic, 1).first().map(|h| h.0))
+    // title match (shortest title containing the topic wins), then best search hit; the guide
+    // answers before the tutorials unless a tutorial is asked for
+    let title = |tut: bool| s.iter().enumerate().filter(|(i, x)| is_tutorial(*i) == tut && norm(&x.title).contains(&t)).min_by_key(|(_, x)| x.title.len()).map(|(i, _)| i);
+    if t.contains("tutorial") {
+        return title(true).or_else(|| title(false));
+    }
+    title(false).or_else(|| search(topic, 1).first().map(|h| h.0)).or_else(|| title(true))
 }
 
 /// Ranked search: (section index, score, snippet around the first body hit).
@@ -111,7 +134,9 @@ pub fn search(query: &str, max: usize) -> Vec<(usize, f64, String)> {
             Some((i, score, snippet(&s.body, pos)))
         })
         .collect();
-    hits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    // reference first: tutorials follow the guide's hits unless a tutorial is asked for
+    let want_tut = words.iter().any(|w| w.starts_with("tutorial"));
+    hits.sort_by(|a, b| (is_tutorial(a.0) && !want_tut).cmp(&(is_tutorial(b.0) && !want_tut)).then(b.1.total_cmp(&a.1)));
     hits.truncate(max);
     hits
 }

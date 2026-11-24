@@ -281,6 +281,10 @@ struct Forms {
     velocity: f64,
     outlet_p: f64,
     padding: f64,
+    /// enclosure as an explicit box (corner, size) instead of padding
+    enc_box: bool,
+    enc_min: [f64; 3],
+    enc_size: [f64; 3],
     fluid: String,
     /// Body for heat generation ("" = whole model).
     heat_body: String,
@@ -330,6 +334,9 @@ impl Default for Forms {
             velocity: 1.0,
             outlet_p: 0.0,
             padding: 0.5,
+            enc_box: false,
+            enc_min: [-50.0, -50.0, -50.0],
+            enc_size: [100.0, 100.0, 100.0],
             fluid: "Air".into(),
             heat_body: String::new(),
             table_text: String::new(),
@@ -526,6 +533,32 @@ fn line_chart(ui: &mut egui::Ui, p: &Pal, series: &[(String, Vec<(f64, f64)>)], 
 }
 
 /// Help window state.
+/// SOLVE ▸ PCB ▸ DC drop dialog.
+#[derive(Default)]
+struct PcbUi {
+    open: bool,
+    path: String,
+    nets: Vec<(String, Vec<String>)>,
+    filter: String,
+    net: String,
+    from: String,
+    to: String,
+    current: f64,
+    temp: f64,
+    job: Option<Arc<std::sync::Mutex<Option<Result<Value, String>>>>>,
+    result: Option<Value>,
+    error: Option<String>,
+}
+
+/// Default net to offer: the first that looks like a supply rail, else the one with most pads.
+fn default_net(nets: &[(String, Vec<String>)]) -> Option<usize> {
+    let rail = |n: &str| {
+        let u = n.to_uppercase();
+        ["VBUS", "VIN", "VCC", "VDD", "PWR", "+", "12V", "5V", "3V3", "VBAT"].iter().any(|k| u.contains(k)) && !u.contains("GND")
+    };
+    nets.iter().position(|(n, _)| rail(n)).or_else(|| (0..nets.len()).max_by_key(|&i| nets[i].1.len()))
+}
+
 #[derive(Default)]
 struct HelpUi {
     open: bool,
@@ -761,6 +794,7 @@ pub struct SimApp {
     mat_edit: Option<(String, Value)>,
     show_chart: bool,
     help: HelpUi,
+    pcb: PcbUi,
     probe_mode: bool,
     /// probed nodes, with the results revision they belong to
     probes: Vec<(u32, u64)>,
@@ -934,6 +968,7 @@ impl SimApp {
             mat_edit: None,
             show_chart: false,
             help: HelpUi::default(),
+            pcb: PcbUi { current: 1.0, temp: 20.0, ..Default::default() },
             probe_mode: false,
             probes: Vec::new(),
             allow_close: false,
@@ -1982,6 +2017,15 @@ impl SimApp {
                         }
                     });
                 });
+                let board = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pcb_path();
+                if let Some(path) = board {
+                    group(ui, &p, "PCB", |ui| {
+                        let on = self.pcb.open;
+                        if tool(ui, &p, "🔌", "DC drop", Some(if on { p.accent } else { Color32::from_rgb(70, 160, 90) }), true) {
+                            self.open_pcb_dc(&path);
+                        }
+                    });
+                }
                 group(ui, &p, "SETTINGS", |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(4.0);
@@ -2182,6 +2226,13 @@ impl SimApp {
                         open = Some("Keyboard and mouse");
                     }
                 });
+                group(ui, &p, "TUTORIALS", |ui| {
+                    for (icon, label, topic) in [("🔩", "Bracket", "Tutorial 1"), ("🌡", "Heat sink", "Tutorial 2"), ("🎵", "Vibration", "Tutorial 3"), ("🟩", "KiCad board", "Tutorial 4"), ("🎯", "Optimize", "Tutorial 5"), ("📡", "Emissions", "Tutorial 6"), ("🤖", "AI agent", "Tutorial 7")] {
+                        if tool(ui, &p, icon, label, Some(p.ok), true) {
+                            open = Some(topic);
+                        }
+                    }
+                });
                 group(ui, &p, "REFERENCE", |ui| {
                     for (icon, label, topic) in [("⚙", "Analyses", "7"), ("📌", "Loads", "8"), ("📊", "Results", "9"), ("📏", "Units", "14"), ("🩺", "Problems", "16"), ("⚠", "Limits", "17")] {
                         if tool(ui, &p, icon, label, None, true) {
@@ -2237,6 +2288,218 @@ impl SimApp {
                 });
             }
         });
+    }
+
+    fn open_pcb_dc(&mut self, path: &str) {
+        if self.pcb.path != path || self.pcb.nets.is_empty() {
+            match crate::kicad::dc::net_pads(path) {
+                Ok(nets) => {
+                    let pick = default_net(&nets);
+                    self.pcb = PcbUi { path: path.to_string(), current: self.pcb.current, temp: self.pcb.temp, ..Default::default() };
+                    if let Some(i) = pick {
+                        self.pcb.net = nets[i].0.clone();
+                        self.pcb.from = nets[i].1.first().cloned().unwrap_or_default();
+                        self.pcb.to = nets[i].1.last().cloned().unwrap_or_default();
+                    }
+                    self.pcb.nets = nets;
+                }
+                Err(e) => {
+                    self.toast = Some((format!("{e:#}"), true, 8.0));
+                    return;
+                }
+            }
+        }
+        if self.pcb.nets.is_empty() {
+            self.toast = Some(("This board has no nets with two or more pads".into(), true, 6.0));
+            return;
+        }
+        self.pcb.open = true;
+    }
+
+    /// DC current in one net of the imported board (kicad::dc), solved on a worker thread.
+    fn pcb_window(&mut self, ctx: &egui::Context) {
+        if !self.pcb.open {
+            return;
+        }
+        // collect a finished job
+        if let Some(job) = &self.pcb.job {
+            let done = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            if let Some(r) = done {
+                match r {
+                    Ok(v) => {
+                        self.pcb.result = Some(v);
+                        self.pcb.error = None;
+                    }
+                    Err(e) => {
+                        self.pcb.result = None;
+                        self.pcb.error = Some(e);
+                    }
+                }
+                self.pcb.job = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+        let p = self.p;
+        let mut open = true;
+        let mut go = false;
+        let mut help = false;
+        egui::Window::new(RichText::new("🔌 PCB DC drop").strong())
+            .open(&mut open)
+            .resizable(true)
+            .default_width(620.0)
+            .collapsible(false)
+            .default_pos(ctx.content_rect().center() - vec2(310.0, 300.0))
+            .show(ctx, |ui| {
+            let f = &mut self.pcb;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Current through one net between two pads: resistance, IR drop, current density and IPC-2221 track heating.").small().color(p.weak));
+                if ui.small_button("ⓘ").on_hover_text("How the DC drop is computed").clicked() {
+                    help = true;
+                }
+            });
+            ui.add_space(4.0);
+            egui::Grid::new("pcbdc-in").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Net");
+                ui.horizontal(|ui| {
+                    let cur = f.nets.iter().find(|(n, _)| *n == f.net).map(|(n, p)| format!("{n}  ({} pads)", p.len())).unwrap_or_else(|| "choose…".into());
+                    let mut picked: Option<String> = None;
+                    egui::ComboBox::from_id_salt("pcbdc-net").width(240.0).height(360.0).selected_text(cur).show_ui(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut f.filter).hint_text("🔎 filter nets").desired_width(220.0));
+                        let q = f.filter.to_lowercase();
+                        for (n, pads) in f.nets.iter().filter(|(n, _)| q.is_empty() || n.to_lowercase().contains(&q)).take(300) {
+                            if ui.selectable_label(*n == f.net, format!("{n}  ({} pads)", pads.len())).clicked() {
+                                picked = Some(n.clone());
+                            }
+                        }
+                    });
+                    if let Some(n) = picked {
+                        if n != f.net {
+                            let pads = f.nets.iter().find(|(m, _)| *m == n).map(|x| x.1.clone()).unwrap_or_default();
+                            f.from = pads.first().cloned().unwrap_or_default();
+                            f.to = pads.last().cloned().unwrap_or_default();
+                            f.net = n;
+                            f.result = None;
+                        }
+                    }
+                });
+                ui.end_row();
+                let pads: Vec<String> = f.nets.iter().find(|(n, _)| *n == f.net).map(|x| x.1.clone()).unwrap_or_default();
+                for (label, which) in [("From pad (source)", 0), ("To pad (sink)", 1)] {
+                    ui.label(label);
+                    ui.horizontal(|ui| {
+                        let val = if which == 0 { &mut f.from } else { &mut f.to };
+                        egui::ComboBox::from_id_salt(("pcbdc-pad", which)).width(140.0).height(320.0).selected_text(val.clone()).show_ui(ui, |ui| {
+                            for pd in &pads {
+                                ui.selectable_value(val, pd.clone(), pd);
+                            }
+                        });
+                        if which == 1 && ui.small_button("⇄").on_hover_text("Swap source and sink").clicked() {
+                            std::mem::swap(&mut f.from, &mut f.to);
+                        }
+                    });
+                    ui.end_row();
+                }
+                ui.label("Current");
+                ui.add(egui::DragValue::new(&mut f.current).speed(0.05).range(0.001..=1000.0).suffix(" A"));
+                ui.end_row();
+                ui.label("Copper temperature");
+                ui.add(egui::DragValue::new(&mut f.temp).speed(1.0).range(-60.0..=250.0).suffix(" °C")).on_hover_text("Copper resistivity rises 0.393 % per °C");
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            let running = f.job.is_some();
+            ui.horizontal(|ui| {
+                let ok = !f.from.is_empty() && !f.to.is_empty() && f.from != f.to && !running;
+                go = ui.add_enabled(ok, primary(&p, "Calculate")).clicked();
+                if running {
+                    ui.spinner();
+                    ui.label(RichText::new("solving the copper network…").color(p.weak));
+                } else if f.from == f.to && !f.from.is_empty() {
+                    ui.label(RichText::new("pick two different pads").color(p.warn));
+                }
+            });
+            if let Some(e) = &f.error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("⚠ {e}")).color(p.err));
+            }
+            if let Some(r) = &f.result {
+                ui.add_space(6.0);
+                ui.separator();
+                let num = |k: &str| r[k].as_f64().unwrap_or(f64::NAN);
+                let at = |k: &str| r[k].as_array().map(|a| format!("({:.2}, {:.2}) mm", a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0))).unwrap_or_default();
+                egui::Grid::new("pcbdc-out").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                    for (label, value) in [
+                        ("Resistance", format!("{:.3} mΩ", num("resistance_mohm"))),
+                        ("Voltage drop", format!("{:.2} mV at {} A", num("voltage_drop_mv"), crate::results::float(num("current_a")))),
+                        ("Power in the copper", format!("{:.4} W", num("power_w"))),
+                        ("Peak current density", format!("{:.1} A/mm²  on {} at {}", num("max_current_density_a_per_mm2"), r["max_current_density_layer"].as_str().unwrap_or(""), at("max_current_density_at_mm"))),
+                        ("Largest via current", if num("vias_and_holes") > 0.0 { format!("{:.3} A at {}", num("max_via_current_a"), at("max_via_at_mm")) } else { "no vias in the path".into() }),
+                    ] {
+                        ui.label(RichText::new(label).color(p.weak));
+                        ui.label(RichText::new(value).strong());
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("Tracks carrying the most current").strong());
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    egui::Grid::new("pcbdc-tracks").striped(true).num_columns(7).spacing([12.0, 3.0]).show(ui, |ui| {
+                        for h in ["Layer", "Width", "Length", "Current", "J", "IPC ΔT", "Width for 10 °C"] {
+                            ui.label(RichText::new(h).small().strong());
+                        }
+                        ui.end_row();
+                        for t in r["tracks_by_current"].as_array().cloned().unwrap_or_default() {
+                            let g = |k: &str| t[k].as_f64().unwrap_or(0.0);
+                            let rise = g("ipc2221_temperature_rise_c");
+                            let short = g("length_mm") < crate::kicad::dc::SHORT_MM;
+                            let col = if short { p.weak } else if rise > 20.0 { p.err } else if rise > 10.0 { p.warn } else { p.text };
+                            ui.label(t["layer"].as_str().unwrap_or(""));
+                            ui.label(format!("{:.3} mm", g("width_mm")));
+                            ui.label(format!("{:.1} mm", g("length_mm")));
+                            ui.label(format!("{:.3} A", g("current_a")));
+                            ui.label(format!("{:.1} A/mm²", g("current_density_a_per_mm2")));
+                            ui.label(RichText::new(format!("{rise:.1} °C{}", if short { " *" } else { "" })).color(col)).on_hover_text(if short { "Neck-down shorter than 2 mm: the copper around it carries heat away, so it runs cooler than IPC-2221's long-track figure" } else { "IPC-2221 rise for this current in a long track of this width" });
+                            ui.label(format!("{:.3} mm", g("ipc2221_width_for_10c_mm")));
+                            ui.end_row();
+                        }
+                    });
+                });
+                for w in r["warnings"].as_array().cloned().unwrap_or_default() {
+                    ui.label(RichText::new(format!("⚠ {}", w.as_str().unwrap_or(""))).small().color(p.warn));
+                }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{} unknowns on a {:.3} mm raster · DC, no skin effect · IPC rise per track alone · * short neck-down", r["unknowns"], num("raster_mm"))).small().color(p.weak));
+                    if ui.small_button("Copy JSON").clicked() {
+                        ui.ctx().copy_text(serde_json::to_string_pretty(r).unwrap_or_default());
+                    }
+                });
+            }
+        });
+        if help {
+            self.open_help("DC current in a net");
+        }
+        if go {
+            self.start_pcb_job();
+        }
+        self.pcb.open = open;
+    }
+
+    fn start_pcb_job(&mut self) {
+        {
+            let f = &mut self.pcb;
+            let slot = Arc::new(std::sync::Mutex::new(None));
+            let (path, net, from, to, cur, temp) = (f.path.clone(), f.net.clone(), f.from.clone(), f.to.clone(), f.current, f.temp);
+            let out = slot.clone();
+            std::thread::spawn(move || {
+                let r = std::panic::catch_unwind(|| crate::kicad::dc::dc_drop(&path, Some(&net), &from, &to, cur, temp))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error in the DC solver")))
+                    .map_err(|e| format!("{e:#}"));
+                *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
+            });
+            f.job = Some(slot);
+            f.error = None;
+        }
     }
 
     fn fatigue_window(&mut self, ctx: &egui::Context) {
@@ -2521,7 +2784,15 @@ impl SimApp {
                                     ui.add_space(4.0);
                                 }
                             } else {
-                                for (i, s) in secs.iter().enumerate().filter(|(_, s)| s.level >= 2) {
+                                for (i, s) in secs.iter().enumerate().filter(|(i, s)| s.level >= 2 || crate::help::is_tutorial(*i)) {
+                                    if s.level == 1 {
+                                        // the tutorials follow the guide under their own heading
+                                        ui.add_space(8.0);
+                                        if ui.selectable_label(i == self.help.section, RichText::new(s.title.to_uppercase()).small().strong().color(p.ok)).clicked() {
+                                            goto = Some(i);
+                                        }
+                                        continue;
+                                    }
                                     let on = crate::help::span(self.help.section).contains(&i) && (s.level == 3 || i == self.help.section) || i == self.help.section;
                                     let txt = if s.level == 2 { RichText::new(&s.title).strong() } else { RichText::new(&s.title).small() };
                                     ui.horizontal(|ui| {
@@ -3218,13 +3489,22 @@ impl SimApp {
                             ui.selectable_value(&mut self.f.fluid, f.to_string(), f.split(' ').next().unwrap());
                         }
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Padding");
-                        ui.add(egui::Slider::new(&mut self.f.padding, 0.1..=3.0).suffix("× part size"));
-                    });
+                    ui.checkbox(&mut self.f.enc_box, "Explicit box").on_hover_text("Give the enclosure's corner and size instead of padding around the parts (e.g. λ/4 of air for radiation)");
+                    if self.f.enc_box {
+                        ui.label(RichText::new("Corner (mm)").small().color(p.weak));
+                        xyz(ui, "emin", &mut self.f.enc_min, "", 0.5);
+                        ui.label(RichText::new("Size (mm)").small().color(p.weak));
+                        xyz(ui, "esize", &mut self.f.enc_size, "", 0.5);
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Padding");
+                            ui.add(egui::Slider::new(&mut self.f.padding, 0.1..=3.0).suffix("× part size"));
+                        });
+                    }
                 });
                 ui.add_space(8.0);
-                if ui.add(primary(&p, "Create")).clicked() && self.run("add_enclosure", json!({"material": self.f.fluid, "padding": self.f.padding})) {
+                let args = if self.f.enc_box { json!({"material": self.f.fluid, "min": self.f.enc_min, "size": self.f.enc_size}) } else { json!({"material": self.f.fluid, "padding": self.f.padding}) };
+                if ui.add(primary(&p, "Create")).clicked() && self.run("add_enclosure", args) {
                     self.need_fit = true;
                 }
             }
@@ -3992,6 +4272,23 @@ impl eframe::App for SimApp {
             if let Some(t) = q["help"].as_str() {
                 self.open_help(t);
             }
+            if let Some(d) = q.get("pcb_dc") {
+                let path = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pcb_path();
+                if let Some(path) = path {
+                    self.open_pcb_dc(&path);
+                    for (k, slot) in [("net", &mut self.pcb.net), ("from", &mut self.pcb.from), ("to", &mut self.pcb.to)] {
+                        if let Some(v) = d[k].as_str() {
+                            *slot = v.to_string();
+                        }
+                    }
+                    if let Some(c) = d["current"].as_f64() {
+                        self.pcb.current = c;
+                    }
+                    if d["calculate"].as_bool() == Some(true) {
+                        self.start_pcb_job();
+                    }
+                }
+            }
             if let Some(t) = q["help_search"].as_str() {
                 self.help.open = true;
                 self.help.query = t.to_string();
@@ -4035,6 +4332,7 @@ impl eframe::App for SimApp {
             }
         }
         self.fatigue_window(&ctx);
+        self.pcb_window(&ctx);
         if let Some((msg, err, ttl)) = &mut self.toast {
             *ttl -= (ui.input(|i| i.stable_dt) as f64).min(0.1);
             let ctx = ui.ctx().clone();

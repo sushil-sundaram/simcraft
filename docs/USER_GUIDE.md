@@ -116,7 +116,10 @@ highlight = your current selection.
 | Stop a running solve or study | ■ Stop in the status bar |
 | Views | toolbar at the viewport corner: Fit, Iso, Front, Top, Right, Left |
 
-The **HELP** tab opens this guide inside the app, with a table of contents and search.
+The **HELP** tab opens this guide inside the app, with a table of contents and search, and seven
+step-by-step **tutorials** (HELP ▸ TUTORIALS: bracket stress, heat sink, vibration and fatigue, KiCad
+board thermal and DC drop, optimisation, radiated emissions, AI agents) — they follow the guide in
+the contents list.
 
 ---
 
@@ -216,8 +219,12 @@ field analyses use the laminate's properties (copper is homogenised for heat onl
 
 #### DC current in a net (IR drop, current density, IPC-2221)
 
-MCP `pcb_dc` answers "is this trace wide enough?" for one net of the board: give the source and sink
-pads as `REFERENCE.PAD` (`from: "U3.1"`, `to: "J1.2"`) and the current (A). SimCraft rasterises that
+**SOLVE ▸ PCB ▸ DC drop** (the PCB group appears once a board is imported; MCP `pcb_dc`, with
+`pcb_nets` to list nets and pads) answers "is this trace wide enough?" for one net of the board: pick
+the net, the source and sink pads (`REFERENCE.PAD`, e.g. from `J1.1` to `U3.4`; supply rails are
+offered first) and the current (A), then **Calculate**. It runs in the background and shows the
+numbers, a table of the tracks with their IPC-2221 rise (orange above 10 °C, red above 20 °C) and
+**Copy JSON**. SimCraft rasterises that
 net's copper on every layer (tracks, arcs, filled zones, pads, via pads, at ¼ of the narrowest track,
 ≥ 0.02 mm), connects the layers through the via barrels and plated holes (25 µm plating), holds the two
 pads at fixed potentials and solves the sheet-resistance network. It reports:

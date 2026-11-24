@@ -130,6 +130,13 @@ impl Session {
     fn fdtd(&self) -> bool {
         matches!(self.model.analysis.kind, AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating)
     }
+    /// File of the first imported KiCad board.
+    pub fn pcb_path(&self) -> Option<String> {
+        self.model.bodies.iter().find_map(|b| match &b.shape {
+            Shape::Pcb { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+    }
     pub fn mesh_valid(&self) -> bool {
         self.mesh.as_ref().is_some_and(|m| m.elems.len() <= mesh::max_cells_for(&self.model)) && self.mesh_rev == self.geom_rev && self.mesh_mode == (self.model.mesh_with_enclosure(), self.model.mesh_fitted())
     }
@@ -636,18 +643,18 @@ impl Core {
                 s.view_request = Some("fit".into());
                 Ok(Output::text(format!("Imported '{path}' as body '{n}' ({ntri} triangles, {nseg} smooth faces). Use list_faces to see face names.")))
             }
+            "pcb_nets" => {
+                let path = match opt_str(a, "path") {
+                    Some(p) => p.to_string(),
+                    None => s.pcb_path().ok_or_else(|| anyhow!("give 'path' (.kicad_pcb) or import a board first"))?,
+                };
+                let nets = crate::kicad::dc::net_pads(&path)?;
+                Ok(Output::json(json!({"path": path, "nets": nets.iter().map(|(n, p)| json!({"net": n, "pads": p})).collect::<Vec<_>>()})))
+            }
             "pcb_dc" => {
                 let path = match opt_str(a, "path") {
                     Some(p) => p.to_string(),
-                    None => s
-                        .model
-                        .bodies
-                        .iter()
-                        .find_map(|b| match &b.shape {
-                            Shape::Pcb { path, .. } => Some(path.clone()),
-                            _ => None,
-                        })
-                        .ok_or_else(|| anyhow!("give 'path' (.kicad_pcb) or import a board first"))?,
+                    None => s.pcb_path().ok_or_else(|| anyhow!("give 'path' (.kicad_pcb) or import a board first"))?,
                 };
                 let from = opt_str(a, "from").ok_or_else(|| anyhow!("missing 'from' (pad as REFERENCE.PAD, e.g. U1.3)"))?;
                 let to = opt_str(a, "to").ok_or_else(|| anyhow!("missing 'to' (pad as REFERENCE.PAD, e.g. J1.1)"))?;
@@ -1807,6 +1814,7 @@ pub fn tool_defs() -> Vec<Value> {
         t("add_cylinder", "Add a cylinder (mm) or, with operation=subtract, drill a hole. Faces: <name>.side/bottom/top.", json!({"name": name, "base": v3s("Centre of the bottom cap [x,y,z] mm"), "axis": {"type": "string", "enum": ["x", "y", "z"]}, "radius": {"type": "number"}, "height": {"type": "number", "description": "Length along the axis from base"}, "operation": op, "material": mat}), &["radius", "height"]),
         t("add_sphere", "Add a sphere (mm). Face: <name>.surface.", json!({"name": name, "center": v3s("Centre mm"), "radius": {"type": "number"}, "operation": op, "material": mat}), &["radius"]),
         t("import_kicad", "Import a KiCad PCB (.kicad_pcb, KiCad 5–10): board outline and stack-up become a 'Board' body whose copper (tracks, pads, filled zones, vias) is homogenised per cell into orthotropic thermal conductivity; footprints larger than min_component_area_mm2 become component boxes named by reference (U1, Q2…). 'power' {reference: watts} adds heat sources. Then add convection/temperature boundaries (thermal) or an air enclosure + inlet (conjugate_heat_transfer). Board lies in XY, z from 0 to the thickness; top parts above, bottom parts below. Save the board in KiCad with zones filled.", json!({"path": {"type": "string"}, "name": {"type": "string", "description": "board body name (default Board)"}, "power": {"type": "object", "additionalProperties": {"type": "number"}, "description": "e.g. {\"U1\": 1.5, \"Q1\": 0.8} watts"}, "heights": {"type": "object", "additionalProperties": {"type": "number"}, "description": "component heights in mm by reference"}, "components": {"type": "boolean", "description": "create component boxes (default true)"}, "component_height_mm": {"type": "number", "description": "default component height (1 mm)"}, "min_component_area_mm2": {"type": "number", "description": "skip footprints smaller than this unless listed in power/heights (default 4)"}, "offset": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}, "material": {"type": "string", "description": "laminate (default FR-4)"}}), &["path"]),
+        t("pcb_nets", "List the nets of a KiCad board with their pads (REFERENCE.PAD), to choose 'from' / 'to' for pcb_dc. Uses the imported board unless 'path' is given.", json!({"path": {"type": "string"}}), &[]),
         t("pcb_dc", "DC current in one net of a KiCad board: resistance and voltage drop between two pads, Joule power, peak current density and where it occurs, current and IPC-2221 temperature rise of the tracks that carry it, and via currents. Pads are REFERENCE.PAD (e.g. U1.3 → J2.1). Uses the imported board's file unless 'path' is given.", json!({"path": {"type": "string", "description": ".kicad_pcb (default: the imported board)"}, "net": {"type": "string", "description": "net name (default: the net of 'from')"}, "from": {"type": "string", "description": "source pad, e.g. U1.3"}, "to": {"type": "string", "description": "sink pad, e.g. J2.1"}, "current": {"type": "number", "description": "amps (default 1)"}, "temperature_c": {"type": "number", "description": "copper temperature for resistivity (default 20 °C)"}}), &["from", "to"]),
         t("import_stl", "Import a closed STL solid (e.g. exported from SolidCraft / Fusion 360). Smooth regions become faces <name>.face0, face1 …", json!({"path": {"type": "string", "description": "Absolute path to .stl"}, "scale": {"type": "number", "description": "Multiply coordinates (use 1000 if the STL is in metres)"}, "offset": v3s("Translation mm"), "name": name, "operation": op, "material": mat}), &["path"]),
         t("edit_body", "Change an existing body: any shape field (box: min, size; cylinder: base, axis, radius, height; sphere: center, radius; STL: scale, offset; board: offset), material, operation (add/subtract) or new_name (loads on it follow the rename). Undoable.", json!({"name": {"type": "string"}, "new_name": {"type": "string"}, "material": {"type": "string"}, "operation": {"type": "string", "enum": ["add", "subtract"]}, "min": v3s("box corner mm"), "size": v3s("box size mm"), "base": v3s("cylinder base centre mm"), "axis": {"type": "string", "enum": ["x", "y", "z"]}, "radius": {"type": "number"}, "height": {"type": "number"}, "center": v3s("sphere centre mm"), "scale": {"type": "number"}, "offset": v3s("STL / board offset mm")}), &["name"]),
