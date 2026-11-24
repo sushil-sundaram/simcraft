@@ -1,4 +1,5 @@
 /target
+/bench-out
 .mcp.json
 *.simcraft
 *.vtk

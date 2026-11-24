@@ -793,6 +793,22 @@ laminar channel flow, plate-with-hole stress concentration, Lamé thick cylinder
 channel friction (Dean), conjugate-heat energy balance, contact reactions) and the GPU solver against the CPU. See the README for the
 numbers.
 
+### Benchmark suite (`simcraft bench`)
+
+`simcraft bench` runs 24 reference cases — NAFEMS LE1 and T4, closed-form structural, thermal and
+electromagnetic problems, Ghia / de Vahl Davis / Dean flows, waveguide and dipole fields, KiCad copper
+— each at several element sizes, and writes `bench-out/bench.json` and a self-contained
+`bench-out/bench.html`: per case the reference and its source, value, error, unknowns and time per
+mesh, the observed convergence order, and a log-log plot of error against unknowns with the pass
+tolerance. `--quick` runs the 19 cheap cases at one size (≈ 20 s; CI runs it on every change and
+fails if a case leaves its tolerance), `--filter thermal` selects by id or group.
+
+**Comparing with another solver** (Ansys, COMSOL, Abaqus …): `simcraft bench --template > ansys.json`
+lists every metric; fill in that solver's `value` (same unit) and optionally `dofs` and `seconds`,
+then `simcraft bench --compare ansys.json` adds it to each case and plot (blue diamonds). Build the
+same geometry, material, loads and output point as the case description, converge that solver's
+mesh too, and check its licence terms before publishing comparisons.
+
 ---
 
 ## 16. Troubleshooting
