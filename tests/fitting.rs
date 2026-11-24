@@ -160,3 +160,42 @@ fn cantilever_rod_bending_frequency() {
     assert!(err(fit, want) < 0.03, "fitted f1 {fit}");
     assert!(err(fit, want) < err(vox, want), "fitting must improve the frequency");
 }
+
+/// Element sizes that do not divide the wall thickness used to distort the edge where the fitted
+/// bore meets the top and bottom (+79 % to +132 % hoop stress). Grid lines now snap onto flat faces
+/// and fitting is decided per face, so every size stays close to Lamé.
+#[test]
+fn lame_at_awkward_element_sizes() {
+    let want = 10.0 * 500.0 / 300.0;
+    for h in [1.25, 1.5, 1.75, 0.7] {
+        let c = new_core();
+        call(&c, "add_cylinder", json!({"name": "Pipe", "base": [0, 0, 0], "axis": "z", "radius": 20, "height": 4}));
+        call(&c, "add_cylinder", json!({"name": "Bore", "base": [0, 0, 0], "axis": "z", "radius": 10, "height": 4, "operation": "subtract"}));
+        call(&c, "add_box", json!({"name": "CutX", "min": [-30, -30, 0], "size": [30, 60, 4], "operation": "subtract"}));
+        call(&c, "add_box", json!({"name": "CutY", "min": [-30, -30, 0], "size": [60, 30, 4], "operation": "subtract"}));
+        call(&c, "set_mesh", json!({"element_size_mm": h}));
+        call(&c, "add_symmetry", json!({"faces": ["CutX.xmax", "CutY.ymax", "Pipe.bottom", "Pipe.top"]}));
+        call(&c, "add_pressure", json!({"faces": ["Bore.side"], "value_mpa": 10}));
+        let got = fmax(&call(&c, "solve", json!({})), "max_principal");
+        println!("h {h}: hoop {got:.3} ({:+.1} %)", 100.0 * (got / want - 1.0));
+        assert!(err(got, want) < 0.05, "h {h}: {got}");
+    }
+}
+
+/// A plate thinner than two cells keeps its elements (grid lines snap to both faces), and a wall
+/// thinner than one cell falls back to plain voxels with a warning instead of an empty mesh.
+#[test]
+fn thin_parts_do_not_vanish() {
+    let c = new_core();
+    call(&c, "add_box", json!({"name": "Plate", "size": [30, 20, 2]}));
+    let m = call(&c, "set_mesh", json!({"element_size_mm": 1.5}));
+    println!("2 mm plate at 1.5 mm: {m}");
+    assert!(m["elements"].as_u64().unwrap() > 300);
+    let c = new_core();
+    call(&c, "add_cylinder", json!({"name": "Tube", "base": [0, 0, 0], "axis": "z", "radius": 10, "height": 10}));
+    call(&c, "add_cylinder", json!({"name": "Inner", "base": [0, 0, 0], "axis": "z", "radius": 9.4, "height": 10, "operation": "subtract"}));
+    let m = call(&c, "set_mesh", json!({"element_size_mm": 1}));
+    println!("0.6 mm tube wall at 1 mm: {m}");
+    assert!(m["elements"].as_u64().unwrap() > 0);
+    assert!(m.to_string().contains("plain voxels"), "expected a fallback warning: {m}");
+}

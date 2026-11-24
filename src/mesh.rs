@@ -151,8 +151,49 @@ pub fn build_mesh_max(bodies: &[Body], h: f64, materials: &[Material], with_encl
 
 /// `conservative`: keep only cells whose 8 corners are all inside the solid (for boundary
 /// fitting: every surface node then lies inside the true surface and moves outward onto it).
+/// Coordinates of the axis-aligned flat faces of the bodies, per axis (box faces, cylinder end caps,
+/// flat axis-aligned STL faces), for snapping grid lines onto them.
+fn axis_planes(bodies: &[Body]) -> [Vec<f64>; 3] {
+    let mut p: [Vec<f64>; 3] = [vec![], vec![], vec![]];
+    for b in bodies.iter().filter(|b| b.role == Role::Solid) {
+        match &b.shape {
+            Shape::Box { min, size } => {
+                for a in 0..3 {
+                    p[a].push(min[a]);
+                    p[a].push(min[a] + size[a]);
+                }
+            }
+            Shape::Cylinder { base, axis, height, .. } => {
+                let a = axis.idx();
+                p[a].push(base[a]);
+                p[a].push(base[a] + height);
+            }
+            Shape::Stl { data: Some(d), .. } => {
+                for seg in 0..d.n_segments {
+                    let tris: Vec<usize> = (0..d.tris.len()).filter(|&t| d.segment[t] as usize == seg).collect();
+                    let Some(&t0) = tris.first() else { continue };
+                    for a in 0..3 {
+                        let c = d.tris[t0][0][a];
+                        let tol = 1e-9 * (d.max[a] - d.min[a]).abs().max(1.0);
+                        if tris.iter().all(|&t| d.tris[t].iter().all(|v| (v[a] - c).abs() <= tol)) {
+                            p[a].push(c);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for v in p.iter_mut() {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    }
+    p
+}
+
 pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclosure: bool, max_cells: usize, conservative: bool) -> Result<Mesh> {
     let has_solid = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Solid);
+    let mut restored: Vec<String> = Vec::new();
     let has_encl = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Enclosure);
     let with_enclosure = with_enclosure && has_encl;
     if !has_solid && !with_enclosure {
@@ -178,7 +219,50 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
     }
     let [nx, ny, nz] = dims;
     let cid = |i: usize, j: usize, k: usize| i + nx * (j + ny * k);
-    let center = |i: usize, j: usize, k: usize| [origin[0] + (i as f64 + 0.5) * h, origin[1] + (j as f64 + 0.5) * h, origin[2] + (k as f64 + 0.5) * h];
+    // grid lines per axis. For boundary-fitted meshes, a grid line within 0.45 h of an axis-aligned
+    // flat face (box faces, cylinder end caps, flat STL faces) is moved onto it, so those faces are
+    // meshed exactly by slightly stretched or squashed boxes instead of a fitted pillow layer. Only
+    // curved and oblique surfaces are then pillowed, and a part whose thickness is not a whole
+    // number of cells keeps full-thickness elements (no thin core between two pillow layers).
+    let mut lines: [Vec<f64>; 3] = [0, 1, 2].map(|a| (0..=dims[a]).map(|i| origin[a] + i as f64 * h).collect());
+    let mut moved: [Vec<bool>; 3] = [0, 1, 2].map(|a| vec![false; dims[a] + 1]);
+    if conservative {
+        let planes = axis_planes(bodies);
+        for a in 0..3 {
+            let mut cands: Vec<(f64, usize, f64)> = planes[a]
+                .iter()
+                .filter_map(|&c| {
+                    let k = ((c - origin[a]) / h).round();
+                    if k < 0.0 || k > dims[a] as f64 {
+                        return None;
+                    }
+                    let delta = c - (origin[a] + k * h);
+                    (delta.abs() <= 0.45 * h).then_some((delta.abs(), k as usize, c))
+                })
+                .collect();
+            cands.sort_by(|p, q| p.0.total_cmp(&q.0));
+            for (dl, k, c) in cands {
+                if moved[a][k] || dl <= 1e-9 * h {
+                    moved[a][k] |= dl <= 1e-9 * h; // already on the grid: keep it there
+                    continue;
+                }
+                let lo_ok = k == 0 || c - lines[a][k - 1] >= 0.3 * h;
+                let hi_ok = k == dims[a] || lines[a][k + 1] - c >= 0.3 * h;
+                if lo_ok && hi_ok {
+                    lines[a][k] = c;
+                    moved[a][k] = true;
+                }
+            }
+            // lines that sit on a plane without moving do not make their elements general
+            for k in 0..=dims[a] {
+                if moved[a][k] && (lines[a][k] - (origin[a] + k as f64 * h)).abs() <= 1e-9 * h {
+                    moved[a][k] = false;
+                }
+            }
+        }
+    }
+    let lines = &lines;
+    let center = |i: usize, j: usize, k: usize| [0.5 * (lines[0][i] + lines[0][i + 1]), 0.5 * (lines[1][j] + lines[1][j + 1]), 0.5 * (lines[2][k] + lines[2][k + 1])];
     let mat_index = |name: &str| -> i32 { materials.iter().position(|m| m.name == name).unwrap_or(0) as i32 };
 
     // membership of each body on the grid
@@ -299,25 +383,32 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
     if conservative {
         let (gx, gy, gz) = (nx + 1, ny + 1, nz + 1);
         let nid = |i: usize, j: usize, k: usize| i + gx * (j + gy * k);
-        let node_pt = |i: usize, j: usize, k: usize| [origin[0] + i as f64 * h, origin[1] + j as f64 * h, origin[2] + k as f64 * h];
+        let node_pt = |i: usize, j: usize, k: usize| [lines[0][i], lines[1][j], lines[2][k]];
         let eps = 1e-6 * h;
         // membership of grid nodes (boundary counts as inside for added bodies, as outside for cuts)
         let node_in = |body: &Body, strict: bool| -> Vec<bool> {
             let mut v = vec![false; gx * gy * gz];
             match &body.shape {
                 Shape::Stl { data: Some(d), .. } => {
-                    let cols: Vec<(usize, usize, Vec<f64>)> = (0..gy * gz)
+                    // a node on the surface counts as inside: rays just beside it on all four
+                    // sides in y/z (a single offset ray misses nodes on the top and y-max faces)
+                    let cols: Vec<(usize, usize, Vec<Vec<f64>>)> = (0..gy * gz)
                         .into_par_iter()
                         .map(|jk| {
                             let (j, k) = (jk % gy, jk / gy);
                             let p = node_pt(0, j, k);
-                            (j, k, d.x_crossings(p[1] + h * 1.1e-4, p[2] + h * 0.7e-4))
+                            let (a, b) = (h * 1.1e-4, h * 0.7e-4);
+                            (j, k, [(a, b), (-a, -b), (a, -b), (-a, b)].iter().map(|(dy, dz)| d.x_crossings(p[1] + dy, p[2] + dz)).collect())
                         })
                         .collect();
-                    for (j, k, xs) in cols {
+                    for (j, k, rays) in cols {
                         for i in 0..gx {
                             let x = node_pt(i, j, k)[0];
-                            if xs.iter().filter(|&&q| q < x).count() % 2 == 1 {
+                            let inside = rays.iter().any(|xs| {
+                                let odd = |t: f64| xs.iter().filter(|&&q| q < t).count() % 2 == 1;
+                                odd(x - eps) || odd(x + eps)
+                            });
+                            if inside {
                                 v[nid(i, j, k)] = true;
                             }
                         }
@@ -354,6 +445,7 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
             }
         }
         let mut dropped = 0usize;
+        let before = (occ.clone(), region.clone(), owner.clone());
         for k in 0..nz {
             for j in 0..ny {
                 for i in 0..nx {
@@ -373,11 +465,39 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
                 }
             }
         }
-        let _ = dropped;
+        // a body that keeps no whole cell (thinner than a cell somewhere it matters) would vanish:
+        // give it back its centre-inside cells, unfitted, and say so
+        if dropped > 0 {
+            let nb = bodies.len();
+            let (mut had, mut has) = (vec![0usize; nb], vec![0usize; nb]);
+            for c in 0..ncell {
+                if before.0[c] >= 0 && before.1[c] == REGION_SOLID {
+                    had[before.2[c] as usize] += 1;
+                }
+                if occ[c] >= 0 && region[c] == REGION_SOLID {
+                    has[owner[c] as usize] += 1;
+                }
+            }
+            for bi in 0..nb {
+                if had[bi] > 0 && has[bi] == 0 {
+                    for c in 0..ncell {
+                        if before.0[c] >= 0 && before.1[c] == REGION_SOLID && before.2[c] as usize == bi {
+                            occ[c] = before.0[c];
+                            region[c] = before.1[c];
+                            owner[c] = before.2[c];
+                        }
+                    }
+                    restored.push(bodies[bi].name.clone());
+                }
+            }
+        }
     }
 
     // Connected components (face adjacency); drop tiny floating fragments.
     let mut warnings = Vec::new();
+    if !restored.is_empty() {
+        warnings.push(format!("{} thinner than a whole cell at {h} mm: meshed with plain voxels (not fitted to the surface) — use a smaller element size for accurate results there", restored.join(", ")));
+    }
     let mut comp = vec![u32::MAX; ncell];
     let mut sizes = Vec::new();
     for s in 0..ncell {
@@ -442,7 +562,7 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
                     let g = gid(i + d[0], j + d[1], k + d[2]);
                     if node_map[g] == u32::MAX {
                         node_map[g] = nodes.len() as u32;
-                        nodes.push([origin[0] + (i + d[0]) as f64 * h, origin[1] + (j + d[1]) as f64 * h, origin[2] + (k + d[2]) as f64 * h]);
+                        nodes.push([lines[0][i + d[0]], lines[1][j + d[1]], lines[2][k + d[2]]]);
                     }
                     en[l] = node_map[g];
                 }
@@ -497,7 +617,7 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
                         quad.swap(1, 3);
                     }
                     let mut ctr = center(i, j, k);
-                    ctr[a] += if plus { h / 2.0 } else { -h / 2.0 };
+                    ctr[a] = lines[a][ijk[a] + plus as usize];
                     faces.push(BFace { elem: elem_of_cell[c], nodes: quad, dir, patch: 0, center: ctr, outer });
                 }
             }
@@ -557,6 +677,12 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
         }
     }
 
+    // elements on snapped grid lines are boxes of another size: general hexahedra
+    let snapped_elems: Vec<bool> = if moved.iter().any(|m| m.iter().any(|x| *x)) {
+        elem_cell.iter().map(|c| (0..3).any(|a| moved[a][c[a] as usize] || moved[a][c[a] as usize + 1])).collect()
+    } else {
+        Vec::new()
+    };
     Ok(Mesh {
         h,
         origin,
@@ -575,7 +701,7 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
         body_names: bodies.iter().map(|b| b.name.clone()).collect(),
         with_enclosure,
         patch_src,
-        fitted: Vec::new(),
+        fitted: snapped_elems,
     })
 }
 
@@ -647,32 +773,36 @@ impl Mesh {
     /// Elements that would become too distorted are relaxed back towards the voxel shape.
     pub fn fit_boundary(&mut self, bodies: &[Body]) -> FitReport {
         let h = self.h;
-        // ---- which patches need fitting: curved surfaces and planes that miss the voxel grid.
-        // Patches whose voxel faces already lie on the true surface are left alone.
+        // elements already general (on snapped grid lines) stay general
+        let pre_fitted = std::mem::take(&mut self.fitted);
+        // ---- which faces need fitting: those with a node off their true surface (curved surfaces,
+        // planes that miss the grid). Decided per face, not per surface: a flat face that lies on a
+        // (snapped) grid plane stays as it is even when a few faces of the same surface step off it
+        // next to a hole, otherwise it would get a zero-thickness pillow that inverts at the edges.
         let n_old = self.nodes.len();
-        let mut needs = vec![false; self.patches.len()];
-        for f in self.faces.iter().filter(|f| !f.outer) {
-            if needs[f.patch as usize] {
-                continue;
-            }
-            let (bi, lp) = self.patch_src[f.patch as usize];
-            let Some(b) = bodies.get(bi as usize) else { continue };
-            for &n in &f.nodes {
-                let p0 = self.nodes[n as usize];
-                if b.shape.project(lp as usize, p0).is_some_and(|q| norm(sub(q, p0)) > 1e-6 * h) {
-                    needs[f.patch as usize] = true;
-                    break;
+        let face_needs: Vec<bool> = self
+            .faces
+            .iter()
+            .map(|f| {
+                if f.outer {
+                    return false;
                 }
-            }
-        }
+                let (bi, lp) = self.patch_src[f.patch as usize];
+                let Some(b) = bodies.get(bi as usize) else { return false };
+                f.nodes.iter().any(|&n| {
+                    let p0 = self.nodes[n as usize];
+                    b.shape.project(lp as usize, p0).is_some_and(|q| norm(sub(q, p0)) > 1e-6 * h)
+                })
+            })
+            .collect();
         // ---- pillow layer on those faces: a new hexahedron whose outer nodes are fitted to the
         // surface. No element then has more than one face on a curved surface, so staircase corners
         // cannot collapse.
         let mut prime: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut shrink_dir: Vec<V3> = vec![[0.0; 3]; n_old];
         let mut plane_normals: Vec<Vec<V3>> = vec![Vec::new(); n_old];
-        let solid_faces: Vec<usize> = (0..self.faces.len()).filter(|&f| !self.faces[f].outer && needs[self.faces[f].patch as usize]).collect();
-        for f in self.faces.iter().filter(|f| !f.outer && !needs[f.patch as usize]) {
+        let solid_faces: Vec<usize> = (0..self.faces.len()).filter(|&f| face_needs[f]).collect();
+        for (_, f) in self.faces.iter().enumerate().filter(|(fi, f)| !f.outer && !face_needs[*fi]) {
             for &n in &f.nodes {
                 let nr = dir_normal(f.dir);
                 if !plane_normals[n as usize].contains(&nr) {
@@ -703,7 +833,7 @@ impl Mesh {
         // non-pillowed faces by edge (to give exposed pillow sides their patch)
         let mut plain_by_edge: std::collections::HashMap<(u32, u32), usize> = std::collections::HashMap::new();
         for (fi, f) in self.faces.iter().enumerate() {
-            if f.outer || needs[f.patch as usize] {
+            if f.outer || face_needs[fi] {
                 continue;
             }
             for k in 0..4 {
@@ -828,10 +958,12 @@ impl Mesh {
             }
         }
         // the voxel surface nodes step inward along their pillowed faces' normals (kept inside any
-        // unfitted plane they also lie on), giving the pillow layer its thickness
+        // unfitted plane they also lie on) so the pillow layer is at least 0.4 h thick. Only the
+        // missing thickness is taken: where the true surface is already far from the voxel face the
+        // pillow is thick enough, and stepping in anyway would crush a thin core between two
+        // pillowed faces (a plate whose thickness is not a whole number of cells).
         {
-            let t = 0.4 * h;
-            for (&old, _) in prime.iter() {
+            for (&old, &pr) in prime.iter() {
                 let o = old as usize;
                 let mut sd = shrink_dir[o];
                 for pnrm in &plane_normals[o] {
@@ -839,7 +971,11 @@ impl Mesh {
                 }
                 let l = norm(sd);
                 if l > 1e-9 {
-                    d[o] = scale(sd, -t / l);
+                    let u = scale(sd, 1.0 / l);
+                    // pillow thickness the surface move already gives along this direction
+                    let gap = dot(d[pr as usize], u).max(0.0);
+                    let t = (0.4 * h - gap).max(0.1 * h);
+                    d[o] = scale(u, -t);
                 }
             }
         }
@@ -914,7 +1050,7 @@ impl Mesh {
                 self.nodes[n] = add(base[n], d[n]);
             }
         }
-        self.fitted = (0..ne).map(|e| touched(e, &d) || e >= ne - solid_faces.len()).collect();
+        self.fitted = (0..ne).map(|e| touched(e, &d) || e >= ne - solid_faces.len() || pre_fitted.get(e).copied().unwrap_or(false)).collect();
         rep.fitted_elements = self.fitted.iter().filter(|f| **f).count();
         rep.relaxed_elements = relaxed.iter().filter(|r| **r).count();
         // faces and patches follow the nodes
