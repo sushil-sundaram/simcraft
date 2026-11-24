@@ -12,6 +12,7 @@ pub mod geometry;
 pub mod kicad;
 pub mod gpu;
 pub mod gui;
+pub mod help;
 pub mod material;
 pub mod mcp;
 pub mod mesh;

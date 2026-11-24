@@ -578,7 +578,7 @@ impl Core {
             let models = crate::assistant::list_models()?;
             return Ok(Output::json(json!({"server": crate::assistant::base_url(), "models": models, "default": crate::assistant::default_model(&models)})));
         }
-        if self.is_busy() && !matches!(tool, "get_model" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets") {
+        if self.is_busy() && !matches!(tool, "get_model" | "get_help" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets") {
             bail!("a solve is running; wait for it to finish (use get_status)");
         }
         let mut guard = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -954,6 +954,22 @@ impl Core {
                 Ok(Output::text(format!(
                     "Added enclosure '{n}' ({mat}). Its outer faces are {n}.xmin … {n}.zmax (use them for inlets/outlets). It is only meshed for electrostatic, magnetostatic and fluid analyses."
                 )))
+            }
+            "get_help" => {
+                use crate::help;
+                if let Some(q) = opt_str(a, "query") {
+                    let hits: Vec<Value> = help::search(q, 6).into_iter().map(|(i, score, snip)| json!({"section": help::sections()[i].title, "score": crate::results::float(score), "snippet": snip})).collect();
+                    if hits.is_empty() {
+                        return Ok(Output::text(format!("Nothing in the guide matches '{q}'. Try fewer or different words, or get_help without arguments for the contents.")));
+                    }
+                    return Ok(Output::json(json!({"query": q, "results": hits, "next": "get_help {topic: <section>} for the full text"})));
+                }
+                if let Some(t) = opt_str(a, "topic") {
+                    let i = help::find(t).ok_or_else(|| anyhow!("no help topic '{t}'. Use get_help without arguments for the contents, or get_help {{query}} to search"))?;
+                    return Ok(Output::text(help::section_text(i)));
+                }
+                let toc: Vec<Value> = help::sections().iter().filter(|x| x.level >= 2).map(|x| json!({"section": x.title, "level": x.level})).collect();
+                Ok(Output::json(json!({"guide": "SimCraft User Guide", "contents": toc, "next": "get_help {topic: '7'} or {topic: 'meshing'} for a section, {query: 'heat sink'} to search"})))
             }
             "undo" | "redo" => {
                 let undo = tool == "undo";
@@ -1768,6 +1784,7 @@ pub fn tool_defs() -> Vec<Value> {
         t("edit_body", "Change an existing body: any shape field (box: min, size; cylinder: base, axis, radius, height; sphere: center, radius; STL: scale, offset; board: offset), material, operation (add/subtract) or new_name (loads on it follow the rename). Undoable.", json!({"name": {"type": "string"}, "new_name": {"type": "string"}, "material": {"type": "string"}, "operation": {"type": "string", "enum": ["add", "subtract"]}, "min": v3s("box corner mm"), "size": v3s("box size mm"), "base": v3s("cylinder base centre mm"), "axis": {"type": "string", "enum": ["x", "y", "z"]}, "radius": {"type": "number"}, "height": {"type": "number"}, "center": v3s("sphere centre mm"), "scale": {"type": "number"}, "offset": v3s("STL / board offset mm")}), &["name"]),
         t("edit_load", "Change an existing support or load by id (see get_model): any of its fields, e.g. {id: 3, vector: [0, 0, -500]}, {id: 2, value_mpa: 4}, {id: 5, faces: [\"Plate.xmax\"]}. Undoable.", json!({"id": {"type": "integer"}}), &["id"]),
         t("transform_body", "Move, copy, pattern or mirror a body. move/copy/pattern use 'translate' [dx, dy, dz] mm (pattern: 'count' instances in total, each step 'translate' further); mirror uses 'axis' and the plane coordinate 'at' (copy: true by default). Copies get new names and no loads.", json!({"name": {"type": "string"}, "mode": {"type": "string", "enum": ["move", "copy", "pattern", "mirror"]}, "translate": v3s("offset mm"), "count": {"type": "integer"}, "axis": {"type": "string", "enum": ["x", "y", "z"]}, "at": {"type": "number", "description": "mirror plane coordinate mm"}, "copy": {"type": "boolean"}}), &["name", "mode"]),
+        t("get_help", "Read the SimCraft user guide: no arguments = table of contents; 'topic' = one section with its subsections (a number like '7' or a name like 'meshing', 'fatigue', 'KiCad'); 'query' = search the whole guide (ranked sections with snippets). Use it to learn how an analysis, load or result works.", json!({"topic": {"type": "string"}, "query": {"type": "string"}}), &[]),
         t("undo", "Undo the last change to the model (geometry, materials, loads, analysis settings).", json!({}), &[]),
         t("redo", "Redo the last undone change.", json!({}), &[]),
         t("remove_body", "Delete a body by name.", json!({"name": {"type": "string"}}), &["name"]),

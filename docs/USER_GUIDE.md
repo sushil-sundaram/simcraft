@@ -103,6 +103,21 @@ compression-only, red = force, orange = pressure, pink = temperature, yellow = h
 convection, violet = voltage/current, brown = coil, crimson = magnet, green = inlet/outlet, green
 highlight = your current selection.
 
+### Keyboard and mouse
+
+| Action | How |
+|---|---|
+| Orbit / pan / zoom | left drag / right or middle drag / wheel |
+| Select a face / add to the selection | click / Shift+click |
+| Edit a body or load | click it in the Browser |
+| Read a value on the model | RESULTS ▸ 🎯 Probe, then click |
+| Undo / redo | Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y |
+| Help for what you are doing | F1 (or the ⓘ next to the analysis name) |
+| Stop a running solve or study | ■ Stop in the status bar |
+| Views | toolbar at the viewport corner: Fit, Iso, Front, Top, Right, Left |
+
+The **HELP** tab opens this guide inside the app, with a table of contents and search.
+
 ---
 
 ## 3. Your first simulation in 5 minutes
@@ -644,6 +659,9 @@ with `get_selection`, and use the planner (`plan_simulation`, `get_plan`, `set_p
 **Security** — the window and `simcraft serve` only accept connections that present the token in
 `~/.config/simcraft/token` (created automatically, readable only by you), so other programs on the machine
 cannot drive SimCraft.
+
+Agents can read this guide with `get_help` (contents, a section by number or name, or a search),
+so they can look up how an analysis or load works before setting it up.
 
 ### Python scripting (`pysimcraft`)
 
