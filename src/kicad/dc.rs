@@ -15,6 +15,8 @@ use serde_json::{Value, json};
 const RHO20: f64 = 1.72e-8;
 const ALPHA_CU: f64 = 0.00393;
 const MAX_PIXELS: usize = 6_000_000;
+/// Tracks shorter than this [mm] are neck-downs: IPC-2221's long-track rise overstates their heating.
+pub const SHORT_MM: f64 = 2.0;
 
 /// IPC-2221 temperature rise [°C] of a conductor carrying `amps` (cross-section in mm², outer layer
 /// or inner layer).
@@ -399,9 +401,11 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
     }
     let a = NodeSparse { bs: 1, ptr, adj, vals };
     let mut vsol: Vec<f64> = (0..m).map(|r| fixed[nodes[r]].unwrap_or(0.5)).collect();
-    let crd: Vec<[u32; 3]> = nodes.iter().map(|&i| coords[i]).collect();
+    // layers are coupled only through via barrels: keep them apart in the aggregation (the layer
+    // coordinate is spread so 2×2×2 blocks never merge two layers)
+    let crd: Vec<[u32; 3]> = nodes.iter().map(|&i| [coords[i][0], coords[i][1], coords[i][2] << 16]).collect();
     let mg = crate::multigrid::Multigrid::new(&a, &crd)?;
-    let its = mg.solve(&rhs, &mut vsol, 1e-10, 3000)?;
+    let its = mg.solve(&rhs, &mut vsol, 1e-9, 3000)?;
     let mut v = vec![0.0; n];
     for (r, &i) in nodes.iter().enumerate() {
         v[i] = vsol[r];
@@ -414,13 +418,13 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
     let r_ohm = 1.0 / i1;
     let vs = current * r_ohm; // volts per unit solution
     let to_board = |p: P2| [p[0] - board.frame[0], board.frame[1] - p[1]];
-    // sheet current |K| [A/m] per pixel
-    let kmag = |l: usize, i: usize, j: usize| -> f64 {
+    // sheet current vector K = −G□ ∇V [A/m] per pixel
+    let kvec = |l: usize, i: usize, j: usize| -> [f64; 2] {
         let at = |ii: usize, jj: usize| -> Option<f64> {
             let a = id[l * np + ii + jj * nx];
             (a != u32::MAX && seen[a as usize]).then(|| v[a as usize])
         };
-        let Some(c) = at(i, j) else { return 0.0 };
+        let Some(c) = at(i, j) else { return [0.0; 2] };
         let d = |p: Option<f64>, q: Option<f64>| match (p, q) {
             (Some(p), Some(q)) => (q - p) / (2.0 * res * 1e-3),
             (Some(p), None) => (c - p) / (res * 1e-3),
@@ -429,7 +433,13 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
         };
         let gx = d(if i > 0 { at(i - 1, j) } else { None }, if i + 1 < nx { at(i + 1, j) } else { None });
         let gy = d(if j > 0 { at(i, j - 1) } else { None }, if j + 1 < ny { at(i, j + 1) } else { None });
-        gsheet[l] * vs * (gx * gx + gy * gy).sqrt()
+        // a partly covered edge pixel carries current only in its copper share
+        let f = cov(l, i + j * nx);
+        [-gsheet[l] * f * vs * gx, -gsheet[l] * f * vs * gy]
+    };
+    let kmag = |l: usize, i: usize, j: usize| -> f64 {
+        let k = kvec(l, i, j);
+        (k[0] * k[0] + k[1] * k[1]).sqrt()
     };
     let mut jmax = (0.0f64, 0usize, [0.0; 2]);
     for l in 0..nl {
@@ -449,19 +459,37 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
         }
     }
     let outer = |l: usize| l == 0 || l + 1 == nl;
-    let sample = |l: usize, p: P2| -> f64 {
+    let sample = |l: usize, p: P2| -> [f64; 2] {
         let i = (((p[0] - x0) / res).floor().max(0.0) as usize).min(nx - 1);
         let j = (((p[1] - y0) / res).floor().max(0.0) as usize).min(ny - 1);
-        kmag(l, i, j)
+        kvec(l, i, j)
+    };
+    // current through a track: K·t̂ integrated across its width at the middle of the segment
+    let through = |l: usize, a: P2, b: P2, w: f64| -> f64 {
+        let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt().max(1e-12);
+        let t = [(b[0] - a[0]) / len, (b[1] - a[1]) / len];
+        let nrm = [-t[1], t[0]];
+        let m = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+        let n = ((w / (res / 2.0)).ceil() as usize).max(4);
+        let ds = w / n as f64;
+        (0..n)
+            .map(|q| {
+                let s = -w / 2.0 + (q as f64 + 0.5) * ds;
+                let k = sample(l, [m[0] + s * nrm[0], m[1] + s * nrm[1]]);
+                (k[0] * t[0] + k[1] * t[1]) * ds * 1e-3
+            })
+            .sum::<f64>()
+            .abs()
     };
     let mut segs: Vec<Value> = Vec::new();
     for (layer, a, b, w) in &tracks {
+        let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        if len < (*w).max(2.0 * res) {
+            continue; // stubs shorter than their width carry no meaningful "track current"
+        }
         for l in lidx(layer) {
-            let mut ks: Vec<f64> = [0.3, 0.4, 0.5, 0.6, 0.7].iter().map(|t| sample(l, [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])])).collect();
-            ks.sort_by(|p, q| p.total_cmp(q));
-            let amps = ks[2] * w * 1e-3;
+            let amps = through(l, *a, *b, *w);
             let t = layers[l].1;
-            let len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
             segs.push(json!({
                 "layer": layer, "width_mm": w, "length_mm": crate::results::float(len),
                 "from_mm": to_board(*a).map(crate::results::float), "to_mm": to_board(*b).map(crate::results::float),
@@ -484,7 +512,8 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
         })
         .collect();
     via_list.sort_by(|p, q| q.0.total_cmp(&p.0));
-    let worst_rise = segs.iter().filter_map(|s| s["ipc2221_temperature_rise_c"].as_f64()).fold(0.0, f64::max);
+    // IPC-2221 is for long tracks: a neck-down of a few mm is cooled by the copper around it
+    let worst_rise = segs.iter().filter(|s| s["length_mm"].as_f64().unwrap_or(0.0) >= SHORT_MM).filter_map(|s| s["ipc2221_temperature_rise_c"].as_f64()).fold(0.0, f64::max);
     let mut warnings = board.warnings.clone();
     if res > wmin / 2.5 {
         warnings.push(format!("raster {res:.3} mm is coarse for the narrowest copper ({wmin:.3} mm): results for thin tracks are approximate"));
@@ -512,6 +541,56 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
         "unknowns": m,
         "solver_iterations": its,
         "warnings": warnings,
-        "note": "DC sheet-resistance model of the net's copper (tracks, zones, pads, via barrels); IPC-2221 temperature rise per track for the current it carries alone (no neighbouring heat).",
+        "note": "DC sheet-resistance model of the net's copper (tracks, zones, pads, via barrels); track current = sheet current integrated across the track at its middle; IPC-2221 temperature rise per track for the current it carries alone (long tracks; segments shorter than 2 mm are neck-downs cooled by the copper around them).",
     }))
+}
+
+/// Nets of a board with their pads ("REF.PAD"), for choosing `pcb_dc` terminals. Nets with fewer
+/// than two pads are left out; sorted by name.
+pub fn net_pads(path: &str) -> Result<Vec<(String, Vec<String>)>> {
+    let text = std::fs::read_to_string(path).map_err(|e| anyhow!("reading {path}: {e}"))?;
+    net_pads_text(&text)
+}
+
+pub fn net_pads_text(text: &str) -> Result<Vec<(String, Vec<String>)>> {
+    let root = parse(text)?;
+    let table: BTreeMap<String, String> = root.all("net").filter_map(|n| Some((n.atom(1)?.to_string(), n.atom(2).unwrap_or("").to_string()))).collect();
+    let mut nets: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for fp in root.all("footprint").chain(root.all("module")) {
+        let reference = fp.all("property").find(|p| p.atom(1) == Some("Reference")).and_then(|p| p.atom(2)).or_else(|| fp.all("fp_text").find(|t| t.atom(1) == Some("reference")).and_then(|t| t.atom(2))).unwrap_or("?").to_string();
+        for pad in fp.all("pad") {
+            if !pad.layers().iter().any(|l| l.ends_with(".Cu")) {
+                continue;
+            }
+            if let Some(n) = net_name(pad, &table).filter(|n| !n.is_empty()) {
+                nets.entry(n).or_default().push(format!("{reference}.{}", pad.atom(1).unwrap_or("")));
+            }
+        }
+    }
+    let mut out: Vec<(String, Vec<String>)> = nets.into_iter().filter(|(_, p)| p.len() >= 2).collect();
+    for (_, p) in out.iter_mut() {
+        p.sort_by(|a, b| natural(a).cmp(&natural(b)));
+        p.dedup();
+    }
+    Ok(out)
+}
+
+/// Sort key that orders "U2.10" after "U2.9".
+fn natural(s: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+        } else {
+            if !num.is_empty() {
+                out.push((std::mem::take(&mut text), num.parse().unwrap_or(0)));
+                num.clear();
+            }
+            text.push(ch);
+        }
+    }
+    out.push((text, num.parse().unwrap_or(0)));
+    out
 }

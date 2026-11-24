@@ -180,7 +180,7 @@ Tools: `get_model`, `new_model`, `add_box`, `add_cylinder`, `add_sphere`, `impor
 `get_help`, `edit_body`, `edit_load`, `transform_body`, `undo`, `redo`, `cancel`, `import_kicad`, `add_port`, `clear_loads`, `set_mesh`, `solve`, `fatigue_life`, `make_report`, `get_results`, `probe`, `set_display` (incl. cut plane, dark mode),
 `render_image` (PNG), `screenshot_gui` (PNG of the window), `export_vtk`, `save_project`, `open_project`,
 `get_selection`, `get_status`, `launch_gui`, `plan_simulation`, `get_plan`, `set_plan_step`,
-`list_local_models`, `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`, `fit_surrogate`, `predict_surrogate`, `pcb_dc`,
+`list_local_models`, `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`, `fit_surrogate`, `predict_surrogate`, `pcb_nets`, `pcb_dc`,
 `topology_optimize`, `get_study`, `apply_design`.
 
 Example prompt: *"In SimCraft, make a 150×30×8 mm aluminium bracket with two 6 mm holes, fix the left
