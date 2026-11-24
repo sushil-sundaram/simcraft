@@ -132,3 +132,60 @@ fn parses_outline_cutout_and_footprints() {
     // through-hole pads put copper on every layer
     assert!(d.copper_fraction[1] > 0.0 && d.copper_fraction[2] > 0.0);
 }
+
+/// Two test points joined by a track (optionally through a via to B.Cu).
+fn dc_board(via: bool) -> String {
+    let (seg, tp2_layer) = if via {
+        (r#"(segment (start 100 50) (end 110 50) (width 0.5) (layer "F.Cu") (net 1))
+  (via (at 110 50) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu") (net 1))
+  (segment (start 110 50) (end 120 50) (width 0.5) (layer "B.Cu") (net 1))"#, "B.Cu")
+    } else {
+        (r#"(segment (start 100 50) (end 120 50) (width 0.5) (layer "F.Cu") (net 1))"#, "F.Cu")
+    };
+    format!(r#"(kicad_pcb (version 20240108) (generator "test")
+  (general (thickness 1.6))
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+  (setup (stackup (layer "F.Cu" (type "copper") (thickness 0.035)) (layer "dielectric 1" (type "core") (thickness 1.53)) (layer "B.Cu" (type "copper") (thickness 0.035))))
+  (net 0 "") (net 1 "VBUS")
+  (gr_rect (start 95 45) (end 125 55) (layer "Edge.Cuts") (width 0.1))
+  (footprint "TestPoint" (layer "F.Cu") (at 100 50)
+    (property "Reference" "TP1" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "VBUS")))
+  (footprint "TestPoint" (layer "{tp2_layer}") (at 120 50)
+    (property "Reference" "TP2" (at 0 0 0) (layer "F.SilkS"))
+    (pad "1" smd rect (at 0 0) (size 1 1) (layers "{tp2_layer}") (net 1 "VBUS")))
+  {seg}
+)"#)
+}
+
+const RHO_CU20: f64 = 1.72e-8;
+
+#[test]
+fn dc_resistance_of_a_track() {
+    let r = call(&new_core(), "pcb_dc", json!({"path": write("dc1.kicad_pcb", &dc_board(false)), "from": "TP1.1", "to": "TP2.1", "current": 2}));
+    println!("{r:#}");
+    // between the pad edges: 19 mm of 0.5 mm × 35 µm copper
+    let want = RHO_CU20 * 19e-3 / (0.5e-3 * 35e-6) * 1e3;
+    close("track resistance [mΩ]", r["resistance_mohm"].as_f64().unwrap(), want, 0.02);
+    close("voltage drop [mV]", r["voltage_drop_mv"].as_f64().unwrap(), 2.0 * want, 0.02);
+    close("current density [A/mm²]", r["tracks_by_current"][0]["current_density_a_per_mm2"].as_f64().unwrap(), 2.0 / (0.5 * 0.035), 0.03);
+    assert_eq!(r["net"], "VBUS");
+}
+
+#[test]
+fn dc_resistance_through_a_via() {
+    let r = call(&new_core(), "pcb_dc", json!({"path": write("dc2.kicad_pcb", &dc_board(true)), "from": "TP1.1", "to": "TP2.1"}));
+    println!("{r:#}");
+    let track = RHO_CU20 * 9.5e-3 / (0.5e-3 * 35e-6);
+    let barrel = RHO_CU20 * 1.6e-3 / (std::f64::consts::PI * 0.3e-3 * 25e-6);
+    close("track + via + track [mΩ]", r["resistance_mohm"].as_f64().unwrap(), (2.0 * track + barrel) * 1e3, 0.05);
+    close("via current [A]", r["max_via_current_a"].as_f64().unwrap(), 1.0, 0.01);
+}
+
+#[test]
+fn ipc2221_reference_width() {
+    // 1 A, 10 °C rise, outer layer, 1 oz (35 µm): ≈ 0.30 mm (12 mil) per the IPC-2221 chart
+    let w = simcraft::kicad::dc::ipc2221_width(1.0, 0.035, 10.0, true);
+    close("IPC-2221 width [mm]", w, 0.30, 0.03);
+    close("rise at that width [°C]", simcraft::kicad::dc::ipc2221_rise(1.0, w * 0.035, true), 10.0, 1e-9);
+}

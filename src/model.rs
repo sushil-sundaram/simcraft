@@ -146,6 +146,9 @@ pub struct AnalysisSettings {
     /// CFD turbulence model: "laminar" or "lvel" (algebraic wall-distance model for electronics).
     #[serde(default = "laminar")]
     pub turbulence: String,
+    /// CFD scheme: "auto" (SIMPLEC, projection for flows that do not settle), "simple", "projection".
+    #[serde(default = "auto")]
+    pub cfd_scheme: String,
     /// Full-wave EM: excitation frequency [Hz].
     #[serde(default = "mw_freq")]
     pub frequency_hz: f64,
@@ -182,6 +185,9 @@ fn freq_steps() -> usize {
 }
 fn yes() -> bool {
     true
+}
+fn auto() -> String {
+    "auto".into()
 }
 fn laminar() -> String {
     "laminar".into()
@@ -224,6 +230,7 @@ impl Default for AnalysisSettings {
             direction: Axis::Z,
             combination: "srss".into(),
             turbulence: "laminar".into(),
+            cfd_scheme: "auto".into(),
             boundary_fit: true,
             frequency_hz: 2.45e9,
             em_boundary: "pec".into(),
@@ -498,9 +505,16 @@ impl Model {
     pub fn has_enclosure(&self) -> bool {
         self.bodies.iter().any(|b| b.role == crate::geometry::Role::Enclosure)
     }
-    /// Whether the current analysis uses a boundary-fitted mesh (static structural).
+    /// Whether the current analysis uses a boundary-fitted mesh: linear structural, thermal,
+    /// thermal-stress, modal and vibration analyses (not buckling, plasticity, fields, CFD, FDTD).
+    /// Models with an imported PCB stay on plain voxels: its homogenised copper conductivity is
+    /// already scaled to the voxel layer thickness.
     pub fn mesh_fitted(&self) -> bool {
-        self.analysis.boundary_fit && self.analysis.kind == AnalysisType::StaticStructural
+        use AnalysisType::*;
+        self.analysis.boundary_fit
+            && !self.mesh_with_enclosure()
+            && !self.bodies.iter().any(|b| matches!(b.shape, crate::geometry::Shape::Pcb { .. }))
+            && matches!(self.analysis.kind, StaticStructural | ThermalStress | SteadyThermal | TransientThermal | Modal | HarmonicResponse | ResponseSpectrum | RandomVibration | TransientStructural)
     }
     /// Whether the mesh for the current analysis includes the enclosure region.
     pub fn mesh_with_enclosure(&self) -> bool {

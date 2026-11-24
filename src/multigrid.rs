@@ -200,6 +200,11 @@ impl Multigrid {
         x
     }
 
+    /// One V-cycle from zero: an approximate inverse, for use as a preconditioner.
+    pub fn precondition(&self, r: &[f64]) -> Vec<f64> {
+        self.vcycle(0, r)
+    }
+
     /// Multigrid-preconditioned CG; `x` is the initial guess. Converges to `tol` relative to the
     /// initial residual. Returns iterations.
     pub fn solve(&self, b: &[f64], x: &mut [f64], tol: f64, max_it: usize) -> Result<usize> {

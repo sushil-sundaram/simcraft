@@ -81,6 +81,8 @@ impl Sx {
     }
 }
 
+pub mod dc;
+
 pub fn parse(text: &str) -> Result<Sx> {
     let b = text.as_bytes();
     let mut i = 0usize;
@@ -170,6 +172,9 @@ pub struct PcbData {
     pub n_vias: usize,
     pub n_tracks: usize,
     pub warnings: Vec<String>,
+    /// file coordinates of the board frame: x of the left edge, y of the top edge (board
+    /// coordinates are (x − frame.0, frame.1 − y))
+    pub frame: P2,
 }
 
 fn rot(x: f64, y: f64, deg: f64) -> P2 {
@@ -725,7 +730,7 @@ impl PcbData {
                 Footprint { lo: [a[0].min(b[0]), a[1].min(b[1])], hi: [a[0].max(b[0]), a[1].max(b[1])], ..f }
             })
             .collect();
-        Ok(PcbData { path: path.to_string(), loops, size, thickness, layers, footprints, res, nx, ny, sat, via_sat, copper_fraction, n_vias: vias.len(), n_tracks, warnings })
+        Ok(PcbData { path: path.to_string(), loops, size, thickness, layers, footprints, res, nx, ny, sat, via_sat, copper_fraction, n_vias: vias.len(), n_tracks, warnings, frame: [fx0, fy1] })
     }
 
     /// Board coordinates contain (x, y) (inside the outline, outside cutouts)?

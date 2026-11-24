@@ -2030,6 +2030,18 @@ impl SimApp {
                             });
                         }
                         if matches!(kind, AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer) {
+                            ui.horizontal(|ui| {
+                                ui.label("Scheme");
+                                for (t, l, tip) in [
+                                    ("auto", "Auto", "Implicit SIMPLE (fast, no time-step limit); switches to Projection if the flow will not settle"),
+                                    ("simple", "SIMPLE", "Implicit SIMPLE only"),
+                                    ("projection", "Projection", "Explicit pseudo-time marching: follows unsteady flows and time-averages them"),
+                                ] {
+                                    if ui.selectable_label(st.cfd_scheme == t, l).on_hover_text(tip).clicked() && st.cfd_scheme != t {
+                                        self.run("set_analysis", json!({"cfd_scheme": t}));
+                                    }
+                                }
+                            });
                             num(ui, "Max iterations", st.max_iterations as f64, "max_iterations", 50.0, "", &mut changes);
                         }
                         if kind == AnalysisType::LinearBuckling {
@@ -2097,9 +2109,9 @@ impl SimApp {
                                 });
                             }
                         }
-                        if kind == AnalysisType::StaticStructural {
+                        if matches!(kind, AnalysisType::StaticStructural | AnalysisType::ThermalStress | AnalysisType::SteadyThermal | AnalysisType::TransientThermal | AnalysisType::Modal | AnalysisType::HarmonicResponse | AnalysisType::ResponseSpectrum | AnalysisType::RandomVibration | AnalysisType::TransientStructural) {
                             let mut fit = st.boundary_fit;
-                            if ui.checkbox(&mut fit, "Fit curved surfaces").on_hover_text("Moves the surface nodes onto the true holes, fillets and off-grid faces (with a fitted surface layer) for accurate peak stresses. Off = plain voxels.").changed() {
+                            if ui.checkbox(&mut fit, "Fit curved surfaces").on_hover_text("Moves the surface nodes onto the true holes, fillets and off-grid faces (with a fitted surface layer) for accurate peak stresses, heat flows and frequencies. Off = plain voxels. Models with a KiCad board always use plain voxels.").changed() {
                                 self.run("set_analysis", json!({"boundary_fit": fit}));
                             }
                         }

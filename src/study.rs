@@ -293,7 +293,7 @@ pub fn response(summary: &Value, mass: f64, volume_mm3: f64, key: &str) -> Resul
 /// Solve one design and return its responses.
 pub fn evaluate(model: &Model, responses: &[String]) -> Result<Vec<Option<f64>>> {
     let h = model.element_size.unwrap_or_else(|| mesh::auto_size(&model.bodies, model.mesh_with_enclosure()));
-    let m = mesh::build_for(model, h, mesh::MAX_CELLS)?;
+    let m = mesh::build_for(model, h, mesh::max_cells_for(model))?;
     let res = fem::solve(model, &m, &|_, _| {})?;
     let sum = res.summary(&m);
     Ok(responses.iter().map(|k| response(&sum, res.info.mass_kg, m.volume_mm3(), k).ok()).collect())

@@ -1,7 +1,9 @@
 //! Steady incompressible flow (Navier–Stokes) on the voxel grid, with optional conjugate heat
 //! transfer, Boussinesq buoyancy and the LVEL turbulence model.
 //!
-//! Flow: cell-centred velocities with face normal velocities, pseudo-time projection (Chorin):
+//! Flow, default: SIMPLE (Patankar) — implicit under-relaxed momentum, Rhie–Chow face velocities, pressure
+//! correction (preconditioned by a periodically refreshed factor / multigrid); no time-step limit. Fallback (and `cfd_scheme = projection`) for flows that do not
+//! settle: cell-centred velocities with face normal velocities, pseudo-time projection (Chorin):
 //! explicit advection (conservative, hybrid central/upwind by cell Péclet number) and diffusion
 //! with a variable effective viscosity, interpolation to faces, pressure Poisson (direct or
 //! warm-started PCG), face correction; marched until the velocity stops changing.
@@ -79,7 +81,7 @@ pub fn lvel_law(re_l: f64) -> (f64, f64) {
 fn bicgstab(ptr: &[usize], col: &[u32], val: &[f64], b: &[f64], x: &mut [f64], tol: f64, max_it: usize) -> Result<usize> {
     let mut total = 0;
     for _ in 0..8 {
-        match bicgstab_once(ptr, col, val, b, x, tol, max_it) {
+        match bicgstab_once(ptr, col, val, b, x, tol, max_it, false) {
             Ok((it, true)) => return Ok(total + it),
             Ok((it, false)) => total += it, // breakdown: restart from the current iterate
             Err(e) => return Err(e),
@@ -89,7 +91,7 @@ fn bicgstab(ptr: &[usize], col: &[u32], val: &[f64], b: &[f64], x: &mut [f64], t
 }
 
 /// One BiCGSTAB cycle: (iterations, converged). `false` = breakdown, x holds the best iterate.
-fn bicgstab_once(ptr: &[usize], col: &[u32], val: &[f64], b: &[f64], x: &mut [f64], tol: f64, max_it: usize) -> Result<(usize, bool)> {
+fn bicgstab_once(ptr: &[usize], col: &[u32], val: &[f64], b: &[f64], x: &mut [f64], tol: f64, max_it: usize, loose: bool) -> Result<(usize, bool)> {
     let n = b.len();
     let dinv: Vec<f64> = (0..n)
         .map(|i| {
@@ -159,7 +161,79 @@ fn bicgstab_once(ptr: &[usize], col: &[u32], val: &[f64], b: &[f64], x: &mut [f6
             return Ok((it, false));
         }
     }
+    if loose {
+        return Ok((max_it, true));
+    }
     bail!("energy equation did not converge")
+}
+
+/// Inexact BiCGSTAB for the momentum equations of SIMPLE: reduce the residual of the current
+/// iterate by `reduce` (at most `max_it` iterations; outer iterations fix the rest).
+fn bicgstab_reduce(ptr: &[usize], col: &[u32], val: &[f64], b: &[f64], x: &mut [f64], reduce: f64, max_it: usize) -> Result<usize> {
+    let r0: f64 = (0..b.len())
+        .into_par_iter()
+        .map(|i| {
+            let mut s = b[i];
+            for k in ptr[i]..ptr[i + 1] {
+                s -= val[k] * x[col[k] as usize];
+            }
+            s * s
+        })
+        .sum::<f64>()
+        .sqrt();
+    let bn = b.par_iter().map(|v| v * v).sum::<f64>().sqrt();
+    if r0 == 0.0 || bn == 0.0 {
+        return Ok(0);
+    }
+    let mut total = 0;
+    for _ in 0..3 {
+        let (it, ok) = bicgstab_once(ptr, col, val, b, x, reduce * r0 / bn, max_it, true)?;
+        total += it;
+        if ok {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Preconditioned CG to `tol` relative to the initial residual (best effort after `max_it`).
+fn pcg_prec(a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, max_it: usize, prec: &dyn Fn(&[f64]) -> Vec<f64>) -> Result<usize> {
+    let n = b.len();
+    let mut r = vec![0.0; n];
+    a.matvec(x, &mut r);
+    r.par_iter_mut().zip(b).for_each(|(r, b)| *r = b - *r);
+    let dot = |u: &[f64], v: &[f64]| u.par_iter().zip(v).map(|(p, q)| p * q).sum::<f64>();
+    let r0 = dot(&r, &r).sqrt();
+    if r0 == 0.0 {
+        return Ok(0);
+    }
+    let mut z = prec(&r);
+    let mut p = z.clone();
+    let mut rz = dot(&r, &z);
+    let mut ap = vec![0.0; n];
+    for it in 1..=max_it {
+        a.matvec(&p, &mut ap);
+        let pap = dot(&p, &ap);
+        if !(pap > 0.0) {
+            return Ok(it);
+        }
+        let al = rz / pap;
+        x.par_iter_mut().zip(&p).for_each(|(x, p)| *x += al * p);
+        r.par_iter_mut().zip(&ap).for_each(|(r, q)| *r -= al * q);
+        let rn = dot(&r, &r).sqrt();
+        if !rn.is_finite() {
+            bail!("pressure-correction solve diverged");
+        }
+        if rn < tol * r0 {
+            return Ok(it);
+        }
+        z = prec(&r);
+        let rz2 = dot(&r, &z);
+        let beta = rz2 / rz;
+        rz = rz2;
+        p.par_iter_mut().zip(&z).for_each(|(p, z)| *p = z + beta * *p);
+    }
+    Ok(max_it)
 }
 
 /// Thermal boundary condition on an outer face of a cell.
@@ -505,7 +579,7 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
     };
 
     // energy assembly + solve with the current face velocities
-    let solve_energy = |uf: &[[f64; 6]], nu_eff: &[f64], nu_wall: &[f64], temp: &mut Vec<f64>| -> Result<usize> {
+    let solve_energy = |uf: &[[f64; 6]], nu_eff: &[f64], nu_wall: &[f64], temp: &mut Vec<f64>, reduce: Option<f64>| -> Result<usize> {
         let mut val = vec![0.0f64; ecol.len()];
         let mut b = vec![0.0f64; ne];
         let kc: Vec<[f64; 3]> = (0..ne).map(|e| k_of(e, nu_eff)).collect();
@@ -568,7 +642,10 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
                 }
             }
         }
-        bicgstab(&eptr, &ecol, &val, &b, temp, 1e-9, 5000)
+        match reduce {
+            Some(r) => bicgstab_reduce(&eptr, &ecol, &val, &b, temp, r, 25),
+            None => bicgstab(&eptr, &ecol, &val, &b, temp, 1e-9, 5000),
+        }
     };
 
     let mut last_energy_t: Vec<f64> = temp.clone();
@@ -577,7 +654,314 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
     let (mut avg_n, mut sim_time, mut avg_start_time) = (0usize, 0.0f64, 0.0f64);
     let t_loop = std::time::Instant::now();
     let profile = std::env::var_os("SIMCRAFT_PROFILE").is_some();
-    while iters < max_it {
+
+    // ---------------------------------------------------------------- SIMPLE (implicit, steady)
+    // Momentum solved implicitly (hybrid advection, under-relaxed), face velocities by Rhie–Chow
+    // interpolation with Majumdar's relaxation correction, SIMPLE pressure correction. No time-
+    // step limit, so fine meshes and slow (diffusion-dominated) flows converge in a few hundred
+    // outer iterations. Flows that do not settle (vortex shedding, plumes) fall back to the
+    // projection method below, which time-averages them.
+    let scheme = st.cfd_scheme.as_str();
+    let mut simple_ok = false;
+    let mut simple_iters = 0usize;
+    let mut mom_total = 0usize;
+    let mut fallback_note: Option<String> = None;
+    if scheme != "projection" {
+        // classic SIMPLE relaxation (Patankar): robust for cavities, buoyancy and LVEL alike
+        let (alpha, alpha_p) = (0.7f64, 0.3f64);
+        let af = h * h;
+        let vol = h * h * h;
+        let budget = if scheme == "simple" { max_it } else { max_it.min(2500) };
+        let mut stalled = false;
+        let dpos: Vec<usize> = (0..nf).map(|i| ptr[i] + adj[ptr[i]..ptr[i + 1]].binary_search(&(i as u32)).unwrap()).collect();
+        let npos: Vec<[usize; 6]> = (0..nf)
+            .map(|i| {
+                let mut q = [usize::MAX; 6];
+                for d in 0..6 {
+                    if let Bc::Fluid(j) = nb[i][d] {
+                        q[d] = ptr[i] + adj[ptr[i]..ptr[i + 1]].binary_search(&(j as u32)).unwrap();
+                    }
+                }
+                q
+            })
+            .collect();
+        // cell pressure gradient; boundary faces: outlet value (or 0 for corrections), else p_i
+        let cell_grad = |p: &[f64], correction: bool| -> Vec<[f64; 3]> {
+            (0..nf)
+                .into_par_iter()
+                .map(|i| {
+                    let pf = |d: usize| match nb[i][d] {
+                        Bc::Fluid(j) => 0.5 * (p[i] + p[j]),
+                        Bc::Outlet(po) => {
+                            if correction {
+                                0.0
+                            } else {
+                                po
+                            }
+                        }
+                        _ => p[i],
+                    };
+                    [(pf(1) - pf(0)) / h, (pf(3) - pf(2)) / h, (pf(5) - pf(4)) / h]
+                })
+                .collect()
+        };
+        let mut val = vec![0.0f64; adj.len()];
+        let mut mval = vec![0.0f64; adj.len()];
+        let mut dcoef = vec![0.0f64; nf];
+        let mut pc = vec![0.0f64; nf];
+        let mut xb = vec![0.0f64; nf];
+        let mut bb = vec![0.0f64; nf];
+        let mut best = (f64::INFINITY, 0usize);
+        let mut du = f64::INFINITY;
+        let mut mres = f64::INFINITY;
+        let mut t_change_s = f64::INFINITY;
+        let coords: Vec<[u32; 3]> = fluid_elems.iter().map(|&e| mesh.elem_cell[e]).collect();
+        // fixed boundary face velocities (axis components)
+        for i in 0..nf {
+            for d in 0..6 {
+                if let Bc::Inlet(v, _) = nb[i][d] {
+                    uf[i][d] = if d % 2 == 1 { -v } else { v };
+                }
+            }
+        }
+        // pressure-correction preconditioner, rebuilt every few iterations (d changes slowly)
+        enum Pre {
+            None,
+            Direct(crate::sparse::Factor),
+            Mg(crate::multigrid::Multigrid),
+        }
+        let mut pre = Pre::None;
+        let mut last_pcg = 0usize;
+        for it in 1..=budget {
+            simple_iters = it;
+            let umax = uc.par_iter().map(|u| u[0].abs().max(u[1].abs()).max(u[2].abs())).reduce(|| 0.0, f64::max);
+            let uscale = umax.max(uref).max(1e-9);
+            if lvel {
+                nu_eff.par_iter_mut().zip(nu_wall.par_iter_mut()).enumerate().for_each(|(i, (v, w))| {
+                    let sp = (uc[i][0].powi(2) + uc[i][1].powi(2) + uc[i][2].powi(2)).sqrt();
+                    *v = nu * lvel_law(sp * wall_dist[i] / nu).0;
+                    *w = nu * lvel_law(sp * 0.5 * h / nu).1;
+                });
+            }
+            if buoyant {
+                bicg_total += solve_energy(&uf, &nu_eff, &nu_wall, &mut temp, Some(0.1))?;
+                let tr = temp.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - temp.iter().cloned().fold(f64::INFINITY, f64::min);
+                t_change_s = temp.iter().zip(&last_energy_t).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) / tr.max(1e-6);
+                last_energy_t.clone_from(&temp);
+            }
+            // ---- momentum coefficients (same off-diagonals for all three components)
+            let gp = cell_grad(&p, false);
+            val.iter_mut().for_each(|v| *v = 0.0);
+            let mut extra = vec![[0.0f64; 3]; nf];
+            let mut src = vec![[0.0f64; 3]; nf];
+            for i in 0..nf {
+                for d in 0..6 {
+                    let out = if d % 2 == 1 { 1.0 } else { -1.0 };
+                    let ax = d / 2;
+                    let f = uf[i][d] * out * af; // outward volume flux
+                    match nb[i][d] {
+                        Bc::Fluid(j) => {
+                            let dd = 0.5 * (nu_eff[i] + nu_eff[j]) * af / h;
+                            let anb = (-f).max(dd - f / 2.0).max(0.0);
+                            val[dpos[i]] += anb + f;
+                            val[npos[i][d]] -= anb;
+                        }
+                        Bc::Wall | Bc::Moving(_) => {
+                            let c = nu_wall[i] * af / (h / 2.0);
+                            for comp in 0..3 {
+                                extra[i][comp] += c;
+                                if let Bc::Moving(v) = nb[i][d] {
+                                    if comp != ax {
+                                        src[i][comp] += c * v[comp];
+                                    }
+                                }
+                            }
+                        }
+                        Bc::Slip => extra[i][ax] += nu_eff[i] * af / (h / 2.0),
+                        Bc::Inlet(..) => {
+                            let dd = nu_eff[i] * af / (h / 2.0);
+                            let anb = (-f).max(dd - f / 2.0).max(0.0);
+                            val[dpos[i]] += anb + f;
+                            src[i][ax] += anb * uf[i][d];
+                        }
+                        Bc::Outlet(_) => {
+                            val[dpos[i]] += f.max(0.0);
+                            for comp in 0..3 {
+                                src[i][comp] += (-f).max(0.0) * uc[i][comp];
+                            }
+                        }
+                    }
+                }
+                for comp in 0..3 {
+                    src[i][comp] -= vol / rho * gp[i][comp];
+                    if buoyant {
+                        src[i][comp] -= vol * beta * (temp[fluid_elems[i]] - t_ref) * g[comp];
+                    }
+                }
+            }
+            // ---- solve each component (under-relaxed)
+            let base_diag: Vec<f64> = dpos.iter().map(|&k| val[k]).collect();
+            let mut apr = vec![0.0f64; nf]; // mean relaxed diagonal
+            for comp in 0..3 {
+                for i in 0..nf {
+                    let ac = (base_diag[i] + extra[i][comp]).max(1e-300) / alpha;
+                    val[dpos[i]] = ac;
+                    bb[i] = src[i][comp] + (1.0 - alpha) * ac * uc[i][comp];
+                    xb[i] = uc[i][comp];
+                    apr[i] += ac / 3.0;
+                }
+                mom_total += bicgstab_reduce(&ptr, &adj, &val, &bb, &mut xb, 0.05, 60)?;
+                for i in 0..nf {
+                    ustar[i][comp] = xb[i];
+                }
+            }
+            // SIMPLE: d = V / (ρ a_P/α)
+            for i in 0..nf {
+                dcoef[i] = vol / (rho * apr[i].max(1e-300));
+            }
+            // ---- Rhie–Chow face velocities
+            let uf_old = uf.clone();
+            uf.par_iter_mut().enumerate().for_each(|(i, ufi)| {
+                for d in 0..6 {
+                    let ax = d / 2;
+                    let up = d % 2 == 1;
+                    match nb[i][d] {
+                        Bc::Fluid(j) => {
+                            let ub = 0.5 * (ustar[i][ax] + ustar[j][ax]);
+                            let db = 0.5 * (dcoef[i] + dcoef[j]);
+                            let gb = 0.5 * (gp[i][ax] + gp[j][ax]);
+                            let gf = if up { (p[j] - p[i]) / h } else { (p[i] - p[j]) / h };
+                            ufi[d] = ub - db * (gf - gb) + (1.0 - alpha) * (uf_old[i][d] - 0.5 * (uc[i][ax] + uc[j][ax]));
+                        }
+                        Bc::Outlet(po) => {
+                            let gf = if up { (po - p[i]) / (h / 2.0) } else { (p[i] - po) / (h / 2.0) };
+                            ufi[d] = ustar[i][ax] - dcoef[i] * (gf - gp[i][ax]) + (1.0 - alpha) * (uf_old[i][d] - uc[i][ax]);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            // ---- pressure correction
+            let imb: Vec<f64> = (0..nf).into_par_iter().map(|i| (0..6).map(|d| uf[i][d] * if d % 2 == 1 { af } else { -af }).sum()).collect();
+            mval.iter_mut().for_each(|v| *v = 0.0);
+            for i in 0..nf {
+                for d in 0..6 {
+                    match nb[i][d] {
+                        Bc::Fluid(j) => {
+                            let c = 0.5 * (dcoef[i] + dcoef[j]) * af / h;
+                            mval[dpos[i]] += c;
+                            mval[npos[i][d]] -= c;
+                        }
+                        Bc::Outlet(_) => mval[dpos[i]] += dcoef[i] * af / (h / 2.0),
+                        _ => {}
+                    }
+                }
+            }
+            if !has_outlet {
+                mval[dpos[0]] += mval[dpos[0]].max(1e-300);
+            }
+            let mm = NodeSparse { bs: 1, ptr: ptr.clone(), adj: adj.clone(), vals: mval.clone() };
+            let rhs_c: Vec<f64> = imb.iter().map(|v| -v).collect();
+            pc.iter_mut().for_each(|v| *v = 0.0);
+            let tp = std::time::Instant::now();
+            if last_pcg > 8 || matches!(pre, Pre::None) {
+                pre = match (nf <= 20_000).then(|| crate::sparse::Factor::new(&mm, crate::sparse::DIRECT_MAX)).flatten() {
+                    Some(f) => Pre::Direct(f?),
+                    None => Pre::Mg(crate::multigrid::Multigrid::new(&mm, &coords)?),
+                };
+            }
+            let prec = |r: &[f64]| -> Vec<f64> {
+                match &pre {
+                    Pre::Direct(f) => f.solve(r),
+                    Pre::Mg(m) => m.precondition(r),
+                    Pre::None => r.to_vec(),
+                }
+            };
+            last_pcg = pcg_prec(&mm, &rhs_c, &mut pc, 1e-3, 200, &prec)?;
+            cg_total += last_pcg;
+            t_pressure += tp.elapsed().as_secs_f64();
+            // ---- corrections
+            for i in 0..nf {
+                p[i] += alpha_p * pc[i];
+            }
+            let gpc = cell_grad(&pc, true);
+            uf.par_iter_mut().enumerate().for_each(|(i, ufi)| {
+                for d in 0..6 {
+                    let up = d % 2 == 1;
+                    match nb[i][d] {
+                        Bc::Fluid(j) => {
+                            let gf = if up { (pc[j] - pc[i]) / h } else { (pc[i] - pc[j]) / h };
+                            ufi[d] -= 0.5 * (dcoef[i] + dcoef[j]) * gf;
+                        }
+                        Bc::Outlet(_) => {
+                            let gf = if up { -pc[i] / (h / 2.0) } else { pc[i] / (h / 2.0) };
+                            ufi[d] -= dcoef[i] * gf;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            du = uc
+                .par_iter_mut()
+                .enumerate()
+                .map(|(i, u)| {
+                    let mut c = 0.0f64;
+                    for q in 0..3 {
+                        let nv = ustar[i][q] - dcoef[i] * gpc[i][q];
+                        c = c.max((nv - u[q]).abs());
+                        u[q] = nv;
+                    }
+                    c
+                })
+                .reduce(|| 0.0, f64::max)
+                / uscale;
+            mres = imb.iter().fold(0.0f64, |m, v| m.max(v.abs())) / (uscale * af);
+            if profile && it % 50 == 0 {
+                eprintln!("[simple] it {it}: du {du:.2e}, mass {mres:.2e}, dT {t_change_s:.1e}, {:.1} ms/it ({:.1} ms pressure)", 1e3 * t_loop.elapsed().as_secs_f64() / it as f64, 1e3 * t_pressure / it as f64);
+            }
+            if it % 10 == 0 {
+                let conv = (-(du.max(1e-12)).log10()).clamp(0.0, 6.0) / 6.0;
+                prog((0.97 * conv).max(0.97 * it as f64 / budget as f64).min(0.97), &format!("SIMPLE iteration {it}, change {du:.2e}, continuity {mres:.2e}"));
+            }
+            if !(du.is_finite() && mres.is_finite()) {
+                stalled = true;
+                break;
+            }
+            if du < 1e-5 && mres < 1e-4 && it > 10 && (!buoyant || t_change_s < 1e-6) {
+                simple_ok = true;
+                break;
+            }
+            let worst = du.max(mres * 0.1);
+            if worst < 0.5 * best.0 {
+                best = (worst, it);
+            }
+            // stalled (oscillating, unsteady flow): hand over to the projection method
+            if scheme != "simple" && it > best.1 + 400 {
+                stalled = true;
+                break;
+            }
+        }
+        if !simple_ok {
+            let why = if du.is_finite() { format!("it did not settle (change {du:.1e}, continuity {mres:.1e} after {simple_iters} iterations)") } else { "it diverged".to_string() };
+            if scheme == "simple" || !stalled {
+                if !du.is_finite() {
+                    bail!("CFD (SIMPLE) diverged; try the projection scheme, a coarser mesh or a lower inlet velocity");
+                }
+                res.warnings.push(format!("SIMPLE is not fully converged: {why}. Raise max iterations or use the projection scheme for unsteady flows."));
+                simple_ok = true; // keep the result
+            } else {
+                fallback_note = Some(format!("SIMPLE {why}; solved with the projection method instead"));
+                uf.iter_mut().for_each(|v| *v = [0.0; 6]);
+                uc.iter_mut().for_each(|v| *v = [0.0; 3]);
+                p.iter_mut().for_each(|v| *v = 0.0);
+                temp.iter_mut().for_each(|v| *v = t_ref);
+                last_energy_t.clone_from(&temp);
+                nu_eff.iter_mut().for_each(|v| *v = nu);
+                nu_wall.iter_mut().for_each(|v| *v = nu);
+            }
+        }
+    }
+    while !simple_ok && iters < max_it {
         iters += 1;
         let umax = uc.par_iter().map(|u| u[0].abs().max(u[1].abs()).max(u[2].abs())).reduce(|| 0.0, f64::max);
         let uscale = umax.max(uref).max(1e-9);
@@ -598,7 +982,7 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
         // two-way coupling only with buoyancy; forced convection solves energy once at the end
         if buoyant && (iters % energy_every == 1 || iters == 1) {
             let tb = std::time::Instant::now();
-            let its = solve_energy(&uf, &nu_eff, &nu_wall, &mut temp)?;
+            let its = solve_energy(&uf, &nu_eff, &nu_wall, &mut temp, None)?;
             bicg_total += its;
             if std::env::var_os("SIMCRAFT_PROFILE").is_some() {
                 eprintln!("[cht] it {iters}: energy {its} BiCGSTAB its, {:.3} s", tb.elapsed().as_secs_f64());
@@ -759,7 +1143,7 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
         }
         sim_time += dt;
     }
-    let converged = change < TOL && (!buoyant || t_change < 1e-5);
+    let converged = simple_ok || (change < TOL && (!buoyant || t_change < 1e-5));
     if !converged && avg_n > 0 {
         let k = 1.0 / avg_n as f64;
         for i in 0..nf {
@@ -785,15 +1169,20 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
         res.note = "time-averaged unsteady flow".into();
     }
     if energy {
-        bicg_total += solve_energy(&uf, &nu_eff, &nu_wall, &mut temp)?;
+        bicg_total += solve_energy(&uf, &nu_eff, &nu_wall, &mut temp, None)?;
     }
-    res.info.iterations = iters;
+    if let Some(n) = &fallback_note {
+        res.warnings.push(n.clone());
+    }
+    res.info.iterations = if simple_ok { simple_iters } else { iters };
     res.info.dofs = nf * 4 + if energy { ne } else { 0 };
     res.info.solver = format!(
-        "projection method ({}{}), {}{}",
+        "{} ({}{}), {}{}",
+        if simple_ok { format!("SIMPLE, {mom_total} momentum BiCGSTAB iterations") } else { "projection method".into() },
         if lvel { "LVEL turbulence" } else { "laminar" },
         if buoyant { ", buoyancy" } else { "" },
         match (&psolver, &mg) {
+            _ if simple_ok => format!("{cg_total} pressure-correction PCG iterations"),
             (_, Some(m)) => format!("{m_levels}-level multigrid CG, {cg_total} pressure iterations", m_levels = m.levels()),
             (Some(_), _) if cg_total > 0 => format!("{cg_total} pressure CG iterations"),
             (Some(s), _) => s.name(),

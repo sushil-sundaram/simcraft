@@ -95,9 +95,33 @@ fn gpu_fdtd_matches_cpu() {
         println!("SKIP: no usable GPU ({:?})", g["warnings"]);
         return;
     }
-    call(&c, "set_analysis", json!({"compute": "cpu"}));
+    call(&c, "set_analysis", json!({"compute": "auto"}));
     let cpu = call(&c, "solve", json!({}));
     println!("{} vs {} ({} s vs {} s)", g["info"]["solver"], cpu["info"]["solver"], g["info"]["seconds"], cpu["info"]["seconds"]);
     close("GPU vs CPU absorbed power", q(&g, "Absorbed in Food"), q(&cpu, "Absorbed in Food"), 0.01);
     close("GPU vs CPU peak |E|", q(&g, "Peak |E|"), q(&cpu, "Peak |E|"), 0.02);
+}
+
+/// An electrically small current sheet in free space is a short dipole: everything delivered is
+/// radiated, directivity 1.5 (1.76 dBi), and no radiation along the current.
+#[test]
+fn short_dipole_far_field() {
+    let c = new_core();
+    call(&c, "add_box", json!({"name": "Feed", "min": [-3, -3, -3], "size": [6, 6, 6], "material": "PTFE"}));
+    call(&c, "add_enclosure", json!({"min": [-60, -60, -60], "size": [120, 120, 120]}));
+    call(&c, "set_mesh", json!({"element_size_mm": 3}));
+    call(&c, "set_analysis", json!({"type": "full_wave_em", "frequency_ghz": 2.45, "em_boundary": "open"}));
+    call(&c, "add_port", json!({"faces": ["Feed.zmax"], "power": 1, "polarization": "x", "profile": "uniform"}));
+    let r = call(&c, "solve", json!({}));
+    println!("{} — warnings {:?}", r["info"]["solver"], r["warnings"]);
+    for n in ["Radiated power", "Absorbed power", "Max directivity", "Max direction θ", "Max direction φ", "Field strength at 3 m", "Margin to FCC"] {
+        println!("  {n}: {}", q(&r, n));
+    }
+    println!("  pattern cut: {}", r["history"]);
+    close("radiated / delivered power", q(&r, "Radiated power") + q(&r, "Absorbed power"), 1.0, 0.05);
+    close("directivity (linear)", 10f64.powf(q(&r, "Max directivity") / 10.0), 1.5, 0.05);
+    // the x-directed current does not radiate along ±x (θ = 90°, φ = 0 or 180°)
+    let (th, ph) = (q(&r, "Max direction θ"), q(&r, "Max direction φ"));
+    let rx = th.to_radians().sin() * ph.to_radians().cos();
+    assert!(rx.abs() < 0.2, "main lobe should be perpendicular to x (θ {th}, φ {ph})");
 }

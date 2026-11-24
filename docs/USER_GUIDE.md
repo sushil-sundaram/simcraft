@@ -212,7 +212,25 @@ Then either:
   temperature) and an outlet, or gravity for natural convection — the airflow is computed.
 
 Results show the board and part temperatures; the report lists the hottest part. Structural and
-electrical analyses use the laminate's properties (copper is homogenised for heat only).
+field analyses use the laminate's properties (copper is homogenised for heat only).
+
+#### DC current in a net (IR drop, current density, IPC-2221)
+
+MCP `pcb_dc` answers "is this trace wide enough?" for one net of the board: give the source and sink
+pads as `REFERENCE.PAD` (`from: "U3.1"`, `to: "J1.2"`) and the current (A). SimCraft rasterises that
+net's copper on every layer (tracks, arcs, filled zones, pads, via pads, at ¼ of the narrowest track,
+≥ 0.02 mm), connects the layers through the via barrels and plated holes (25 µm plating), holds the two
+pads at fixed potentials and solves the sheet-resistance network. It reports:
+- **resistance** (mΩ), **voltage drop** (mV) and **Joule power** (W) at the given current — copper
+  resistivity at `temperature_c` (default 20 °C, +0.393 %/K);
+- the **peak current density** (A/mm²), its layer and position on the board (corners and neck-downs);
+- the ten tracks carrying most current, each with its current, current density, **IPC-2221
+  temperature rise** and the IPC-2221 width for a 10 °C rise (outer layers k = 0.048, inner 0.024);
+- the largest **via current** and where.
+
+A track carrying 2 A over 20 mm of 0.5 mm × 35 µm copper reads within 1 % of ρL/(w·t). The model is
+DC only (no skin effect) and each track's IPC rise assumes it is alone; for the board's actual
+temperature, add the Joule power as heat generation in a thermal or CHT run.
 
 ---
 
@@ -245,8 +263,10 @@ SimCraft fills the model with equal cubes ("voxels") of the **element size** you
 - Rule of thumb: at least **3–4 elements through the thinnest wall** you care about
   (e.g. 2.5 mm for a 10 mm thick plate in bending).
 - Halving the size gives 8× more elements; solve time grows faster than that.
-- Limit: 400 000 elements per mesh (12 M for full-wave EM, which needs no matrix solve).
-- **Fit curved surfaces** (Static Structural, on by default — SOLVE ▸ settings, MCP
+- Limit: 2 000 000 elements for Static Structural, Thermal Stress and Steady Thermal (solved by
+  matrix-free multigrid, §11), 400 000 for the other analyses, 12 M for full-wave EM (no matrix
+  solve). Budget roughly 4 GB of memory per million elements.
+- **Fit curved surfaces** (structural, thermal, modal and vibration, on by default — SOLVE ▸ settings, MCP
   `set_analysis boundary_fit`): holes, fillets, spheres, STL surfaces and faces that do not line up
   with the grid are fitted exactly. SimCraft keeps the cubes whose corners are all inside the part,
   adds one layer of elements on every curved or off-grid surface and moves its outer nodes onto the
@@ -254,10 +274,15 @@ SimCraft fills the model with equal cubes ("voxels") of the **element size** you
   are left alone. Those elements are general hexahedra (incompatible modes with Taylor's correction,
   stresses from Gauss points), all others stay identical cubes, so solve time barely changes. Peak
   stress at a hole drops from ~10–25 % error with plain voxels to ~2 % at the same element size
-  (plate with hole Kt and thick cylinder, see §15). The viewport shows the fitted mesh.
-- Other analyses (thermal, modal, vibration, EM, CFD, topology) use the plain voxel mesh, where curved
-  surfaces are stair-stepped: global results stay accurate, peak values *on* a curved surface read
-  high — refine there, or read a little away from the edge.
+  (plate with hole Kt and thick cylinder, see §15). Thermal analyses use fitted conduction elements
+  and true face areas for flux and convection (heat through a pipe wall: 4 % error → 0.1 %); masses
+  and heat capacities use each element's true volume (rod bending frequency: 5 % → 0.8 %). Fitting
+  applies to Static Structural, Thermal Stress, Steady and Transient Thermal, Modal, Harmonic,
+  Response Spectrum, Random Vibration and Transient Structural. The viewport shows the fitted mesh.
+- Other analyses (buckling, plasticity, EM, full-wave, CFD, topology) and models with an imported
+  KiCad board use the plain voxel mesh, where curved surfaces are stair-stepped: global results stay
+  accurate, peak values *on* a curved surface read high — refine there, or read a little away from
+  the edge.
 - Size the cubes so thin layers line up with the grid (e.g. 1 mm cubes for a 4 mm dielectric):
   a 4 mm layer meshed with 1.5 mm cubes becomes 4.5 mm.
 
@@ -399,6 +424,17 @@ waveguides and RF fields around parts.
   density** (W/m³), **SAR** (W/kg), and quantities: input and absorbed power, absorbed fraction, power
   absorbed in each body, peak |E|, periods simulated, cells per wavelength. In a closed metal cavity
   the absorbed fraction is ~100 % (a check of convergence).
+- **Far field and radiated emissions** (Open boundary): a near-to-far-field transform on a box just
+  inside the absorbing layer (equivalent surface currents J = n×H, M = −n×E) gives the radiation
+  pattern over the whole sphere. Quantities: **radiated power**, radiation efficiency, power balance
+  (radiated + absorbed ≈ input), **max directivity and gain** (dBi) and their direction (θ, φ), the
+  **field strength at 3 m and 10 m** in the strongest direction (rms, dBµV/m) and the margin to the
+  **FCC Part 15 class B** (3 m) and **CISPR 32 class B** (10 m, 30 MHz–1 GHz) limits. The results chart
+  shows the directivity cut through the main lobe. Keep all parts at least 2 cells away from the
+  enclosure wall (SimCraft warns otherwise). A short dipole gives D = 1.52 (theory 1.5) and the
+  radiated power converges to the input as the mesh refines (−3.9 % at 41 cells/λ, −0.2 % at 82).
+  EMI values are free-space estimates for pre-compliance (no ground plane or antenna-height scan):
+  expect ±6 dB against a test site.
 - Runs on the GPU for grids ≥ 150 000 cells in Auto mode (single precision; same algorithm on the
   CPU). A 240 × 240 × 160 mm oven at 1.6 mm (2.25 M cells, 136 RF periods) takes ≈ 24 s on an
   RTX 3070 Ti Laptop.
@@ -427,9 +463,20 @@ number. Settings: maximum iterations and **Turbulence**:
   nearest wall, and wall shear uses the law of the wall, so coarse meshes still give sensible
   friction and heat transfer (plane-channel friction within ~14 % of Dean's correlation at Re 20 000).
 
-If the flow never settles (vortex shedding behind bluff bodies, plumes) SimCraft warns and shows the
-last state. Advection is second-order (central) where cells resolve the flow and switches to upwind
-where they do not; the pressure equation is solved with multigrid-preconditioned CG on large meshes.
+**Scheme** (SOLVE ▸ settings, MCP `set_analysis cfd_scheme`):
+- **Auto** (default) — the implicit **SIMPLE** method: each iteration solves the momentum equations
+  implicitly (under-relaxed), then corrects the pressure so mass is conserved. It has no time-step
+  limit, so it usually converges in a few hundred iterations however fine the mesh — a 92 000-cell
+  electronics box with two 5 W parts takes ~20 s instead of 7 minutes. If the flow will not settle
+  (vortex shedding behind bluff bodies, plumes), Auto switches to the projection method and says so.
+- **SIMPLE** — SIMPLE only; if it does not settle you get the last iterate with a warning.
+- **Projection** — explicit pseudo-time marching (Chorin). Slower on fine meshes, but it follows
+  unsteady flows and time-averages them when they never settle.
+
+Both give the same steady answer. Advection is second-order (central) where cells resolve the flow
+and switches to upwind where they do not; pressure solves use a direct factor or multigrid-
+preconditioned CG on large meshes. **Max iterations** caps the SIMPLE iterations (at most 2500 in
+Auto before switching) and the projection steps.
 
 **Conjugate Heat Transfer (CFD + thermal)** — flow *and* temperature in the fluid **and the solid
 parts together**: heat conducts through the parts, crosses into the air or liquid and is carried
@@ -448,7 +495,7 @@ pressure; quantities: max and mean temperature of every part, heat carried away 
 through each Temperature/Convection boundary, heat generated and the energy balance (out/in ≈ 100 %
 at convergence). Try **Examples ▸ Heat sink in a duct**: a 10 W chip under a six-fin aluminium sink in
 a 2 m/s air stream. Settings: reference temperature (default inflow temperature and buoyancy
-reference), maximum iterations, turbulence. Thermal loads on faces *between* a part and the fluid
+reference), maximum iterations, turbulence, scheme. Thermal loads on faces *between* a part and the fluid
 are ignored — that exchange is computed; use them on the enclosure's outer faces.
 
 ---
@@ -547,8 +594,8 @@ Two methods:
 - **Direct search** — Latin hypercube then a bounded Nelder–Mead search on real solves only; 20–40
   evaluations for 1–3 parameters. Robust for jumpy responses.
 
-The results table marks the best feasible design ★ and designs that violate a constraint. In Static
-Structural, curved-surface fitting makes dimensions change smoothly; other analyses mesh in whole
+The results table marks the best feasible design ★ and designs that violate a constraint. In the
+analyses with curved-surface fitting (§6), dimensions change smoothly; other analyses mesh in whole
 cubes, so dimensions change in steps of one element — use a finer element size for finer answers.
 
 ### What-if (surrogates)
@@ -571,7 +618,8 @@ starts a new model from it so you can re-apply loads and verify the stresses, or
 your CAD as a starting point.
 
 MCP tools: `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`,
-`fit_surrogate`, `predict_surrogate`, `topology_optimize`, `get_study`, `apply_design`.
+`fit_surrogate`, `predict_surrogate`, `topology_optimize`, `get_study`, `apply_design`; for boards,
+`pcb_dc` (DC drop and current density in a net).
 
 ---
 
@@ -581,9 +629,23 @@ MCP tools: `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `
 
 | Mode | Behaviour |
 |---|---|
-| **Auto** (default) | Small and medium models use the CPU direct solver (fast and exact). Large models that need the iterative solver (≥ 50 000 unknowns) run on the GPU. |
+| **Auto** (default) | Small models use the CPU direct solver (fast and exact). Static structural, thermal-stress and steady-thermal models from 60 000 elements use **multigrid CG** on the CPU (below). Other large iterative solves (modal, transient, …, ≥ 50 000 unknowns) run on the GPU. |
 | **CPU** | Never use the GPU. |
-| **GPU** | Every linear solve on the GPU. |
+| **GPU** | Every linear solve on the GPU (Jacobi-preconditioned CG). |
+
+**Multigrid** (static structural, thermal stress, steady thermal, ≥ 60 000 elements, Compute Auto or
+CPU): the structural stiffness is never assembled — it is applied element by element — and a
+geometric multigrid on the voxel lattice (2h, 4h, … with Galerkin coarse operators) preconditions CG,
+so a solve needs 10–25 iterations instead of thousands. Steady thermal uses an aggregation multigrid.
+That is what lets these analyses go to 2 million elements:
+
+| Model | Multigrid (CPU) | Jacobi-PCG CPU | Jacobi-PCG GPU |
+|---|---|---|---|
+| Structural plate, 1.07 M unknowns | 3.0 s (≈ 20 iterations) | 59.8 s (2425) | 10.4 s |
+| Thermal plate, 275 k unknowns | 0.54 s | 1.9 s | 0.36 s |
+| Structural plate, 1.78 M elements / 5.6 M unknowns | ≈ 26 s (19 iterations) | — (too large to assemble) | — |
+
+The Jacobi-PCG GPU numbers below remain what **Compute ▸ GPU** does.
 
 The GPU solver runs double-precision conjugate gradients as Vulkan compute shaders and gives the same
 answers as the CPU. Measured on an RTX 3070 Ti Laptop vs Ryzen 9 6900HS:
@@ -720,7 +782,7 @@ and frequency, Euler buckling, dynamic amplification, harmonic resonance amplifi
 spectrum vs. static 1 g, random-vibration RMS (Miles), Basquin/Goodman fatigue life, Steinberg damage,
 WR-340 guide wavelength, closed-cavity power balance, microwave-heating energy balance, plastic yielding, conduction, transient heating,
 thermal expansion, parallel-plate capacitance, resistance and Joule heating, ring-coil field,
-laminar channel flow, plate-with-hole stress concentration and Lamé thick cylinder (boundary-fitted), lid-driven cavity (Ghia), natural convection (de Vahl Davis), LVEL turbulent
+laminar channel flow, plate-with-hole stress concentration, Lamé thick cylinder, pipe-wall conduction and rod bending frequency (boundary-fitted), lid-driven cavity (Ghia), natural convection (de Vahl Davis), LVEL turbulent
 channel friction (Dean), conjugate-heat energy balance, contact reactions) and the GPU solver against the CPU. See the README for the
 numbers.
 
@@ -734,10 +796,10 @@ numbers.
 | "face selector … matched nothing" | The face name doesn't exist in the current mesh; hover faces or use `list_faces`. Enclosure faces only exist in analyses that use the enclosure. |
 | "needs an enclosure" | Add **GEOMETRY ▸ Enclosure** (electrostatic, magnetostatic, CFD). |
 | "thermal model needs at least one Temperature or Convection" | Give the heat a way out. |
-| CFD "did not reach a steady state" | Lower the velocity, enlarge the domain, or accept a snapshot of unsteady flow. |
+| CFD "did not reach a steady state" / "SIMPLE did not settle" | The flow is unsteady: the projection method's time average is shown. Lower the velocity, enlarge the domain, or raise max iterations for a longer average. |
 | Nonlinear step "did not converge" | The structure is collapsing at that load; reduce the load or add support. |
 | Results look blocky | Use a smaller element size. |
-| Solve is slow | Use a coarser mesh first; try Compute ▸ GPU for very large models; ■ Stop cancels a running job. |
+| Solve is slow | Use a coarser mesh first; keep Compute on Auto so large structural/thermal models use multigrid; ■ Stop cancels a running job. |
 | "internal error during solve: …" | A solver hit an unexpected condition; the model is unchanged and you can keep working. Please report it with the project file. |
 | "the solution is not finite" | A part has no stiffness/conductivity, extreme property values, or a load on a part not connected to a support. |
 | GPU warning in results | GPU unavailable or out of memory; the CPU was used instead. |
@@ -750,15 +812,16 @@ numbers.
 
 ## 17. Limitations
 
-- Voxel meshes stair-step curved surfaces in all analyses except Static Structural, which fits them (see §6).
+- Voxel meshes stair-step curved surfaces in buckling, plasticity, EM, CFD and topology optimisation;
+  structural, thermal, modal and vibration analyses fit them (see §6).
 - Magnetostatics uses nodal elements: very high permeability contrasts are approximate.
 - CFD is steady and incompressible; turbulence is the algebraic LVEL model (no k-ε / k-ω), and
   there is no thermal radiation between surfaces.
-- KiCad boards: copper is homogenised per cell for heat conduction only — trace resistance, current
-  density in traces, warpage from copper/FR-4 expansion mismatch and component 3D models are not
-  imported (components are boxes).
-- Full-wave EM: one frequency at a time, near fields only (no far-field / radiated-emission
-  transform, antenna gain or S-parameters yet), no sub-cell thin wires or PCB traces, μr = 1.
+- KiCad boards: copper is homogenised per cell for heat conduction; `pcb_dc` solves DC current per
+  net separately (no AC / skin effect). Warpage from copper/FR-4 expansion mismatch and component 3D
+  models are not imported (components are boxes).
+- Full-wave EM: one frequency at a time; far fields are free-space (no ground plane); no
+  S-parameters, sub-cell thin wires or PCB traces in the FDTD grid; μr = 1.
 - Not included: eddy currents and induction heating, contact between two deformable bodies,
   radiation heat transfer, phase change,
   temperature-dependent properties, strain-life (ε-N) and weld fatigue, acoustics, moving parts.

@@ -952,6 +952,38 @@ pub fn full_wave(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> R
     if s.pad == 0 && total_abs < 0.97 * s.power {
         res.warnings.push(format!("power balance: only {:.1}% of the input is absorbed in a closed cavity (expected ~100%) — results may not be converged", 100.0 * total_abs / s.power));
     }
+    if s.pad > 0 {
+        prog(0.97, "far field");
+        let ff = far_field(&s, &sol.re, &sol.im, scale)?;
+        let eta = (MU0 / EPS0).sqrt();
+        let d = 4.0 * std::f64::consts::PI * ff.umax / ff.prad.max(1e-300);
+        let gain = 4.0 * std::f64::consts::PI * ff.umax / s.power;
+        res.quantity("Radiated power (far field)", ff.prad, "W");
+        res.quantity("Radiation efficiency (radiated / input)", 100.0 * ff.prad / s.power, "%");
+        res.quantity("Power balance (radiated + absorbed) / input", 100.0 * (ff.prad + total_abs) / s.power, "%");
+        res.quantity("Max directivity", 10.0 * d.max(1e-12).log10(), "dBi");
+        res.quantity("Max gain", 10.0 * gain.max(1e-12).log10(), "dBi");
+        res.quantity("Max direction θ", ff.dir.0, "°");
+        res.quantity("Max direction φ", ff.dir.1, "°");
+        // rms field in the strongest direction: |E|rms = √(η U) / r
+        let dbuv = |r: f64| 20.0 * ((eta * ff.umax).sqrt() / r * 1e6).max(1e-12).log10();
+        let (e3, e10) = (dbuv(3.0), dbuv(10.0));
+        res.quantity("Field strength at 3 m (max direction, rms)", e3, "dBµV/m");
+        res.quantity("Field strength at 10 m (max direction, rms)", e10, "dBµV/m");
+        let fcc = fcc_class_b_3m(s.freq);
+        res.quantity("FCC Part 15 class B limit at 3 m", fcc, "dBµV/m");
+        res.quantity("Margin to FCC class B (negative = fails)", fcc - e3, "dB");
+        if let Some(c) = cispr32_class_b_10m(s.freq) {
+            res.quantity("CISPR 32 class B limit at 10 m", c, "dBµV/m");
+            res.quantity("Margin to CISPR 32 class B (negative = fails)", c - e10, "dB");
+        }
+        res.history = ff.cut.clone();
+        res.history_label = format!("directivity [dBi] vs θ [°] at φ = {:.0}°", ff.dir.1);
+        if ff.outside > 0 {
+            res.warnings.push(format!("{} cells of material lie within 2 cells of the enclosure boundary, outside the far-field surface: enlarge the enclosure so the far field includes them", ff.outside));
+        }
+        res.warnings.push("far field: free-space radiation of the model as driven (no ground plane, no antenna-height scan); EMI field strengths are estimates for pre-compliance, expect ±6 dB against a test site".into());
+    }
     if let Some(f) = &sol.fallback {
         res.warnings.push(f.clone());
     }
@@ -1009,4 +1041,191 @@ pub fn microwave_heating(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Resul
     }
     res.note = format!("{} — temperatures after {} s of heating", res.note, crate::results::float(model.analysis.end_time));
     Ok(())
+}
+
+// ------------------------------------------------------------------ far field (NTFF)
+
+#[derive(Clone, Copy, Default, Debug)]
+struct Cx {
+    re: f64,
+    im: f64,
+}
+impl Cx {
+    fn new(re: f64, im: f64) -> Cx {
+        Cx { re, im }
+    }
+    fn add(self, o: Cx) -> Cx {
+        Cx::new(self.re + o.re, self.im + o.im)
+    }
+    fn sub(self, o: Cx) -> Cx {
+        Cx::new(self.re - o.re, self.im - o.im)
+    }
+    fn mul(self, o: Cx) -> Cx {
+        Cx::new(self.re * o.re - self.im * o.im, self.re * o.im + self.im * o.re)
+    }
+    fn scale(self, s: f64) -> Cx {
+        Cx::new(self.re * s, self.im * s)
+    }
+    fn norm2(self) -> f64 {
+        self.re * self.re + self.im * self.im
+    }
+}
+type CV = [Cx; 3];
+fn cross_c(a: [f64; 3], b: CV) -> CV {
+    [b[2].scale(a[1]).sub(b[1].scale(a[2])), b[0].scale(a[2]).sub(b[2].scale(a[0])), b[1].scale(a[0]).sub(b[0].scale(a[1]))]
+}
+
+/// Far-field result of a radiating model.
+pub struct FarField {
+    /// radiated power [W]
+    pub prad: f64,
+    /// max radiation intensity [W/sr] and its direction (θ, φ) in degrees
+    pub umax: f64,
+    pub dir: (f64, f64),
+    /// directivity [dBi] vs θ in the plane φ = dir.1 (θ from 0 to 180°)
+    pub cut: Vec<(f64, f64)>,
+    /// cells of material outside the transform surface (should be 0)
+    pub outside: usize,
+}
+
+/// Near-to-far-field transform: equivalent currents J = n×H, M = −n×E on a box two cells inside
+/// the absorbing layer, radiation vectors N, L over the sphere, U = k²/(32π²η)(|L_φ+ηN_θ|²+|L_θ−ηN_φ|²).
+/// `scale` turns the raw phasors into V/m.
+pub fn far_field(s: &Setup, re: &[f32], im: &[f32], scale: f64) -> Result<FarField> {
+    if s.pad == 0 {
+        bail!("far field needs an open boundary");
+    }
+    let nn = s.nn;
+    let n1 = s.n1();
+    let (sy, sz) = (n1[0], n1[0] * n1[1]);
+    let h = s.h;
+    let omega = std::f64::consts::TAU * s.freq;
+    // discrete-time angular frequency (Yee leapfrog)
+    let wt = 2.0 / s.dt * (omega * s.dt / 2.0).sin();
+    let e = |c: usize, idx: usize| Cx::new(re[c * nn + idx] as f64 * scale, -(im[c * nn + idx] as f64) * scale);
+    // H = j curl E / (ω μ0), curl from the Yee update stencils
+    let hk = Cx::new(0.0, 1.0 / (wt * MU0 * h));
+    let hf = |c: usize, idx: usize| -> Cx {
+        let curl = match c {
+            0 => e(2, idx + sy).sub(e(2, idx)).sub(e(1, idx + sz).sub(e(1, idx))),
+            1 => e(0, idx + sz).sub(e(0, idx)).sub(e(2, idx + 1).sub(e(2, idx))),
+            _ => e(1, idx + 1).sub(e(1, idx)).sub(e(0, idx + sy).sub(e(0, idx))),
+        };
+        curl.mul(hk)
+    };
+    let m = 2usize;
+    let b0 = [s.pad + m; 3];
+    let b1 = [s.n[0] - s.pad - m, s.n[1] - s.pad - m, s.n[2] - s.pad - m];
+    if (0..3).any(|a| b1[a] < b0[a] + 2) {
+        bail!("the enclosure is too small for the far-field transform");
+    }
+    // material between the transform surface and the absorber
+    let mut outside = 0usize;
+    for k in s.pad..s.n[2] - s.pad {
+        for j in s.pad..s.n[1] - s.pad {
+            for i in s.pad..s.n[0] - s.pad {
+                let inside = i >= b0[0] && i < b1[0] && j >= b0[1] && j < b1[1] && k >= b0[2] && k < b1[2];
+                let c = s.cell(i, j, k);
+                if !inside && (s.cell_pec[c] || s.cell_eps[c] > 1.01 || s.cell_sig[c] > 1e-6) {
+                    outside += 1;
+                }
+            }
+        }
+    }
+    let centre = [0, 1, 2].map(|a| 0.5 * (b0[a] + b1[a]) as f64 * h);
+    // surface patches: position, J, M (per unit area), area
+    let mut patches: Vec<([f64; 3], CV, CV)> = Vec::new();
+    for a in 0..3 {
+        let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+        for (p, sign) in [(b0[a], -1.0), (b1[a], 1.0)] {
+            let mut nrm = [0.0; 3];
+            nrm[a] = sign;
+            for iu in b0[u]..b1[u] {
+                for iv in b0[v]..b1[v] {
+                    let node = |pa: usize, pu: usize, pv: usize| {
+                        let mut q = [0usize; 3];
+                        q[a] = pa;
+                        q[u] = pu;
+                        q[v] = pv;
+                        s.node(q[0], q[1], q[2])
+                    };
+                    let mut ev: CV = [Cx::default(); 3];
+                    ev[u] = e(u, node(p, iu, iv)).add(e(u, node(p, iu, iv + 1))).scale(0.5);
+                    ev[v] = e(v, node(p, iu, iv)).add(e(v, node(p, iu + 1, iv))).scale(0.5);
+                    let mut hv: CV = [Cx::default(); 3];
+                    hv[u] = hf(u, node(p - 1, iu, iv)).add(hf(u, node(p, iu, iv))).add(hf(u, node(p - 1, iu + 1, iv))).add(hf(u, node(p, iu + 1, iv))).scale(0.25);
+                    hv[v] = hf(v, node(p - 1, iu, iv)).add(hf(v, node(p, iu, iv))).add(hf(v, node(p - 1, iu, iv + 1))).add(hf(v, node(p, iu, iv + 1))).scale(0.25);
+                    let j = cross_c(nrm, hv);
+                    let mm = cross_c(nrm, ev).map(|x| x.scale(-1.0));
+                    let mut pos = [0.0; 3];
+                    pos[a] = p as f64 * h - centre[a];
+                    pos[u] = (iu as f64 + 0.5) * h - centre[u];
+                    pos[v] = (iv as f64 + 0.5) * h - centre[v];
+                    patches.push((pos, j, mm));
+                }
+            }
+        }
+    }
+    let k0 = omega / C0;
+    let eta = (MU0 / EPS0).sqrt();
+    let da = h * h;
+    let (nth, nph) = (60usize, 72usize);
+    let (dth, dph) = (std::f64::consts::PI / nth as f64, std::f64::consts::TAU / nph as f64);
+    let dirs: Vec<(f64, f64)> = (0..nth).flat_map(|i| (0..nph).map(move |j| ((i as f64 + 0.5) * dth, j as f64 * dph))).collect();
+    let u_of = |th: f64, ph: f64| -> f64 {
+        let (st, ct, sp, cp) = (th.sin(), th.cos(), ph.sin(), ph.cos());
+        let rhat = [st * cp, st * sp, ct];
+        let (mut nv, mut lv): (CV, CV) = ([Cx::default(); 3], [Cx::default(); 3]);
+        for (pos, j, mm) in &patches {
+            let phase = k0 * (rhat[0] * pos[0] + rhat[1] * pos[1] + rhat[2] * pos[2]);
+            let w = Cx::new(phase.cos(), phase.sin()).scale(da);
+            for c in 0..3 {
+                nv[c] = nv[c].add(j[c].mul(w));
+                lv[c] = lv[c].add(mm[c].mul(w));
+            }
+        }
+        let th_c = |x: CV| x[0].scale(ct * cp).add(x[1].scale(ct * sp)).sub(x[2].scale(st));
+        let ph_c = |x: CV| x[1].scale(cp).sub(x[0].scale(sp));
+        let (nt, np, lt, lp) = (th_c(nv), ph_c(nv), th_c(lv), ph_c(lv));
+        k0 * k0 / (32.0 * std::f64::consts::PI.powi(2) * eta) * (lp.add(nt.scale(eta)).norm2() + lt.sub(np.scale(eta)).norm2())
+    };
+    let us: Vec<f64> = dirs.par_iter().map(|&(t, p)| u_of(t, p)).collect();
+    let prad: f64 = dirs.iter().zip(&us).map(|(&(t, _), u)| u * t.sin() * dth * dph).sum();
+    let (imax, umax) = us.iter().enumerate().fold((0, 0.0f64), |b, (i, &u)| if u > b.1 { (i, u) } else { b });
+    let (tmax, pmax) = dirs[imax];
+    let cut: Vec<(f64, f64)> = (0..=60)
+        .into_par_iter()
+        .map(|i| {
+            let t = (i as f64 * 3.0).to_radians();
+            let u = u_of(t, pmax);
+            (i as f64 * 3.0, 10.0 * (4.0 * std::f64::consts::PI * u / prad.max(1e-300)).max(1e-12).log10())
+        })
+        .collect();
+    Ok(FarField { prad, umax, dir: (tmax.to_degrees(), pmax.to_degrees()), cut, outside })
+}
+
+/// FCC Part 15 class B radiated limit at 3 m [dBµV/m] (quasi-peak below 1 GHz, average above).
+pub fn fcc_class_b_3m(f: f64) -> f64 {
+    let mhz = f / 1e6;
+    if mhz < 88.0 {
+        40.0
+    } else if mhz < 216.0 {
+        43.5
+    } else if mhz < 960.0 {
+        46.0
+    } else {
+        54.0
+    }
+}
+
+/// CISPR 32 class B radiated limit at 10 m [dBµV/m], 30 MHz–1 GHz (None above).
+pub fn cispr32_class_b_10m(f: f64) -> Option<f64> {
+    let mhz = f / 1e6;
+    if mhz < 30.0 || mhz > 1000.0 {
+        None
+    } else if mhz <= 230.0 {
+        Some(30.0)
+    } else {
+        Some(37.0)
+    }
 }

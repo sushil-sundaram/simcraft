@@ -53,7 +53,6 @@ pub fn transient_thermal_with(model: &Model, mesh: &crate::mesh::Mesh, elem_q: O
 
 /// Transient thermal on the selected elements only (`sel`); other nodes stay at the initial temperature.
 pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Option<&[f64]>, sel: Option<&[bool]>, prog: Prog, res: &mut Results) -> Result<()> {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let st = &model.analysis;
     let steps = st.time_steps.clamp(1, 5000);
@@ -71,8 +70,9 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
             continue;
         }
         let m = &mesh.materials[mesh.elem_mat[e] as usize];
-        for &n in en {
-            cap[n as usize] += m.density * m.specific_heat * h * h * h / 8.0;
+        let nv = crate::fem::node_volumes(mesh, e);
+        for (a, &n) in en.iter().enumerate() {
+            cap[n as usize] += m.density * m.specific_heat * nv[a];
         }
     }
     let mut a = sys.k.clone();
@@ -128,13 +128,13 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
 // ------------------------------------------------------------------ transient structural
 
 fn lumped_mass(mesh: &crate::mesh::Mesh) -> Vec<f64> {
-    let h = mesh.h * 1e-3;
     let mut m = vec![0.0; mesh.nodes.len() * 3];
     for (e, en) in mesh.elems.iter().enumerate() {
-        let me = mesh.materials[mesh.elem_mat[e] as usize].density * h * h * h / 8.0;
-        for &n in en {
+        let rho = mesh.materials[mesh.elem_mat[e] as usize].density;
+        let nv = crate::fem::node_volumes(mesh, e);
+        for (a, &n) in en.iter().enumerate() {
             for c in 0..3 {
-                m[n as usize * 3 + c] += me;
+                m[n as usize * 3 + c] += rho * nv[a];
             }
         }
     }

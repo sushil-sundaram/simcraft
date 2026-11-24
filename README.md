@@ -33,6 +33,8 @@ the local-AI Planner and MCP setup.
 tracks, pads, filled zones and vias become a board body with homogenised **orthotropic** copper
 conductivity per cell; footprints become component boxes named by reference with optional power in W.
 Solve it with thermal analyses (convection) or conjugate heat transfer (real airflow).
+`pcb_dc` solves the DC current in one net between two pads: resistance, IR drop, Joule power, peak
+current density and the IPC-2221 temperature rise of each track, with vias between layers.
 
 ## Analyses
 
@@ -53,7 +55,7 @@ Solve it with thermal analyses (convection) or conjugate heat transfer (real air
 | | **DC Current Flow** | potential, current density, Joule heat, resistance |
 | | **Thermal-Electric** (Joule heating) | all of the above + temperature |
 | | **Magnetostatic** (coils, permanent magnets, iron) | B and H fields, stored energy |
-| | **Full-Wave EM (FDTD, GPU)** — metal cavity or open boundary, RF ports | E field, absorbed power density, SAR, power per body |
+| | **Full-Wave EM (FDTD, GPU)** — metal cavity or open boundary, RF ports | E field, absorbed power density, SAR, power per body; open boundary: far-field pattern, directivity/gain, radiated power, EMI field at 3 m / 10 m vs FCC / CISPR 32 class B |
 | | **Microwave Heating** (full-wave EM → transient heat) | temperature history, hot/cold spots, absorbed power |
 | Fluids | **Fluid Flow (CFD)** — steady incompressible, laminar or LVEL turbulence, moving walls | velocity (+ components), pressure, drag/lift, flow rates, Reynolds number |
 | | **Conjugate Heat Transfer** — flow + temperature in fluid and parts, forced or natural convection | part temperatures, heat carried by the flow, energy balance |
@@ -67,15 +69,20 @@ density, permanent magnet, velocity inlet, pressure outlet.
 
 ### Numerics
 - **Elements**: 8-node hexahedra with incompatible modes (no shear locking); nodal recovery of stresses.
-- **Linear solvers**: direct sparse Cholesky (RCM + skyline) when the estimated work is small, otherwise
-  Jacobi-preconditioned conjugate gradients on the GPU (Vulkan compute, f64, ELLPACK) or CPU.
-  SOLVE ▸ Compute: Auto / CPU / GPU.
+- **Linear solvers**: direct sparse Cholesky (RCM + skyline) when the estimated work is small; for
+  large static structural / thermal models, CG preconditioned by geometric multigrid — matrix-free
+  fine level (coloured element-by-element products), Galerkin coarse levels on the voxel lattice,
+  Chebyshev smoothing — up to 2 M elements (5.6 M unknowns in ~26 s); otherwise Jacobi-preconditioned
+  CG on the GPU (Vulkan compute, f64, ELLPACK) or CPU. SOLVE ▸ Compute: Auto / CPU / GPU.
 - **Modal / buckling**: shifted subspace iteration with Rayleigh–Ritz.
 - **Transient**: implicit Euler (thermal), Newmark average acceleration + Rayleigh damping (structural).
 - **Plasticity**: J2 radial return, Newton–Raphson with the consistent tangent, load stepping.
 - **Contact**: active-set iteration on compression-only supports.
 - **Magnetostatics**: nodal vector potential, Coulomb-gauged curl-curl + div-div form.
-- **CFD**: MAC staggered grid, Chorin projection to steady state, factored pressure Poisson.
+- **CFD**: collocated finite volumes; implicit SIMPLE (hybrid advection, Rhie–Chow face velocities,
+  pressure correction by PCG preconditioned with a refreshed factor / aggregation multigrid), with
+  Chorin projection (time-averaging) as the fallback for unsteady flows; LVEL turbulence, Boussinesq
+  buoyancy, conjugate heat transfer.
 - **Mesher**: voxel hex mesh of a CSG model (add/subtract boxes, cylinders, spheres, closed STL files).
 
 ### Validation (`cargo test --release`)
@@ -109,17 +116,23 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | Natural convection, Ra 10⁴ / 10⁵: Nusselt | 2.257 / 4.556 | 2.243 / 4.519 (de Vahl Davis) |
 | Turbulent channel (LVEL), Re 20 000: dp/dx | 94.6 Pa/m | 83.2 Pa/m (Dean) |
 | Conjugate heat balance, heated block in a duct | 0.200 W carried | 0.200 W generated |
+| Cantilever, 115 k elements (multigrid CG, 10 iterations): tip deflection | 1.4381 mm | 1.4478 mm (Timoshenko) |
 | Plate with hole (d/W = 0.1) Kt, h = r/10 | fitted 3.08 / voxel 3.31 | 3.03 (Heywood) |
 | Lamé thick cylinder, bore hoop stress | fitted 16.95 / voxel 21.05 MPa | 16.67 MPa |
+| Radial conduction through a pipe wall (quarter, ri 10 / ro 20 mm) | fitted 354.43 / voxel 369.46 W | 354.43 W (2πkLΔT / ln(ro/ri)) |
+| Cantilever round rod (r 3.3, L 80 mm), first bending frequency | fitted 722.5 / voxel 764.5 Hz | 728.2 Hz (Euler–Bernoulli) |
 | Surrogate what-if (6 designs), beam deflection at unseen thickness | 0.65 % from the real solve | — |
 | Bayesian optimisation, lightest beam with σ ≤ 150 MPa | 10 solves, σ = 149.1 MPa | direct search: 24 evaluations |
+| KiCad DC: 2 A in a 20 mm × 0.5 mm track (35 µm) | 18.80 mΩ | 18.67 mΩ (ρL/wt) |
+| KiCad DC: track → via → track | 19.83 mΩ | 19.84 mΩ (series) |
+| Short dipole far field (FDTD + NTFF): directivity, radiated/input | 1.516, 96.1 % (41 cells/λ) → 99.8 % (82) | 1.5, 100 % |
 | KiCad board, copper plane in-plane conduction | 0.034817 W | 0.034861 W (Σkt) |
 | KiCad board, through-plane with 40 thermal vias | 3.0395 W | 3.0333 W (series ∥ via copper) |
 
 ### Limitations
-- Static Structural fits curved and off-grid surfaces (pillow layer + node projection, ~2 % peak
-  stress); other analyses use stair-stepped voxels — global results stay accurate, peaks on curved
-  surfaces read high.
+- Structural, thermal, modal and vibration analyses fit curved and off-grid surfaces (pillow layer +
+  node projection, ~2 % peak stress); buckling, plasticity, EM, CFD and topology use stair-stepped
+  voxels — global results stay accurate, peaks on curved surfaces read high.
 - Magnetostatics uses nodal elements: very high permeability contrasts (iron cores) are approximate.
 - CFD is steady and incompressible with laminar or LVEL turbulence (the solver reports when the flow
   does not settle, e.g. vortex shedding); no thermal radiation.
@@ -167,7 +180,7 @@ Tools: `get_model`, `new_model`, `add_box`, `add_cylinder`, `add_sphere`, `impor
 `get_help`, `edit_body`, `edit_load`, `transform_body`, `undo`, `redo`, `cancel`, `import_kicad`, `add_port`, `clear_loads`, `set_mesh`, `solve`, `fatigue_life`, `make_report`, `get_results`, `probe`, `set_display` (incl. cut plane, dark mode),
 `render_image` (PNG), `screenshot_gui` (PNG of the window), `export_vtk`, `save_project`, `open_project`,
 `get_selection`, `get_status`, `launch_gui`, `plan_simulation`, `get_plan`, `set_plan_step`,
-`list_local_models`, `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`, `fit_surrogate`, `predict_surrogate`,
+`list_local_models`, `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`, `fit_surrogate`, `predict_surrogate`, `pcb_dc`,
 `topology_optimize`, `get_study`, `apply_design`.
 
 Example prompt: *"In SimCraft, make a 150×30×8 mm aluminium bracket with two 6 mm holes, fix the left
