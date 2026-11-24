@@ -164,7 +164,7 @@ Tools: `get_model`, `new_model`, `add_box`, `add_cylinder`, `add_sphere`, `impor
 `add_fixed_support`, `add_displacement`, `add_compression_only_support`, `add_symmetry`, `add_force`,
 `add_pressure`, `add_gravity`, `add_temperature`, `add_heat_flux`, `add_convection`, `add_heat_generation`,
 `add_voltage`, `add_current`, `add_coil`, `add_magnet`, `add_inlet`, `add_outlet`, `add_moving_wall`, `remove_load`,
-`import_kicad`, `add_port`, `clear_loads`, `set_mesh`, `solve`, `fatigue_life`, `make_report`, `get_results`, `probe`, `set_display` (incl. cut plane, dark mode),
+`get_help`, `edit_body`, `edit_load`, `transform_body`, `undo`, `redo`, `cancel`, `import_kicad`, `add_port`, `clear_loads`, `set_mesh`, `solve`, `fatigue_life`, `make_report`, `get_results`, `probe`, `set_display` (incl. cut plane, dark mode),
 `render_image` (PNG), `screenshot_gui` (PNG of the window), `export_vtk`, `save_project`, `open_project`,
 `get_selection`, `get_status`, `launch_gui`, `plan_simulation`, `get_plan`, `set_plan_step`,
 `list_local_models`, `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`, `fit_surrogate`, `predict_surrogate`,

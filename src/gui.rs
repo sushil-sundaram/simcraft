@@ -120,6 +120,7 @@ enum Tab {
     Solve,
     Results,
     Optimize,
+    Help,
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -524,6 +525,212 @@ fn line_chart(ui: &mut egui::Ui, p: &Pal, series: &[(String, Vec<(f64, f64)>)], 
     }
 }
 
+/// Help window state.
+#[derive(Default)]
+struct HelpUi {
+    open: bool,
+    section: usize,
+    query: String,
+    focus_search: bool,
+    scroll_top: bool,
+}
+
+/// Inline markdown (**bold**, `code`, [link](url)) as a wrapped layout job; `hl` is highlighted.
+fn md_inline(text: &str, p: &Pal, size: f32, hl: &str) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let base = TextFormat { font_id: FontId::proportional(size), color: p.text.gamma_multiply(0.86), ..Default::default() };
+    let mut segs: Vec<(String, TextFormat)> = Vec::new();
+    let (mut bold, mut code, mut ital) = (false, false, false);
+    let mut cur = String::new();
+    let fmt = |bold: bool, code: bool, ital: bool| {
+        let mut f = base.clone();
+        f.italics = ital;
+        if code {
+            f.font_id = FontId::monospace(size - 1.0);
+            f.background = p.border.gamma_multiply(0.5);
+            f.color = p.text;
+        } else if bold {
+            f.color = p.text;
+            f.font_id = FontId::proportional(size + 0.3);
+        }
+        f
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if !code && c == '*' && chars.get(i + 1) == Some(&'*') {
+            segs.push((std::mem::take(&mut cur), fmt(bold, code, ital)));
+            bold = !bold;
+            i += 2;
+            continue;
+        }
+        if c == '`' {
+            segs.push((std::mem::take(&mut cur), fmt(bold, code, ital)));
+            code = !code;
+            i += 1;
+            continue;
+        }
+        // *italic*: a single star touching a word on the inside
+        if !code && c == '*' && chars.get(i + 1).is_some_and(|n| if ital { true } else { !n.is_whitespace() }) && (ital || i == 0 || !chars[i - 1].is_alphanumeric()) {
+            segs.push((std::mem::take(&mut cur), fmt(bold, code, ital)));
+            ital = !ital;
+            i += 1;
+            continue;
+        }
+        if !code && c == '[' {
+            if let Some(close) = chars[i..].iter().position(|&x| x == ']').map(|k| i + k) {
+                if chars.get(close + 1) == Some(&'(') {
+                    if let Some(end) = chars[close..].iter().position(|&x| x == ')').map(|k| close + k) {
+                        segs.push((std::mem::take(&mut cur), fmt(bold, code, ital)));
+                        let mut f = fmt(bold, code, ital);
+                        f.color = p.accent;
+                        segs.push((chars[i + 1..close].iter().collect(), f));
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        cur.push(c);
+        i += 1;
+    }
+    segs.push((cur, fmt(bold, code, ital)));
+    let mut job = LayoutJob::default();
+    let hl_l = hl.to_lowercase();
+    for (t, f) in segs.into_iter().filter(|s| !s.0.is_empty()) {
+        if hl_l.len() < 2 {
+            job.append(&t, 0.0, f);
+            continue;
+        }
+        // highlight every occurrence of the search text
+        let low = t.to_lowercase();
+        let mut last = 0;
+        for (pos, _) in low.match_indices(&hl_l) {
+            if pos < last || !t.is_char_boundary(pos) || !t.is_char_boundary(pos + hl_l.len()) {
+                continue;
+            }
+            job.append(&t[last..pos], 0.0, f.clone());
+            let mut h = f.clone();
+            h.background = Color32::from_rgba_unmultiplied(250, 200, 60, 110);
+            job.append(&t[pos..pos + hl_l.len()], 0.0, h);
+            last = pos + hl_l.len();
+        }
+        job.append(&t[last..], 0.0, f);
+    }
+    job
+}
+
+/// Render a markdown section body: paragraphs, bullets, numbered lists, tables and code blocks.
+fn render_md(ui: &mut egui::Ui, p: &Pal, md: &str, hl: &str) {
+    let lines: Vec<&str> = md.lines().collect();
+    let mut i = 0;
+    let wrap = |ui: &mut egui::Ui, job: egui::text::LayoutJob| {
+        ui.add(egui::Label::new(job).wrap());
+    };
+    while i < lines.len() {
+        let line = lines[i];
+        let t = line.trim();
+        if t.is_empty() {
+            ui.add_space(6.0);
+            i += 1;
+            continue;
+        }
+        if t.chars().all(|c| c == '-') && t.len() >= 3 {
+            ui.separator();
+            i += 1;
+            continue;
+        }
+        if t.starts_with("```") {
+            let mut code = Vec::new();
+            i += 1;
+            while i < lines.len() && !lines[i].trim_start().starts_with("```") {
+                code.push(lines[i]);
+                i += 1;
+            }
+            i += 1;
+            egui::Frame::new().fill(p.border.gamma_multiply(0.35)).corner_radius(6.0).inner_margin(8.0).show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(code.join("\n")).monospace().size(12.5)).wrap());
+            });
+            ui.add_space(4.0);
+            continue;
+        }
+        if t.starts_with('|') {
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            while i < lines.len() && lines[i].trim().starts_with('|') {
+                let cells: Vec<String> = lines[i].trim().trim_matches('|').split('|').map(|c| c.trim().to_string()).collect();
+                if !cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ':') && !c.is_empty()) {
+                    rows.push(cells);
+                }
+                i += 1;
+            }
+            let ncol = rows.iter().map(|r| r.len()).max().unwrap_or(1);
+            // column widths in proportion to their (capped) text length
+            let lens: Vec<f32> = (0..ncol).map(|k| rows.iter().map(|r| r.get(k).map(|c| c.chars().count()).unwrap_or(0)).max().unwrap_or(1).clamp(6, 60) as f32).collect();
+            let total: f32 = lens.iter().sum();
+            let avail = ui.available_width() - 14.0 * ncol as f32 - 8.0;
+            let widths: Vec<f32> = lens.iter().map(|l| (avail * l / total).max(60.0)).collect();
+            egui::Grid::new(ui.next_auto_id()).striped(true).num_columns(ncol).spacing(vec2(14.0, 4.0)).show(ui, |ui| {
+                for (ri, row) in rows.iter().enumerate() {
+                    for (k, c) in row.iter().enumerate() {
+                        let txt = if ri == 0 { format!("**{c}**") } else { c.clone() };
+                        let w = widths.get(k).copied().unwrap_or(80.0);
+                        ui.vertical(|ui| {
+                            ui.set_width(w);
+                            ui.add(egui::Label::new(md_inline(&txt, p, 12.5, hl)).wrap());
+                        });
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(4.0);
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let bullet = t.strip_prefix("- ").or_else(|| t.strip_prefix("* "));
+        let numbered = t.split_once(". ").filter(|(n, _)| !n.is_empty() && n.len() <= 3 && n.chars().all(|c| c.is_ascii_digit()));
+        if bullet.is_some() || numbered.is_some() {
+            let (mark, mut text) = match (bullet, numbered) {
+                (Some(b), _) => ("•".to_string(), b.to_string()),
+                (_, Some((n, rest))) => (format!("{n}."), rest.to_string()),
+                _ => unreachable!(),
+            };
+            i += 1;
+            // continuation lines of this item
+            while i < lines.len() {
+                let nt = lines[i].trim();
+                let nind = lines[i].len() - lines[i].trim_start().len();
+                if nt.is_empty() || nt.starts_with("- ") || nt.starts_with("* ") || nt.starts_with('|') || nt.starts_with("```") || nind <= indent || nt.split_once(". ").is_some_and(|(n, _)| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty()) {
+                    break;
+                }
+                text.push(' ');
+                text.push_str(nt);
+                i += 1;
+            }
+            ui.horizontal_top(|ui| {
+                ui.add_space(8.0 + indent as f32 * 6.0);
+                ui.label(RichText::new(mark).color(p.accent));
+                wrap(ui, md_inline(&text, p, 13.5, hl));
+            });
+            continue;
+        }
+        // paragraph: join lines until a blank line or another block
+        let mut text = t.to_string();
+        i += 1;
+        while i < lines.len() {
+            let nt = lines[i].trim();
+            let numbered_next = nt.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.len() <= 3 && n.chars().all(|c| c.is_ascii_digit()));
+            if nt.is_empty() || nt.starts_with("- ") || nt.starts_with("* ") || nt.starts_with('|') || nt.starts_with("```") || nt.starts_with('#') || numbered_next {
+                break;
+            }
+            text.push(' ');
+            text.push_str(nt);
+            i += 1;
+        }
+        wrap(ui, md_inline(&text, p, 13.5, hl));
+    }
+}
+
 /// An action that discards the current model; asks first when there are unsaved changes.
 #[derive(Clone, Debug)]
 enum Pending {
@@ -553,6 +760,7 @@ pub struct SimApp {
     /// material editor: (material it is based on, editable fields incl. name)
     mat_edit: Option<(String, Value)>,
     show_chart: bool,
+    help: HelpUi,
     probe_mode: bool,
     /// probed nodes, with the results revision they belong to
     probes: Vec<(u32, u64)>,
@@ -725,6 +933,7 @@ impl SimApp {
             xform: ("move".into(), [10.0, 0.0, 0.0], 3, 0, 0.0, true),
             mat_edit: None,
             show_chart: false,
+            help: HelpUi::default(),
             probe_mode: false,
             probes: Vec::new(),
             allow_close: false,
@@ -1587,7 +1796,7 @@ impl SimApp {
         let p = self.p;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 18.0;
-            for (t, name) in [(Tab::Geometry, "GEOMETRY"), (Tab::Material, "MATERIAL"), (Tab::Setup, "SETUP"), (Tab::Mesh, "MESH"), (Tab::Solve, "SOLVE"), (Tab::Results, "RESULTS"), (Tab::Optimize, "OPTIMIZE")] {
+            for (t, name) in [(Tab::Geometry, "GEOMETRY"), (Tab::Material, "MATERIAL"), (Tab::Setup, "SETUP"), (Tab::Mesh, "MESH"), (Tab::Solve, "SOLVE"), (Tab::Results, "RESULTS"), (Tab::Optimize, "OPTIMIZE"), (Tab::Help, "HELP")] {
                 let on = self.tab == t;
                 let r = ui.add(egui::Label::new(RichText::new(name).size(12.0).strong().color(if on { p.accent } else { p.weak })).sense(Sense::click()));
                 if on {
@@ -1776,7 +1985,12 @@ impl SimApp {
                 group(ui, &p, "SETTINGS", |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(4.0);
-                        ui.label(RichText::new(kind.label()).strong());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(kind.label()).strong());
+                            if ui.small_button("ⓘ").on_hover_text("How this analysis works (F1)").clicked() {
+                                self.open_help(crate::help::analysis_topic(&kind.key()));
+                            }
+                        });
                         let st = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.clone();
                         let num = |ui: &mut egui::Ui, label: &str, v: f64, key: &str, speed: f64, suffix: &str, run: &mut Vec<(String, f64)>| {
                             let mut x = v;
@@ -1940,6 +2154,54 @@ impl SimApp {
                 }
             }
             Tab::Results => self.results_ribbon(ui),
+            Tab::Help => {
+                let mut open: Option<&str> = None;
+                group(ui, &p, "GUIDE", |ui| {
+                    if tool(ui, &p, "📖", "User guide", Some(p.accent), true) {
+                        open = Some("2");
+                    }
+                    if tool(ui, &p, "🚀", "Quick start", None, true) {
+                        open = Some("3");
+                    }
+                    if tool(ui, &p, "🔎", "Search", None, true) {
+                        open = Some("");
+                    }
+                    if tool(ui, &p, "⌨", "Shortcuts", None, true) {
+                        open = Some("Keyboard and mouse");
+                    }
+                });
+                group(ui, &p, "REFERENCE", |ui| {
+                    for (icon, label, topic) in [("⚙", "Analyses", "7"), ("📌", "Loads", "8"), ("📊", "Results", "9"), ("📏", "Units", "14"), ("🩺", "Problems", "16"), ("⚠", "Limits", "17")] {
+                        if tool(ui, &p, icon, label, None, true) {
+                            open = Some(topic);
+                        }
+                    }
+                });
+                group(ui, &p, "AI & SCRIPTS", |ui| {
+                    if tool(ui, &p, "🤖", "MCP / Python", None, true) {
+                        open = Some("13");
+                    }
+                    if tool(ui, &p, "✨", "Planner", None, true) {
+                        open = Some("12");
+                    }
+                });
+                group(ui, &p, "ABOUT", |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("SimCraft {}", env!("CARGO_PKG_VERSION"))).strong());
+                        ui.label(RichText::new("MIT licence · F1 opens help anywhere").small().color(p.weak));
+                        ui.hyperlink_to(RichText::new("github.com/sushil-sundaram/simcraft").small(), "https://github.com/sushil-sundaram/simcraft");
+                    });
+                });
+                if let Some(t) = open {
+                    if t.is_empty() {
+                        self.help.open = true;
+                        self.help.focus_search = true;
+                    } else {
+                        self.open_help(t);
+                    }
+                }
+            }
             Tab::Optimize => {
                 let kind = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.kind;
                 group(ui, &p, "STUDIES", |ui| {
@@ -2171,6 +2433,136 @@ impl SimApp {
                 }
             });
         });
+    }
+
+    fn open_help(&mut self, topic: &str) {
+        if let Some(i) = crate::help::find(topic) {
+            self.help.section = i;
+        }
+        self.help.query.clear();
+        self.help.open = true;
+        self.help.scroll_top = true;
+    }
+
+    /// Help for what the user is looking at (F1).
+    fn context_help(&mut self) {
+        let kind = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.analysis.kind;
+        let topic = match self.tab {
+            Tab::Geometry => "4".to_string(),
+            Tab::Material => "5".to_string(),
+            Tab::Mesh => "6".to_string(),
+            Tab::Setup if self.form != Form::None => "8".to_string(),
+            Tab::Setup | Tab::Solve => crate::help::analysis_topic(&kind.key()).to_string(),
+            Tab::Results => "9".to_string(),
+            Tab::Optimize => "10".to_string(),
+            Tab::Help => "2".to_string(),
+        };
+        self.open_help(&topic);
+    }
+
+    /// The user guide inside the app: contents / search on the left, the section on the right.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.help.open {
+            return;
+        }
+        let p = self.p;
+        let secs = crate::help::sections();
+        let mut open = true;
+        let mut goto: Option<usize> = None;
+        egui::Window::new(RichText::new("📖 SimCraft help").strong())
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_size(vec2(940.0, 660.0))
+            .default_pos(ctx.content_rect().center() - vec2(470.0, 330.0))
+            .frame(egui::Frame::window(&ctx.global_style()).fill(p.card).inner_margin(12))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.help.query).hint_text("🔎 Search the guide (e.g. heat sink, fatigue, undo)").desired_width(380.0));
+                    if self.help.focus_search {
+                        r.request_focus();
+                        self.help.focus_search = false;
+                    }
+                    if !self.help.query.is_empty() && ui.small_button("✖").clicked() {
+                        self.help.query.clear();
+                    }
+                    ui.label(RichText::new("F1 opens the topic for what you are doing").small().color(p.weak));
+                });
+                ui.separator();
+                let h = ui.available_height();
+                ui.horizontal_top(|ui| {
+                    // contents or search results
+                    ui.vertical(|ui| {
+                        ui.set_width(250.0);
+                        egui::ScrollArea::vertical().id_salt("help-toc").max_height(h).show(ui, |ui| {
+                            if self.help.query.trim().len() >= 2 {
+                                let hits = crate::help::search(&self.help.query, 25);
+                                if hits.is_empty() {
+                                    ui.label(RichText::new("No matches").color(p.weak));
+                                }
+                                for (i, _, snip) in hits {
+                                    let on = self.help.section == i;
+                                    if ui.selectable_label(on, RichText::new(&secs[i].title).strong()).clicked() {
+                                        goto = Some(i);
+                                    }
+                                    ui.label(RichText::new(snip).small().color(p.weak));
+                                    ui.add_space(4.0);
+                                }
+                            } else {
+                                for (i, s) in secs.iter().enumerate().filter(|(_, s)| s.level >= 2) {
+                                    let on = crate::help::span(self.help.section).contains(&i) && (s.level == 3 || i == self.help.section) || i == self.help.section;
+                                    let txt = if s.level == 2 { RichText::new(&s.title).strong() } else { RichText::new(&s.title).small() };
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(if s.level == 3 { 14.0 } else { 0.0 });
+                                        if ui.selectable_label(on, txt).clicked() {
+                                            goto = Some(i);
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    // the section with its subsections
+                    ui.vertical(|ui| {
+                        let mut sa = egui::ScrollArea::vertical().id_salt(("help-body", self.help.section)).max_height(h - 34.0).auto_shrink([false, false]);
+                        if self.help.scroll_top {
+                            sa = sa.vertical_scroll_offset(0.0);
+                            self.help.scroll_top = false;
+                        }
+                        let hl = self.help.query.trim().to_string();
+                        sa.show(ui, |ui| {
+                            for j in crate::help::span(self.help.section) {
+                                let s = &secs[j];
+                                let size = match s.level {
+                                    1 => 22.0,
+                                    2 => 19.0,
+                                    _ => 15.5,
+                                };
+                                ui.add_space(if j == self.help.section { 0.0 } else { 10.0 });
+                                ui.label(RichText::new(&s.title).size(size).strong().color(p.text));
+                                ui.add_space(4.0);
+                                render_md(ui, &p, &s.body, &hl);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let chapters: Vec<usize> = secs.iter().enumerate().filter(|(_, s)| s.level <= 2).map(|(i, _)| i).collect();
+                            let cur = chapters.iter().rposition(|&c| c <= self.help.section).unwrap_or(0);
+                            if ui.add_enabled(cur > 0, egui::Button::new("◀ Previous")).clicked() {
+                                goto = Some(chapters[cur - 1]);
+                            }
+                            if ui.add_enabled(cur + 1 < chapters.len(), egui::Button::new("Next ▶")).clicked() {
+                                goto = Some(chapters[cur + 1]);
+                            }
+                        });
+                    });
+                });
+            });
+        if let Some(i) = goto {
+            self.help.section = i;
+            self.help.scroll_top = true;
+        }
+        self.help.open = open;
     }
 
     /// History chart of the current results (transient, harmonic sweep, load steps, convergence).
@@ -3585,6 +3977,13 @@ impl eframe::App for SimApp {
                     self.mat_edit = Some((mat.name.clone(), v));
                 }
             }
+            if let Some(t) = q["help"].as_str() {
+                self.open_help(t);
+            }
+            if let Some(t) = q["help_search"].as_str() {
+                self.help.open = true;
+                self.help.query = t.to_string();
+            }
             if q["show_chart"].as_bool() == Some(true) {
                 self.show_chart = true;
             }
@@ -3598,12 +3997,17 @@ impl eframe::App for SimApp {
                     "results" => Tab::Results,
                     "material" => Tab::Material,
                     "solve" => Tab::Solve,
+                    "help" => Tab::Help,
                     _ => self.tab,
                 };
             }
         }
         self.safety_ui(&ctx);
         self.chart_window(&ctx);
+        self.help_window(&ctx);
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.context_help();
+        }
         self.material_window(&ctx);
         if !ctx.egui_wants_keyboard_input() {
             let (undo, redo) = ctx.input_mut(|i| {
