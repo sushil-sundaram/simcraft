@@ -4,6 +4,7 @@ pub mod assistant;
 pub mod bridge;
 pub mod cfd;
 pub mod dynamics;
+pub mod elastic_mg;
 pub mod fatigue;
 pub mod fdtd;
 pub mod fem;

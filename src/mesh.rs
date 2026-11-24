@@ -75,6 +75,19 @@ pub fn dir_normal(dir: u8) -> V3 {
 }
 
 pub const MAX_CELLS: usize = 400_000;
+/// Largest mesh for analyses solved by multigrid (static structural, thermal stress, steady
+/// thermal): the stiffness is applied matrix-free, so memory grows only with the node count.
+pub const MAX_CELLS_LARGE: usize = 2_000_000;
+
+/// Element limit for the model's current analysis.
+pub fn max_cells_for(model: &crate::model::Model) -> usize {
+    use crate::model::AnalysisType::*;
+    match model.analysis.kind {
+        FullWaveEm | MicrowaveHeating => MAX_CELLS_FDTD,
+        StaticStructural | ThermalStress | SteadyThermal => MAX_CELLS_LARGE,
+        _ => MAX_CELLS,
+    }
+}
 
 pub fn auto_size(bodies: &[Body], with_enclosure: bool) -> f64 {
     let (lo, hi) = domain_bounds(bodies, with_enclosure);

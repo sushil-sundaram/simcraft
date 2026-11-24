@@ -2,8 +2,9 @@
 //!
 //! * Structural: 8-node hexahedra with Wilson-Taylor incompatible modes (no shear locking in
 //!   bending), statically condensed to 24x24.
-//! * Thermal: 8-node conduction hexahedra, convection / flux / generation loads.
-//! * Modal: lumped mass, shifted subspace iteration with Rayleigh-Ritz.
+//! * Thermal: 8-node conduction hexahedra (general hexes on boundary-fitted surfaces), convection /
+//!   flux / generation loads with true face areas and consistent nodal volumes.
+//! * Modal: lumped mass (consistent nodal volumes), shifted subspace iteration with Rayleigh-Ritz.
 //!
 //! Internally everything is SI (m, N, Pa, K).
 
@@ -339,6 +340,81 @@ pub fn center_grads() -> Vec<[f64; 3]> {
     (0..8).map(|i| dn_dxi(i, [0.0; 3]).map(|v| 2.0 * v)).collect()
 }
 
+/// Conduction matrices of a general (boundary-fitted) hex in SI coordinates: isotropic
+/// ∫ ∇Nᵢ·∇Nⱼ dV and the per-axis parts ∫ ∂Nᵢ/∂x_a ∂Nⱼ/∂x_a dV (multiply by k in W/m·K).
+pub fn hex_conduction_general(x: &[[f64; 3]; 8]) -> [Vec<f64>; 4] {
+    let mut k = [vec![0.0; 64], vec![0.0; 64], vec![0.0; 64], vec![0.0; 64]];
+    for xi in gauss_points() {
+        let (jinv, det) = inv3(&jacobian(x, xi));
+        let g: Vec<[f64; 3]> = (0..8).map(|i| map_grad(&jinv, dn_dxi(i, xi))).collect();
+        for a in 0..8 {
+            for b in 0..8 {
+                for ax in 0..3 {
+                    let v = g[a][ax] * g[b][ax] * det;
+                    k[0][a * 8 + b] += v;
+                    k[ax + 1][a * 8 + b] += v;
+                }
+            }
+        }
+    }
+    k
+}
+
+/// Shape-function gradients [1/m] at the centre of a general hex (SI coordinates).
+pub fn center_grads_general(x: &[[f64; 3]; 8]) -> Vec<[f64; 3]> {
+    let (jinv, _) = inv3(&jacobian(x, [0.0; 3]));
+    (0..8).map(|i| map_grad(&jinv, dn_dxi(i, [0.0; 3]))).collect()
+}
+
+/// Consistent nodal volumes ∫ Nᵢ dV [m³] of an element (h³/8 each for a cube); used for lumped
+/// mass, heat capacity and volumetric loads so boundary-fitted elements carry their true volume.
+pub fn node_volumes(mesh: &Mesh, e: usize) -> [f64; 8] {
+    if !mesh.is_fitted(e) {
+        return [(mesh.h * 1e-3).powi(3) / 8.0; 8];
+    }
+    let x = elem_xyz_m(mesh, e);
+    let mut v = [0.0; 8];
+    for xi in gauss_points() {
+        let det = inv3(&jacobian(&x, xi)).1;
+        for (i, vi) in v.iter_mut().enumerate() {
+            let s = sgn(i);
+            *vi += (1.0 + s[0] * xi[0]) * (1.0 + s[1] * xi[1]) * (1.0 + s[2] * xi[2]) / 8.0 * det;
+        }
+    }
+    v
+}
+
+/// Consistent nodal shares of a surface face: vector ∫ Nᵢ n dA [m²] (outward) and scalar
+/// ∫ Nᵢ dA [m²]. Exact for any bilinear (possibly boundary-fitted) quad; h²/4 on a voxel face.
+pub fn face_shares(mesh: &Mesh, fi: usize) -> ([V3; 4], [f64; 4]) {
+    let face = &mesh.faces[fi];
+    let h = mesh.h * 1e-3;
+    if mesh.fitted.is_empty() {
+        return ([scale(dir_normal(face.dir), h * h / 4.0); 4], [h * h / 4.0; 4]);
+    }
+    let q = face.nodes.map(|n| mesh.nodes[n as usize].map(|v| v * 1e-3));
+    let mut sh = [[0.0; 3]; 4];
+    let mut sa = [0.0; 4];
+    for (a, b) in [(-GP, -GP), (GP, -GP), (GP, GP), (-GP, GP)] {
+        let nn = [(1.0 - a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 + b) / 4.0, (1.0 - a) * (1.0 + b) / 4.0];
+        let da = [-(1.0 - b) / 4.0, (1.0 - b) / 4.0, (1.0 + b) / 4.0, -(1.0 + b) / 4.0];
+        let db = [-(1.0 - a) / 4.0, -(1.0 + a) / 4.0, (1.0 + a) / 4.0, (1.0 - a) / 4.0];
+        let mut ta = [0.0; 3];
+        let mut tb = [0.0; 3];
+        for k in 0..4 {
+            ta = add(ta, scale(q[k], da[k]));
+            tb = add(tb, scale(q[k], db[k]));
+        }
+        let dav = cross(ta, tb); // outward area density (nodes CCW from outside)
+        let dan = dot(dav, dav).sqrt();
+        for k in 0..4 {
+            sh[k] = add(sh[k], scale(dav, nn[k]));
+            sa[k] += dan * nn[k];
+        }
+    }
+    (sh, sa)
+}
+
 pub fn face_nodes(mesh: &Mesh, faces: &[u32]) -> Vec<u32> {
     let mut v: Vec<u32> = faces.iter().flat_map(|&f| mesh.faces[f as usize].nodes).collect();
     v.sort_unstable();
@@ -456,6 +532,15 @@ pub fn assemble_structural(model: &Model, mesh: &Mesh, prog: Prog) -> Result<(As
             None => k.add_element(en, &units[mesh.elem_mat[e] as usize].k, m.youngs_modulus_gpa * 1e9 * h),
         }
     }
+    let (fixed, support_nodes, contact, owner) = structural_bcs(model, mesh)?;
+    Ok((Assembled { k, fixed, support_nodes, contact, owner }, units))
+}
+
+/// Supports of a structural model: prescribed dofs, support node sets, compression-only dofs and
+/// the owning load of every constrained dof.
+#[allow(clippy::type_complexity)]
+pub fn structural_bcs(model: &Model, mesh: &Mesh) -> Result<(Vec<Option<f64>>, Vec<(u32, String, Vec<u32>)>, Vec<(usize, f64)>, Vec<u32>)> {
+    let nn = mesh.nodes.len();
     let mut fixed = vec![None; nn * 3];
     let mut support_nodes = Vec::new();
     let mut contact = Vec::new();
@@ -509,7 +594,84 @@ pub fn assemble_structural(model: &Model, mesh: &Mesh, prog: Prog) -> Result<(As
     }
     contact.sort_unstable_by_key(|c| c.0);
     contact.dedup_by_key(|c| c.0);
-    Ok((Assembled { k, fixed, support_nodes, contact, owner }, units))
+    Ok((fixed, support_nodes, contact, owner))
+}
+
+/// Smallest structural model (elements) solved with matrix-free multigrid CG instead of the
+/// assembled direct / Jacobi-PCG solvers (`SIMCRAFT_MG=0/1` overrides).
+pub const MG_MIN_ELEMENTS: usize = 60_000;
+
+fn use_multigrid(model: &Model, mesh: &Mesh) -> bool {
+    match std::env::var("SIMCRAFT_MG").ok().as_deref() {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    mesh.elems.len() >= MG_MIN_ELEMENTS && model.analysis.compute != crate::gpu::ComputeMode::Gpu
+}
+
+/// Static solve with matrix-free multigrid CG (never assembles K).
+fn structural_mg(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog, res: &mut Results) -> Result<()> {
+    let nn = mesh.nodes.len();
+    let (mut fixed, support_nodes, contact, owner) = structural_bcs(model, mesh)?;
+    if support_nodes.is_empty() {
+        bail!("no supports defined: add a Fixed Support (or Displacement) so the part cannot fly away");
+    }
+    let units: Vec<ElemUnit> = mesh.materials.iter().map(|m| hex_elastic_unit(m.poisson_ratio)).collect();
+    let f_ext = external_forces(model, mesh, temps)?;
+    let fscale = f_ext.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-30);
+    let mut u = vec![0.0; nn * 3];
+    let mut pass = 0;
+    loop {
+        prog(0.03, "building multigrid");
+        let t0 = Instant::now();
+        let mg = crate::elastic_mg::ElasticMg::new(mesh, &units, fixed.iter().map(|g| g.is_some()).collect())?;
+        let ug: Vec<f64> = fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
+        let t1 = Instant::now();
+        let its = mg.solve(&f_ext, &ug, &mut u, 1e-8, 500, &|p| prog(0.08 + 0.82 * p, "solving (multigrid CG)"))?;
+        if std::env::var_os("SIMCRAFT_PROFILE").is_some() {
+            eprintln!("[mg] setup {:.2} s, {its} CG iterations {:.2} s", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
+        }
+        crate::sparse::SOLVE_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        res.info.solver = format!("matrix-free multigrid CG ({} levels, CPU)", mg.levels());
+        res.info.iterations += its;
+        if contact.is_empty() {
+            break;
+        }
+        let mut ku = vec![0.0; nn * 3];
+        mg.fine.apply_k(&u, &mut ku);
+        let mut changed = 0;
+        for &(dof, sgn) in &contact {
+            if fixed[dof].is_some() {
+                if (ku[dof] - f_ext[dof]) * sgn > 1e-7 * fscale {
+                    fixed[dof] = None;
+                    changed += 1;
+                }
+            } else if u[dof] * sgn > 1e-12 {
+                fixed[dof] = Some(0.0);
+                changed += 1;
+            }
+        }
+        pass += 1;
+        prog(0.5, &format!("contact iteration {pass}: {changed} change(s)"));
+        if changed == 0 {
+            break;
+        }
+        if pass >= 60 {
+            res.warnings.push("contact status did not fully settle after 60 iterations".into());
+            break;
+        }
+    }
+    if !contact.is_empty() {
+        let open = contact.iter().filter(|(d, _)| fixed[*d].is_none()).count();
+        res.quantity("Contact nodes in contact", (contact.len() - open) as f64, "");
+        res.quantity("Contact nodes lifted off", open as f64, "");
+    }
+    res.info.dofs = nn * 3;
+    prog(0.92, "computing stresses");
+    structural_post(model, mesh, &u, temps, &units, &fixed, &f_ext, &support_nodes, &owner, res);
+    prog(1.0, "done");
+    Ok(())
 }
 
 /// External nodal forces [N]: forces, pressure, gravity and thermal-expansion loads.
@@ -541,30 +703,8 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
             Load::Pressure { faces, value_mpa } => {
                 for &fi in &mesh.resolve_faces(faces)? {
                     let face = &mesh.faces[fi as usize];
-                    // consistent nodal loads ∫ Nᵢ p n dA (exact for any bilinear, possibly
-                    // boundary-fitted quad; equals pA/4 per node on a square face)
-                    let shares: [V3; 4] = if mesh.fitted.is_empty() {
-                        [scale(dir_normal(face.dir), h * h / 4.0); 4]
-                    } else {
-                        let q = face.nodes.map(|n| mesh.nodes[n as usize].map(|v| v * 1e-3));
-                        let mut sh = [[0.0; 3]; 4];
-                        for (a, b) in [(-GP, -GP), (GP, -GP), (GP, GP), (-GP, GP)] {
-                            let nn = [(1.0 - a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 + b) / 4.0, (1.0 - a) * (1.0 + b) / 4.0];
-                            let da = [-(1.0 - b) / 4.0, (1.0 - b) / 4.0, (1.0 + b) / 4.0, -(1.0 + b) / 4.0];
-                            let db = [-(1.0 - a) / 4.0, -(1.0 + a) / 4.0, (1.0 + a) / 4.0, (1.0 - a) / 4.0];
-                            let mut ta = [0.0; 3];
-                            let mut tb = [0.0; 3];
-                            for k in 0..4 {
-                                ta = add(ta, scale(q[k], da[k]));
-                                tb = add(tb, scale(q[k], db[k]));
-                            }
-                            let dav = cross(ta, tb); // outward area density (nodes CCW from outside)
-                            for k in 0..4 {
-                                sh[k] = add(sh[k], scale(dav, nn[k]));
-                            }
-                        }
-                        sh
-                    };
+                    // consistent nodal loads ∫ Nᵢ p n dA
+                    let shares = face_shares(mesh, fi as usize).0;
                     let p = value_mpa * 1e6;
                     for (k, &n) in face.nodes.iter().enumerate() {
                         for c in 0..3 {
@@ -575,10 +715,11 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
             }
             Load::Gravity { acceleration } => {
                 for (e, en) in mesh.elems.iter().enumerate() {
-                    let m = mesh.materials[mesh.elem_mat[e] as usize].density * mesh.elem_volume(e) * 1e-9 / 8.0;
-                    for &n in en {
+                    let rho = mesh.materials[mesh.elem_mat[e] as usize].density;
+                    let nv = node_volumes(mesh, e);
+                    for (a, &n) in en.iter().enumerate() {
                         for c in 0..3 {
-                            f[n as usize * 3 + c] += acceleration[c] * m;
+                            f[n as usize * 3 + c] += acceleration[c] * rho * nv[a];
                         }
                     }
                 }
@@ -603,6 +744,9 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
 }
 
 pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog, res: &mut Results) -> Result<()> {
+    if use_multigrid(model, mesh) {
+        return structural_mg(model, mesh, temps, prog, res);
+    }
     let nn = mesh.nodes.len();
     let (asm, units) = assemble_structural(model, mesh, prog)?;
     let Assembled { k: k0, mut fixed, support_nodes, contact, owner } = asm;
@@ -855,7 +999,7 @@ pub fn heat_source(model: &Model, mesh: &Mesh, load: &Load) -> Result<(Vec<usize
     if els.is_empty() {
         bail!("heat generation: the body has no cells in the mesh (too small for the element size?)");
     }
-    let vox = els.len() as f64 * (mesh.h * 1e-3).powi(3);
+    let vox: f64 = els.iter().map(|&e| mesh.elem_volume(e) * 1e-9).sum();
     if let Some(p) = power {
         return Ok((els, p / vox));
     }
@@ -906,12 +1050,19 @@ pub fn assemble_thermal_sel(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, 
     };
     let mut k = NodeSparse::new(nn, &elems, 1);
     let kax = hex_conduction_unit_axes();
+    let general: Vec<Option<[Vec<f64>; 4]>> = (0..mesh.elems.len()).into_par_iter().map(|e| (on(e) && mesh.is_fitted(e)).then(|| hex_conduction_general(&elem_xyz_m(mesh, e)))).collect();
     for (e, en) in mesh.elems.iter().enumerate() {
         if on(e) {
             let m = &mesh.materials[mesh.elem_mat[e] as usize];
-            match m.conductivity_xyz {
-                None => k.add_element(en, &ku, m.thermal_conductivity * h),
-                Some(kk) => {
+            match (&general[e], m.conductivity_xyz) {
+                (Some(g), None) => k.add_element(en, &g[0], m.thermal_conductivity),
+                (Some(g), Some(kk)) => {
+                    for a in 0..3 {
+                        k.add_element(en, &g[a + 1], kk[a]);
+                    }
+                }
+                (None, None) => k.add_element(en, &ku, m.thermal_conductivity * h),
+                (None, Some(kk)) => {
                     for a in 0..3 {
                         k.add_element(en, &kax[a], kk[a] * h);
                     }
@@ -950,15 +1101,17 @@ pub fn assemble_thermal_sel(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, 
             }
             Load::HeatFlux { faces, value } => {
                 for &fi in &mesh.resolve_faces(faces)? {
-                    for &n in &mesh.faces[fi as usize].nodes {
-                        f[n as usize] += value * h * h / 4.0;
+                    let a = face_shares(mesh, fi as usize).1;
+                    for (j, &n) in mesh.faces[fi as usize].nodes.iter().enumerate() {
+                        f[n as usize] += value * a[j];
                     }
                 }
             }
             Load::Convection { faces, coefficient, ambient } => {
                 for &fi in &mesh.resolve_faces(faces)? {
-                    for &n in &mesh.faces[fi as usize].nodes {
-                        let c = coefficient * h * h / 4.0;
+                    let a = face_shares(mesh, fi as usize).1;
+                    for (j, &n) in mesh.faces[fi as usize].nodes.iter().enumerate() {
+                        let c = coefficient * a[j];
                         conv_diag[n as usize] += c;
                         f[n as usize] += c * ambient;
                     }
@@ -968,8 +1121,9 @@ pub fn assemble_thermal_sel(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, 
             Load::HeatGeneration { .. } => {
                 let (els, q) = heat_source(model, mesh, &it.load)?;
                 for e in els {
-                    for &n in &mesh.elems[e] {
-                        f[n as usize] += q * h * h * h / 8.0;
+                    let nv = node_volumes(mesh, e);
+                    for (a, &n) in mesh.elems[e].iter().enumerate() {
+                        f[n as usize] += q * nv[a];
                     }
                 }
             }
@@ -978,8 +1132,9 @@ pub fn assemble_thermal_sel(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, 
     }
     if let Some(q) = elem_q {
         for (e, en) in mesh.elems.iter().enumerate().filter(|(e, _)| on(*e)) {
-            for &n in en {
-                f[n as usize] += q[e] * h * h * h / 8.0;
+            let nv = node_volumes(mesh, e);
+            for (a, &n) in en.iter().enumerate() {
+                f[n as usize] += q[e] * nv[a];
             }
         }
     }
@@ -1002,9 +1157,22 @@ pub fn thermal(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, prog: Prog, r
     let mut f = sys.f.clone();
     k.apply_dirichlet(&sys.fixed, &mut f);
     let mut t: Vec<f64> = sys.fixed.iter().map(|g| g.unwrap_or(model.analysis.reference_temperature)).collect();
-    let solver = Solver::new(&k)?;
-    let its = solver.solve(&k, &f, &mut t, 1e-10, &|p| prog(0.05 + 0.85 * p, "solving thermal (PCG)"))?;
-    res.info.solver = solver.name().to_string();
+    let its = if use_multigrid(model, mesh) {
+        // aggregation multigrid on the voxel lattice (nodes placed by position)
+        prog(0.03, "building multigrid");
+        let t0 = Instant::now();
+        let coords: Vec<[u32; 3]> = mesh.nodes.iter().map(|p| [0, 1, 2].map(|k| ((p[k] - mesh.origin[k]) / mesh.h).round().max(0.0) as u32)).collect();
+        let mg = crate::multigrid::Multigrid::new(&k, &coords)?;
+        let its = mg.solve(&f, &mut t, 1e-10, 2000)?;
+        crate::sparse::SOLVE_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        res.info.solver = format!("multigrid CG ({} levels, CPU)", mg.levels());
+        its
+    } else {
+        let solver = Solver::new(&k)?;
+        let its = solver.solve(&k, &f, &mut t, 1e-10, &|p| prog(0.05 + 0.85 * p, "solving thermal (PCG)"))?;
+        res.info.solver = solver.name().to_string();
+        its
+    };
     res.info.dofs += nn;
     res.info.iterations += its;
     thermal_post(mesh, &t, Some(&sys), res);
@@ -1028,20 +1196,32 @@ pub fn thermal_post(mesh: &Mesh, t: &[f64], sys: Option<&ThermalSystem>, res: &m
         let kc = mat.thermal_conductivity;
         let kv = [mat.k_axis(0), mat.k_axis(1), mat.k_axis(2)];
         let ortho = mat.conductivity_xyz.is_some();
+        let fitted = mesh.is_fitted(e);
+        let xm = fitted.then(|| elem_xyz_m(mesh, e));
+        let gk = xm.as_ref().map(hex_conduction_general);
+        let gc = xm.as_ref().map(center_grads_general);
         let mut grad = [0.0; 3];
         for a in 0..8 {
             for c in 0..3 {
-                grad[c] += cg[a][c] * t[en[a] as usize] / h;
+                grad[c] += match &gc {
+                    Some(g) => g[a][c] * t[en[a] as usize],
+                    None => cg[a][c] * t[en[a] as usize] / h,
+                };
             }
         }
+        // element matrices: general (SI, no h factor) or the scaled unit cube
+        let (iso, axes, scale_h): (&[f64], [&[f64]; 3], f64) = match &gk {
+            Some(g) => (&g[0], [&g[1], &g[2], &g[3]], 1.0),
+            None => (&ku, [&kax[0], &kax[1], &kax[2]], h),
+        };
         for a in 0..8 {
             let n = en[a] as usize;
             let s: f64 = if ortho {
-                (0..3).map(|ax| kv[ax] * (0..8).map(|b| kax[ax][a * 8 + b] * t[en[b] as usize]).sum::<f64>()).sum()
+                (0..3).map(|ax| kv[ax] * (0..8).map(|b| axes[ax][a * 8 + b] * t[en[b] as usize]).sum::<f64>()).sum()
             } else {
-                kc * (0..8).map(|b| ku[a * 8 + b] * t[en[b] as usize]).sum::<f64>()
+                kc * (0..8).map(|b| iso[a * 8 + b] * t[en[b] as usize]).sum::<f64>()
             };
-            fint[n] += s * h;
+            fint[n] += s * scale_h;
             for c in 0..3 {
                 acc[n][c] += -kv[c] * grad[c];
             }
@@ -1098,7 +1278,6 @@ pub fn modal(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
 
 /// Lowest `nmodes` modes by shifted subspace iteration with Rayleigh–Ritz.
 pub fn modal_basis(model: &Model, mesh: &Mesh, nmodes: usize, prog: Prog, res: &mut Results) -> Result<ModalBasis> {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let n = nn * 3;
     let (asm, _) = assemble_structural(model, mesh, prog)?;
@@ -1110,10 +1289,11 @@ pub fn modal_basis(model: &Model, mesh: &Mesh, nmodes: usize, prog: Prog, res: &
     }
     let mut mdiag = vec![0.0; n];
     for (e, en) in mesh.elems.iter().enumerate() {
-        let m = mesh.materials[mesh.elem_mat[e] as usize].density * h * h * h / 8.0;
-        for &a in en {
+        let rho = mesh.materials[mesh.elem_mat[e] as usize].density;
+        let nv = node_volumes(mesh, e);
+        for (j, &a) in en.iter().enumerate() {
             for c in 0..3 {
-                mdiag[a as usize * 3 + c] += m;
+                mdiag[a as usize * 3 + c] += rho * nv[j];
             }
         }
     }

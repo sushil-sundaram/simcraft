@@ -132,3 +132,47 @@ fn lvel_turbulent_channel_friction() {
     let tau = cf * 0.5 * 1.204 * ub * ub;
     close("developed dp/dx (Dean)", dpdx, tau / (two_delta / 2.0), 0.15);
 }
+
+/// 3-D forced-convection electronics box (~90k cells, LVEL, two 5 W parts): SIMPLE vs the
+/// projection method. `cargo test --release --test cfd scheme_benchmark -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn scheme_benchmark() {
+    for scheme in ["projection", "simple"] {
+        let c = new_core();
+        call(&c, "add_enclosure", json!({"min": [0, 0, 0], "size": [200, 120, 60]}));
+        call(&c, "add_box", json!({"name": "Board", "min": [20, 10, 10], "size": [160, 100, 2], "material": "FR-4 (PCB laminate)"}));
+        call(&c, "add_box", json!({"name": "U1", "min": [60, 40, 12], "size": [20, 20, 6], "material": "Aluminum 6061-T6"}));
+        call(&c, "add_box", json!({"name": "U2", "min": [120, 60, 12], "size": [20, 20, 10], "material": "Aluminum 6061-T6"}));
+        call(&c, "set_analysis", json!({"type": "conjugate_heat_transfer", "turbulence": "lvel", "max_iterations": 30000, "cfd_scheme": scheme}));
+        call(&c, "set_mesh", json!({"element_size_mm": 2.5}));
+        call(&c, "add_inlet", json!({"faces": ["Enclosure.xmin"], "velocity": 1.5, "temperature": 25}));
+        call(&c, "add_outlet", json!({"faces": ["Enclosure.xmax"], "pressure": 0}));
+        call(&c, "add_heat_generation", json!({"body": "U1", "power": 5}));
+        call(&c, "add_heat_generation", json!({"body": "U2", "power": 5}));
+        let t = std::time::Instant::now();
+        let r = call(&c, "solve", json!({}));
+        println!("{scheme}: {:.1} s, {} iterations, {} cells — {}", t.elapsed().as_secs_f64(), r["info"]["iterations"], r["info"]["elements"], r["info"]["solver"]);
+        println!("   U1 max {:.2} °C, U2 max {:.2} °C, carried {:.3} W, drag {:.4e} N, warnings {}", q(&r, "Max temperature of U1"), q(&r, "Max temperature of U2"), q(&r, "Heat carried away"), q(&r, "Force on solids X"), r["warnings"]);
+    }
+}
+
+/// Cylinder in a channel at Re 200 (2-D): the wake sheds vortices, so a steady scheme cannot
+/// settle — `auto` must still return a sensible (time-averaged) answer with a warning.
+#[test]
+#[ignore]
+fn unsteady_wake_fallback() {
+    let c = new_core();
+    let u = 200.0 * NU_AIR / 0.02;
+    call(&c, "add_enclosure", json!({"min": [0, 0, 0], "size": [300, 1, 100]}));
+    call(&c, "add_cylinder", json!({"name": "Pin", "base": [80, 0, 50], "axis": "y", "radius": 10, "height": 1}));
+    call(&c, "set_analysis", json!({"type": "fluid", "max_iterations": 20000}));
+    call(&c, "set_mesh", json!({"element_size_mm": 1}));
+    call(&c, "add_inlet", json!({"faces": ["Enclosure.xmin"], "velocity": u}));
+    call(&c, "add_outlet", json!({"faces": ["Enclosure.xmax"], "pressure": 0}));
+    call(&c, "add_symmetry", json!({"faces": ["Enclosure.ymin", "Enclosure.ymax", "Enclosure.zmin", "Enclosure.zmax"]}));
+    let t = std::time::Instant::now();
+    let r = call(&c, "solve", json!({}));
+    let cd = q(&r, "Force on solids X") / (0.5 * 1.204 * u * u * 0.02 * 0.001);
+    println!("{:.1} s, {} iterations — {}\n  Cd {cd:.3}, warnings {}", t.elapsed().as_secs_f64(), r["info"]["iterations"], r["info"]["solver"], r["warnings"]);
+}
