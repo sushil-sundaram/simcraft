@@ -275,7 +275,10 @@ SimCraft fills the model with equal cubes ("voxels") of the **element size** you
   solve). Budget roughly 4 GB of memory per million elements.
 - **Fit curved surfaces** (structural, thermal, modal and vibration, on by default — SOLVE ▸ settings, MCP
   `set_analysis boundary_fit`): holes, fillets, spheres, STL surfaces and faces that do not line up
-  with the grid are fitted exactly. SimCraft keeps the cubes whose corners are all inside the part,
+  with the grid are fitted exactly. Flat faces aligned with an axis are meshed exactly by moving the
+  nearest grid plane onto them (those elements become slightly longer or shorter boxes), so a 4 mm
+  plate meshes the same way at 1.25, 1.5 or 2 mm. For curved and oblique faces SimCraft keeps the
+  cubes whose corners are all inside the part,
   adds one layer of elements on every curved or off-grid surface and moves its outer nodes onto the
   true surface (the voxel nodes underneath step in to make room); faces that already lie on the grid
   are left alone. Those elements are general hexahedra (incompatible modes with Taylor's correction,

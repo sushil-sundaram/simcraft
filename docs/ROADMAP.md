@@ -40,7 +40,7 @@ Sizes: **S** ≈ one session, **M** ≈ 2–3, **L** ≈ 4–6, **XL** > 6.
 | # | Item | Size | Why first / depends on | State |
 |---|---|---|---|---|
 | P2.0 | Benchmark suite (`simcraft bench`): 24 reference cases, mesh sweeps, HTML report, other-solver column, CI gate | S–M | measures every later item against references and Ansys | done |
-| P2.0b | Fix the fitting defects the benchmark found (see below) | S–M | wrong peak stresses at some element sizes; must come before more physics | planned |
+| P2.0b | Fix the fitting defects the benchmark found (see below) | S–M | wrong peak stresses at some element sizes; must come before more physics | done |
 | P2.1 | Thermal radiation + temperature-dependent properties | M | biggest missing physics for electronics cooling; self-contained | planned |
 | P2.2 | Path plots, cylindrical results, mesh-convergence assistant | S–M | cheap, raises trust in every result | planned |
 | P2.3 | STEP import (spike first) | M–L | unlocks real CAD parts and assemblies | planned |
@@ -61,7 +61,17 @@ HTML report with error-vs-unknowns plots and observed convergence order; `--comp
 solver's results from a `--template` file; `--quick` (19 cases, one size) runs in CI as an accuracy
 gate and uploads the report. Every Phase 2 item adds its cases here.
 
-### P2.0b Fitting defects found by the first full benchmark run (S–M)
+### P2.0b Fitting defects found by the first full benchmark run (S–M) — done
+
+Fixed in `mesh.rs` / `geometry.rs`: (a) grid lines within 0.45 h of an axis-aligned flat face (box
+faces, cylinder caps, flat STL faces) snap onto it, so flat faces are meshed exactly and only curved
+or oblique surfaces get a pillow layer; (b) fitting is decided per face, not per surface; (c) flat
+surfaces only take voxel faces facing the same way; (d) the pillow inward step only adds missing
+thickness; (e) STL node inside-tests count surface nodes as inside (the top layer of STL parts was
+being dropped); (f) bodies the conservative voxelisation would drop keep centre-inside voxels with a
+warning. Results: Lamé within 1.8–3.7 % at every size from 0.7 to 2 mm (was +79 to +132 % at
+1.25 / 1.5 / 1.75 mm); NAFEMS LE1 0.5–1.2 % at 50 / 35 / 25 mm (was 33–73 %; plain voxels 14 %);
+all 27 benchmark metrics pass with no convergence anomalies. Original findings:
 
 1. **Curved fitted surface meeting an off-grid flat face.** When a part's thickness is not a whole
    number of cells, the flat top/bottom get a fitted layer too, and where it meets a fitted curved

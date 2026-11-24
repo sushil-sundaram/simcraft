@@ -310,6 +310,13 @@ impl Shape {
             let d = (dot(pn, n) * sign).clamp(-1.0, 1.0);
             if d < -0.2 { f64::INFINITY } else { dist + h * (1.0 - d) }
         };
+        // flat axis-aligned surfaces only take voxel faces that face the same way: a staircase face
+        // perpendicular to a plane belongs to the curved or other flat surface it steps along, even
+        // when it is close to the plane (thin layers next to a snapped grid plane)
+        let flat = |dist: f64, pn: V3| {
+            let d = (dot(pn, n) * sign).clamp(-1.0, 1.0);
+            if d < 0.5 { f64::INFINITY } else { dist + h * (1.0 - d) }
+        };
         match self {
             Shape::Box { min, size } => {
                 let mut best = (0, f64::INFINITY);
@@ -325,7 +332,7 @@ impl Shape {
                     }
                     let mut pn = [0.0; 3];
                     pn[a] = if i % 2 == 0 { -1.0 } else { 1.0 };
-                    let s = score(d2.sqrt(), pn);
+                    let s = flat(d2.sqrt(), pn);
                     if s < best.1 {
                         best = (i, s);
                     }
@@ -351,8 +358,8 @@ impl Shape {
                 down[a] = -1.0;
                 let mut up = [0.0; 3];
                 up[a] = 1.0;
-                let bottom = score((t * t + dr_out * dr_out).sqrt(), down);
-                let top = score(((t - height).powi(2) + dr_out * dr_out).sqrt(), up);
+                let bottom = flat((t * t + dr_out * dr_out).sqrt(), down);
+                let top = flat(((t - height).powi(2) + dr_out * dr_out).sqrt(), up);
                 let mut best = (0, side);
                 if bottom < best.1 {
                     best = (1, bottom);
@@ -389,7 +396,9 @@ impl Shape {
                     if dist - h > best.1 {
                         continue;
                     }
-                    let s = score(dist, d.normals[i]);
+                    let nn = d.normals[i];
+                    let axis_flat = nn.iter().any(|c| c.abs() > 0.999);
+                    let s = if axis_flat { flat(dist, nn) } else { score(dist, nn) };
                     if s < best.1 {
                         best = (d.segment[i] as usize, s);
                     }

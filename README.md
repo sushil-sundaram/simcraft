@@ -117,6 +117,7 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | Turbulent channel (LVEL), Re 20 000: dp/dx | 94.6 Pa/m | 83.2 Pa/m (Dean) |
 | Conjugate heat balance, heated block in a duct | 0.200 W carried | 0.200 W generated |
 | Cantilever, 115 k elements (multigrid CG, 10 iterations): tip deflection | 1.4381 mm | 1.4478 mm (Timoshenko) |
+| NAFEMS LE1 elliptic membrane (STL), σyy at D, h = 25 mm | 93.28 MPa (fitted) / 79.8 (voxel) | 92.7 MPa |
 | Plate with hole (d/W = 0.1) Kt, h = r/10 | fitted 3.08 / voxel 3.31 | 3.03 (Heywood) |
 | Lamé thick cylinder, bore hoop stress | fitted 16.95 / voxel 21.05 MPa | 16.67 MPa |
 | Radial conduction through a pipe wall (quarter, ri 10 / ro 20 mm) | fitted 354.43 / voxel 369.46 W | 354.43 W (2πkLΔT / ln(ro/ri)) |
