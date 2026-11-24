@@ -242,6 +242,14 @@ enum Tbc {
     Fixed(f64, usize),
     Flux(f64),
     Conv(f64, f64, usize),
+    /// radiation to ambient: emissivity, ambient °C, load index
+    Rad(f64, f64, usize),
+}
+
+/// Secant radiation coefficient εσ(T² + T∞²)(T + T∞) [W/(m²·K)] for temperatures in °C.
+fn h_rad(eps: f64, t: f64, ta: f64) -> f64 {
+    let (a, b) = ((t + crate::radiation::KELVIN).max(1.0), ta + crate::radiation::KELVIN);
+    eps * crate::radiation::SIGMA * (a * a + b * b) * (a + b)
 }
 
 pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<()> {
@@ -476,6 +484,17 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
                         tbc.insert((bf.elem, bf.dir), Tbc::Conv(*coefficient, *ambient, li));
                     }
                 }
+                Load::Radiation { faces, emissivity, ambient, enclosure } => {
+                    has_sink = true;
+                    thermal_loads.push((it.id, it.load.label().to_string()));
+                    if *enclosure {
+                        res.warnings.push(format!("radiation #{}: surface-to-surface radiation is not modelled in conjugate heat transfer (the fluid region is between the faces); treated as radiation to the ambient", it.id));
+                    }
+                    for f in mesh.resolve_faces(faces)? {
+                        let bf = &mesh.faces[f as usize];
+                        tbc.insert((bf.elem, bf.dir), Tbc::Rad(*emissivity, *ambient, li));
+                    }
+                }
                 Load::HeatFlux { faces, value } => {
                     for f in mesh.resolve_faces(faces)? {
                         let bf = &mesh.faces[f as usize];
@@ -634,6 +653,11 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
                                 let c = 1.0 / (1.0 / (2.0 * kw[e][d / 2] * h) + 1.0 / (hc * a2));
                                 val[di] += c;
                                 b[e] += c * tamb;
+                            }
+                            Some(Tbc::Rad(eps, ta, _)) => {
+                                let c = 1.0 / (1.0 / (2.0 * kw[e][d / 2] * h) + 1.0 / (h_rad(*eps, temp[e], *ta) * a2));
+                                val[di] += c;
+                                b[e] += c * ta;
                             }
                             Some(Tbc::Flux(q)) => b[e] += q * a2,
                             None => {}
@@ -1170,6 +1194,16 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
     }
     if energy {
         bicg_total += solve_energy(&uf, &nu_eff, &nu_wall, &mut temp, None)?;
+        // radiation is non-linear in T: re-linearise until the temperatures settle
+        if tbc.values().any(|b| matches!(b, Tbc::Rad(..))) {
+            for _ in 0..60 {
+                let old = temp.clone();
+                bicg_total += solve_energy(&uf, &nu_eff, &nu_wall, &mut temp, None)?;
+                if temp.iter().zip(&old).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) < 1e-4 {
+                    break;
+                }
+            }
+        }
     }
     if let Some(n) = &fallback_note {
         res.warnings.push(n.clone());
@@ -1262,12 +1296,13 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
             match *bc {
                 Tbc::Fixed(tw, li) => through[li] += 2.0 * kc[e][d as usize / 2] * h * (tw - temp[e]),
                 Tbc::Conv(hc, ta, li) => through[li] += (ta - temp[e]) / (1.0 / (2.0 * kc[e][d as usize / 2] * h) + 1.0 / (hc * a2)),
+                Tbc::Rad(eps, ta, li) => through[li] += (ta - temp[e]) / (1.0 / (2.0 * kc[e][d as usize / 2] * h) + 1.0 / (h_rad(eps, temp[e], ta) * a2)),
                 Tbc::Flux(q) => flux_in += q * a2,
             }
         }
         let mut boundary_in = flux_in;
         for (li, it) in model.loads.iter().enumerate() {
-            if matches!(it.load, Load::Temperature { .. } | Load::Convection { .. }) {
+            if matches!(it.load, Load::Temperature { .. } | Load::Convection { .. } | Load::Radiation { .. }) {
                 res.quantity(&format!("Heat flow through #{} ({})", it.id, it.load.label()), through[li], "W");
                 boundary_in += through[li];
             }

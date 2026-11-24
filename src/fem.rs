@@ -1040,6 +1040,29 @@ pub fn assemble_thermal(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>) -> R
 /// Like `assemble_thermal`, restricted to the elements where `sel` is true (e.g. the solids inside
 /// an air cavity). Nodes not touched by a selected element are held at `rest_temperature`.
 pub fn assemble_thermal_sel(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, sel: Option<(&[bool], f64)>) -> Result<ThermalSystem> {
+    assemble_thermal_k(model, mesh, elem_q, sel, None)
+}
+
+/// Per-element conductivity factor k(T)/k at the element mean temperature (None when no material
+/// has a conductivity table).
+pub fn elem_kscale(mesh: &Mesh, t: &[f64]) -> Option<Vec<f64>> {
+    if !mesh.materials.iter().any(|m| !m.conductivity_table.is_empty()) {
+        return None;
+    }
+    Some(
+        mesh.elems
+            .par_iter()
+            .enumerate()
+            .map(|(e, en)| {
+                let m = &mesh.materials[mesh.elem_mat[e] as usize];
+                m.k_factor(en.iter().map(|&n| t[n as usize]).sum::<f64>() / 8.0)
+            })
+            .collect(),
+    )
+}
+
+/// `assemble_thermal_sel` with per-element conductivity factors (temperature-dependent k).
+pub fn assemble_thermal_k(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, sel: Option<(&[bool], f64)>, kscale: Option<&[f64]>) -> Result<ThermalSystem> {
     let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let ku = hex_conduction_unit();
@@ -1054,17 +1077,18 @@ pub fn assemble_thermal_sel(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, 
     for (e, en) in mesh.elems.iter().enumerate() {
         if on(e) {
             let m = &mesh.materials[mesh.elem_mat[e] as usize];
+            let ks = kscale.map(|v| v[e]).unwrap_or(1.0);
             match (&general[e], m.conductivity_xyz) {
-                (Some(g), None) => k.add_element(en, &g[0], m.thermal_conductivity),
+                (Some(g), None) => k.add_element(en, &g[0], m.thermal_conductivity * ks),
                 (Some(g), Some(kk)) => {
                     for a in 0..3 {
-                        k.add_element(en, &g[a + 1], kk[a]);
+                        k.add_element(en, &g[a + 1], kk[a] * ks);
                     }
                 }
-                (None, None) => k.add_element(en, &ku, m.thermal_conductivity * h),
+                (None, None) => k.add_element(en, &ku, m.thermal_conductivity * h * ks),
                 (None, Some(kk)) => {
                     for a in 0..3 {
-                        k.add_element(en, &kax[a], kk[a] * h);
+                        k.add_element(en, &kax[a], kk[a] * h * ks);
                     }
                 }
             }
@@ -1118,6 +1142,7 @@ pub fn assemble_thermal_sel(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, 
                 }
                 has_sink = true;
             }
+            Load::Radiation { .. } => has_sink = true,
             Load::HeatGeneration { .. } => {
                 let (els, q) = heat_source(model, mesh, &it.load)?;
                 for e in els {
@@ -1146,39 +1171,110 @@ pub fn assemble_thermal_sel(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, 
     Ok(ThermalSystem { k, f, fixed, conv_diag, temp_sets, has_sink })
 }
 
-pub fn thermal(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, prog: Prog, res: &mut Results) -> Result<()> {
-    let nn = mesh.nodes.len();
-    prog(0.0, "assembling conduction");
-    let sys = assemble_thermal(model, mesh, elem_q)?;
-    if !sys.has_sink {
-        bail!("thermal model needs at least one Temperature or Convection boundary condition");
-    }
-    let mut k = sys.k.clone();
-    let mut f = sys.f.clone();
-    k.apply_dirichlet(&sys.fixed, &mut f);
-    let mut t: Vec<f64> = sys.fixed.iter().map(|g| g.unwrap_or(model.analysis.reference_temperature)).collect();
-    let its = if use_multigrid(model, mesh) {
+/// Solve one linear conduction system (Dirichlet already applied) into `t`; returns iterations.
+fn solve_thermal_linear(model: &Model, mesh: &Mesh, k: &NodeSparse, f: &[f64], t: &mut [f64], prog: Prog, res: &mut Results) -> Result<usize> {
+    if use_multigrid(model, mesh) {
         // aggregation multigrid on the voxel lattice (nodes placed by position)
         prog(0.03, "building multigrid");
         let t0 = Instant::now();
         let coords: Vec<[u32; 3]> = mesh.nodes.iter().map(|p| [0, 1, 2].map(|k| ((p[k] - mesh.origin[k]) / mesh.h).round().max(0.0) as u32)).collect();
-        let mg = crate::multigrid::Multigrid::new(&k, &coords)?;
-        let its = mg.solve(&f, &mut t, 1e-10, 2000)?;
+        let mg = crate::multigrid::Multigrid::new(k, &coords)?;
+        let its = mg.solve(f, t, 1e-10, 2000)?;
         crate::sparse::SOLVE_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         res.info.solver = format!("multigrid CG ({} levels, CPU)", mg.levels());
-        its
+        Ok(its)
     } else {
-        let solver = Solver::new(&k)?;
-        let its = solver.solve(&k, &f, &mut t, 1e-10, &|p| prog(0.05 + 0.85 * p, "solving thermal (PCG)"))?;
+        let solver = Solver::new(k)?;
+        let its = solver.solve(k, f, t, 1e-10, &|p| prog(0.05 + 0.85 * p, "solving thermal (PCG)"))?;
         res.info.solver = solver.name().to_string();
-        its
-    };
+        Ok(its)
+    }
+}
+
+pub fn thermal(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, prog: Prog, res: &mut Results) -> Result<()> {
+    let nn = mesh.nodes.len();
+    prog(0.0, "assembling conduction");
+    let rad = crate::radiation::Radiation::new(model, mesh, &|m| prog(0.01, m))?;
+    let kdep = mesh.materials.iter().any(|m| !m.conductivity_table.is_empty());
+    let nonlinear = rad.is_some() || kdep;
+    let base = assemble_thermal(model, mesh, elem_q)?;
+    if !base.has_sink {
+        bail!("thermal model needs at least one Temperature, Convection or Radiation boundary condition");
+    }
+    let mut t: Vec<f64> = base.fixed.iter().map(|g| g.unwrap_or(model.analysis.reference_temperature)).collect();
+    // radiation and k(T) are non-linear: Picard iterations, each re-linearised at the current
+    // temperature (radiation in secant form, so a converged state satisfies q = εσ(T⁴ − T∞⁴) exactly)
+    let max_it = if nonlinear { 80 } else { 1 };
+    let (mut omega, mut prev_change, mut change) = (1.0f64, f64::INFINITY, 0.0f64);
+    let mut converged = !nonlinear;
+    let mut used = base.clone();
+    let mut iters = 0usize;
+    for it in 0..max_it {
+        let ks = elem_kscale(mesh, &t);
+        let mut s = match &ks {
+            Some(v) => assemble_thermal_k(model, mesh, elem_q, None, Some(v))?,
+            None => base.clone(),
+        };
+        if let Some(r) = &rad {
+            let lin = r.linearize(&t);
+            for n in 0..nn {
+                if lin.diag[n] != 0.0 {
+                    s.k.add_diag(n, lin.diag[n]);
+                    s.conv_diag[n] += lin.diag[n];
+                }
+                s.f[n] += lin.rhs[n];
+            }
+        }
+        let mut k = s.k.clone();
+        let mut f = s.f.clone();
+        k.apply_dirichlet(&s.fixed, &mut f);
+        let mut tn = t.clone();
+        res.info.iterations += solve_thermal_linear(model, mesh, &k, &f, &mut tn, prog, res)?;
+        used = s;
+        iters = it + 1;
+        if !nonlinear {
+            t = tn;
+            break;
+        }
+        change = tn.iter().zip(&t).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        if change > prev_change {
+            omega = (omega * 0.6).max(0.25);
+        }
+        prev_change = change;
+        for (a, b) in t.iter_mut().zip(&tn) {
+            *a += omega * (b - *a);
+        }
+        prog(0.05 + 0.9 * (it as f64 / max_it as f64), &format!("non-linear iteration {} (ΔT {change:.2e} K)", it + 1));
+        if change < 1e-4 {
+            converged = true;
+            break;
+        }
+    }
+    if nonlinear {
+        res.quantity("Non-linear iterations (radiation / k(T))", iters as f64, "");
+        if !converged {
+            res.warnings.push(format!("radiation / temperature-dependent conduction did not fully converge in {iters} iterations (last change {change:.2e} K)"));
+        }
+    }
     res.info.dofs += nn;
-    res.info.iterations += its;
-    thermal_post(mesh, &t, Some(&sys), res);
+    thermal_post(mesh, &t, Some(&used), res);
+    if let Some(r) = &rad {
+        radiation_quantities(r, &t, res);
+    }
     res.temp = Some(t);
     prog(1.0, "done");
     Ok(())
+}
+
+/// Heat radiated through each radiation load (positive = leaving the part).
+pub fn radiation_quantities(r: &crate::radiation::Radiation, t: &[f64], res: &mut Results) {
+    for (id, label, w) in r.heat_flows(t) {
+        res.quantity(&format!("Heat radiated through #{id} ({label})"), w, "W");
+    }
+    if r.patches > 0 {
+        res.quantity("Radiation patches (enclosure)", r.patches as f64, "");
+        res.quantity("View-factor rays", r.rays as f64, "");
+    }
 }
 
 /// Heat flux field and (optionally) heat flow through fixed-temperature faces.
@@ -1191,10 +1287,12 @@ pub fn thermal_post(mesh: &Mesh, t: &[f64], sys: Option<&ThermalSystem>, res: &m
     let mut fint = vec![0.0; nn];
     let mut acc = vec![[0.0; 3]; nn];
     let mut cnt = vec![0u32; nn];
+    let kscale = elem_kscale(mesh, t);
     for (e, en) in mesh.elems.iter().enumerate() {
         let mat = &mesh.materials[mesh.elem_mat[e] as usize];
-        let kc = mat.thermal_conductivity;
-        let kv = [mat.k_axis(0), mat.k_axis(1), mat.k_axis(2)];
+        let ks = kscale.as_ref().map(|v| v[e]).unwrap_or(1.0);
+        let kc = mat.thermal_conductivity * ks;
+        let kv = [mat.k_axis(0) * ks, mat.k_axis(1) * ks, mat.k_axis(2) * ks];
         let ortho = mat.conductivity_xyz.is_some();
         let fitted = mesh.is_fitted(e);
         let xm = fitted.then(|| elem_xyz_m(mesh, e));

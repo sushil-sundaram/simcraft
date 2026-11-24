@@ -118,6 +118,11 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | Conjugate heat balance, heated block in a duct | 0.200 W carried | 0.200 W generated |
 | Cantilever, 115 k elements (multigrid CG, 10 iterations): tip deflection | 1.4381 mm | 1.4478 mm (Timoshenko) |
 | NAFEMS LE1 elliptic membrane (STL), σyy at D, h = 25 mm | 93.28 MPa (fitted) / 79.8 (voxel) | 92.7 MPa |
+| Copper cube radiating 2 W (ε 0.8): temperature rise | 107.47 K | 107.46 K (Stefan–Boltzmann) |
+| Black parallel plates 100 × 100 mm, 50 mm apart (view factors) | 197.84 W | 198.05 W (F₁₂ = 0.4153, Howell) |
+| Grey parallel plates (ε 0.5) | 95.33 W | 95.55 W (radiosity network) |
+| Slab with k(T) = 50 (1 + 0.005 T): heat flow / midpoint T | 30.000 W / 116.228 °C | 30 W / 116.228 °C (Kirchhoff) |
+| Heated block in a duct + radiation (CHT): carried + radiated | 0.2000 W | 0.2 W generated |
 | Plate with hole (d/W = 0.1) Kt, h = r/10 | fitted 3.08 / voxel 3.31 | 3.03 (Heywood) |
 | Lamé thick cylinder, bore hoop stress | fitted 16.95 / voxel 21.05 MPa | 16.67 MPa |
 | Radial conduction through a pipe wall (quarter, ri 10 / ro 20 mm) | fitted 354.43 / voxel 369.46 W | 354.43 W (2πkLΔT / ln(ro/ri)) |
@@ -142,8 +147,9 @@ plots and convergence order. `--quick` (19 cases, ≈ 20 s) gates every CI run; 
   voxels — global results stay accurate, peaks on curved surfaces read high.
 - Magnetostatics uses nodal elements: very high permeability contrasts (iron cores) are approximate.
 - CFD is steady and incompressible with laminar or LVEL turbulence (the solver reports when the flow
-  does not settle, e.g. vortex shedding); no thermal radiation.
-- Full-wave EM is single-frequency with near fields only (no far-field / EMI transform yet).
+  does not settle, e.g. vortex shedding); conjugate heat transfer radiates to the surroundings only.
+- Full-wave EM is single-frequency; far fields are free-space estimates.
+- Thermal radiation is grey and diffuse.
 - Not included: contact between two
   deformable bodies (only contact against a rigid surface).
 

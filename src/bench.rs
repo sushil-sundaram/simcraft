@@ -478,6 +478,82 @@ pub fn cases() -> Vec<Case> {
         });
     }
 
+    {
+        let (ta, sig) = (20.0f64 + 273.15, crate::radiation::SIGMA);
+        let t = (ta.powi(4) + 2.0 / (0.8 * sig * 6.0 * 4e-4)).powf(0.25) - 273.15;
+        v.push(Case {
+            id: "radiating_cube",
+            group: "Thermal",
+            title: "Copper cube dissipating 2 W by radiation only (ε 0.8, 20 °C surroundings)",
+            source: "Stefan–Boltzmann: P = εσA(T⁴ − T∞⁴)",
+            sizes: vec![5.0, 2.0],
+            size_unit: "mm",
+            quick: true,
+            metrics: vec![m("radcube.dt", "temperature rise", t - 20.0, "K", 0.01)],
+            run: Box::new(|hh| {
+                let c = new_core();
+                let r = script(&c, &[
+                    ("add_box", json!({"name": "Cube", "size": [20, 20, 20], "material": "Copper C101"})),
+                    ("set_mesh", json!({"element_size_mm": hh})),
+                    ("set_analysis", json!({"type": "steady_thermal"})),
+                    ("add_heat_generation", json!({"body": "Cube", "power": 2.0})),
+                    ("add_radiation", json!({"faces": ["all"], "emissivity": 0.8, "ambient": 20})),
+                    ("solve", json!({})),
+                ])?;
+                out(vec![field(&r, "temperature", "max")? - 20.0], &r)
+            }),
+        });
+        let (t1, t2) = (500.0f64 + 273.15, 100.0f64 + 273.15);
+        let f = crate::radiation::parallel_rectangles_vf(100.0, 100.0, 50.0);
+        v.push(Case {
+            id: "parallel_plates",
+            group: "Thermal",
+            title: "Black parallel plates 100 × 100 mm, 50 mm apart: radiation exchange (view factors)",
+            source: "Q = Aσ(T₁⁴ − F₁₂T₂⁴), F₁₂ from the coaxial-rectangles formula (Howell C-11)",
+            sizes: vec![5.0, 2.0],
+            size_unit: "mm",
+            quick: false,
+            metrics: vec![m("plates.q", "heat into the hot plate", 0.01 * sig * (t1.powi(4) - f * t2.powi(4)), "W", 0.02)],
+            run: Box::new(|hh| {
+                let c = new_core();
+                let r = script(&c, &[
+                    ("add_box", json!({"name": "Hot", "min": [0, 0, 0], "size": [100, 100, 4], "material": "Copper C101"})),
+                    ("add_box", json!({"name": "Cold", "min": [0, 0, 54], "size": [100, 100, 4], "material": "Copper C101"})),
+                    ("set_mesh", json!({"element_size_mm": hh})),
+                    ("set_analysis", json!({"type": "steady_thermal"})),
+                    ("add_temperature", json!({"faces": ["Hot.zmin"], "value": 500})),
+                    ("add_temperature", json!({"faces": ["Cold.zmax"], "value": 100})),
+                    ("add_radiation", json!({"faces": ["Hot.zmax", "Cold.zmin"], "emissivity": 1.0, "ambient": -273.15, "enclosure": true})),
+                    ("solve", json!({})),
+                ])?;
+                out(vec![r["reactions"][0]["heat_flow_w"].as_f64().ok_or_else(|| anyhow!("no heat flow"))?], &r)
+            }),
+        });
+        v.push(Case {
+            id: "conductivity_kt",
+            group: "Thermal",
+            title: "Slab with k = 50 (1 + 0.005 T) between 200 °C and 0 °C: heat flow",
+            source: "Kirchhoff transform: q = (A/L) ∫ k dT",
+            sizes: vec![5.0, 2.5],
+            size_unit: "mm",
+            quick: true,
+            metrics: vec![m("kt.q", "heat flow", 1e-4 / 0.05 * 50.0 * (200.0 + 0.0025 * 40000.0), "W", 0.01)],
+            run: Box::new(|hh| {
+                let c = new_core();
+                let r = script(&c, &[
+                    ("define_material", json!({"name": "kT", "based_on": "Structural Steel", "thermal_conductivity": 50, "conductivity_table": [[0, 50], [200, 100]]})),
+                    ("add_box", json!({"name": "Slab", "size": [50, 10, 10], "material": "kT"})),
+                    ("set_mesh", json!({"element_size_mm": hh})),
+                    ("set_analysis", json!({"type": "steady_thermal"})),
+                    ("add_temperature", json!({"faces": ["Slab.xmin"], "value": 200})),
+                    ("add_temperature", json!({"faces": ["Slab.xmax"], "value": 0})),
+                    ("solve", json!({})),
+                ])?;
+                out(vec![r["reactions"][0]["heat_flow_w"].as_f64().ok_or_else(|| anyhow!("no heat flow"))?], &r)
+            }),
+        });
+    }
+
     // ---------------------------------------------------------------- fluids
     v.push(Case {
         id: "poiseuille",

@@ -22,6 +22,7 @@ pub mod multigrid;
 pub mod model;
 pub mod render;
 pub mod report;
+pub mod radiation;
 pub mod results;
 pub mod session;
 pub mod sparse;

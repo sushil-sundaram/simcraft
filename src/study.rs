@@ -106,6 +106,7 @@ fn load_fields(l: &Load) -> Vec<String> {
         Load::Gravity { .. } => v3("acceleration"),
         Load::Temperature { .. } | Load::HeatFlux { .. } | Load::HeatGeneration { .. } | Load::Voltage { .. } | Load::Current { .. } => vec!["value".into()],
         Load::Convection { .. } => vec!["coefficient".into(), "ambient".into()],
+        Load::Radiation { .. } => vec!["emissivity".into(), "ambient".into()],
         Load::Coil { .. } => vec!["current_density".into()],
         Load::Magnet { .. } => v3("remanence"),
         Load::Inlet { .. } => vec!["velocity".into()],

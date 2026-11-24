@@ -49,7 +49,10 @@ coefficient to real airflow. **Time:** 10 minutes.
    quantities give the chip temperature and the energy balance (≈ 100 %).
 
 **Try next:** change the inlet velocity (edit the Inlet load) and plot chip temperature against
-fan speed with **OPTIMIZE ▸ Parameters**.
+fan speed with **OPTIMIZE ▸ Parameters**. Or back in the thermal heat sink, add **SETUP ▸
+Radiation** on all faces (ε 0.85 for anodised aluminium, 22 °C) next to the convection: the base
+runs cooler, and the results list how many watts leave by radiation. Tick *Faces see each other
+(enclosure)* to account for the fins shading each other.
 
 ## Tutorial 3 — Will it resonate? Modal, random vibration and fatigue
 

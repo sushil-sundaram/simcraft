@@ -250,7 +250,8 @@ Engine Oil.
 
 Each material carries: Young's modulus, Poisson's ratio, density, yield and ultimate strength,
 plastic tangent modulus, thermal conductivity, expansion and specific heat, relative permittivity,
-electrical conductivity, relative permeability and (for fluids) viscosity.
+electrical conductivity, relative permeability and (for fluids) viscosity. Thermal conductivity and
+specific heat can also be tables against temperature (§7, Thermal).
 
 - **MATERIAL** tab: pick a material and **Assign to all bodies**; the panel shows its key values.
 - **✏ New / edit material…** opens an editor pre-filled from the selected material: change any
@@ -379,9 +380,34 @@ lifts off, the part is free and you will get an "under-constrained" message.
 ### Thermal
 
 **Steady-State Thermal** — temperatures once everything has settled. Needs at least one
-Temperature or Convection boundary (otherwise heat has nowhere to go). Heat inputs: Heat Flux,
-Heat Generation (whole model or one body). Results: temperature, heat flux, heat flow through
+Temperature, Convection or Radiation boundary (otherwise heat has nowhere to go). Heat inputs: Heat
+Flux, Heat Generation (whole model or one body). Results: temperature, heat flux, heat flow through
 fixed-temperature faces (positive = into the part, negative = out of it).
+
+**Radiation** (SETUP ▸ THERMAL ▸ Radiation, MCP `add_radiation`) — faces emit εσT⁴ (Kelvin inside;
+you enter °C). Give the emissivity ε (polished aluminium ≈ 0.05, oxidised metal 0.3–0.6, anodised,
+painted or FR-4 0.8–0.95) and the surroundings' temperature:
+- **To the surroundings** (default): each face exchanges with the ambient — a hot part in a room or
+  in space. Combine with Convection on the same faces for natural cooling (radiation is often 30–50
+  % of it at 60–100 °C).
+- **Faces see each other (enclosure)**: all faces of enclosure radiation loads exchange heat with
+  each other through view factors — fins facing each other, a chip under a lid, parts inside a
+  sealed box. SimCraft groups the faces into patches (≤ 1 500), casts ~1 000 rays from each against
+  the whole model (so parts shade each other), enforces reciprocity and solves the grey-diffuse
+  radiosity equations; the part of each face's view that escapes, or hits a face without a radiation
+  load, sees the surroundings. View factors are validated against Howell's catalogue (black
+  parallel plates within 0.1 %, grey plates 0.2 %).
+- Radiation makes the problem non-linear: SimCraft iterates (typically 10–30 times; the count is in
+  the results) and reports the **heat radiated through each radiation load**.
+- Also in Transient Thermal, Thermal-Stress, Microwave Heating and Conjugate Heat Transfer (there:
+  radiation to the surroundings from faces on the outer boundary; surface-to-surface radiation across
+  the fluid is not modelled yet).
+
+**Temperature-dependent properties** — a material's thermal conductivity and specific heat can be
+tables against temperature (MATERIAL ▸ New / edit material: *conductivity table* `20: 167; 200: 180`,
+*specific heat table*; MCP `define_material` with `conductivity_table` / `specific_heat_table`),
+linear between points and constant outside. Steady and transient thermal analyses then iterate
+(Kirchhoff slab and enthalpy checks within 0.05 %).
 
 **Transient Thermal** — temperatures over time. Settings: end time, time steps, initial temperature.
 Uses density × specific heat. No sink is required (an insulated part simply heats up). Results:
@@ -524,6 +550,7 @@ are ignored — that exchange is computed; use them on the enclosure's outer fac
 | Temperature | faces | °C | |
 | Heat Flux | faces | W/m² | positive flows in |
 | Convection | faces | h (W/m²K), ambient (°C) | natural air ≈ 5–25, forced air 25–250, water 500+ |
+| Radiation | faces | emissivity ε, surroundings (°C), enclosure on/off | to the surroundings, or surface-to-surface between enclosure faces; non-linear |
 | Heat Generation | whole model or one body (e.g. a KiCad component `U1`) | total power (W) or W/m³ | total power is spread over the body (exact on any mesh); W/m³ = power ÷ body volume, e.g. 2 W in a 10×10×2 mm chip = 10⁷ W/m³ (corrected to the exact volume for boxes, cylinders and spheres) |
 | Voltage | faces | V | electrostatic, current flow |
 | Current | faces | A (into the body) | needs a 0 V ground elsewhere |
@@ -841,16 +868,18 @@ mesh too, and check its licence terms before publishing comparisons.
 - Voxel meshes stair-step curved surfaces in buckling, plasticity, EM, CFD and topology optimisation;
   structural, thermal, modal and vibration analyses fit them (see §6).
 - Magnetostatics uses nodal elements: very high permeability contrasts are approximate.
-- CFD is steady and incompressible; turbulence is the algebraic LVEL model (no k-ε / k-ω), and
-  there is no thermal radiation between surfaces.
+- CFD is steady and incompressible; turbulence is the algebraic LVEL model (no k-ε / k-ω); in
+  conjugate heat transfer, radiation goes to the surroundings only (no surface-to-surface across the
+  fluid). Thermal analyses without flow support both.
 - KiCad boards: copper is homogenised per cell for heat conduction; `pcb_dc` solves DC current per
   net separately (no AC / skin effect). Warpage from copper/FR-4 expansion mismatch and component 3D
   models are not imported (components are boxes).
 - Full-wave EM: one frequency at a time; far fields are free-space (no ground plane); no
   S-parameters, sub-cell thin wires or PCB traces in the FDTD grid; μr = 1.
-- Not included: eddy currents and induction heating, contact between two deformable bodies,
-  radiation heat transfer, phase change,
-  temperature-dependent properties, strain-life (ε-N) and weld fatigue, acoustics, moving parts.
+- Radiation is grey and diffuse (no wavelength-dependent or specular surfaces, no participating
+  media); temperature tables cover conductivity and specific heat (not density, expansion or E).
+- Not included: eddy currents and induction heating, contact between two deformable bodies, phase
+  change, strain-life (ε-N) and weld fatigue, acoustics, moving parts.
 - Vibration analyses use mode superposition with proportional (modal) damping and the lumped mass
   matrix; very high modes are approximate.
   The Planner flags these when your goal needs them.
