@@ -50,7 +50,7 @@ Today SimCraft runs as a single-user local desktop binary where `docs/ROADMAP.md
   - **Action:** Create a private temp file via `tempfile::NamedTempFile` (mode `0o600`) or pass the model over an authenticated socket/stdin pipe, and delete the file after the GUI loads it.
 
 #### Medium Priority — Parser, Mesh & Solver DoS / Crash Hardening
-- [x] **Guard STL loader against oversized files, 32-bit overflows, `NaN`/`Inf`, and `O(T)` algorithmic DoS (`src/geometry.rs`)** _(file cap, `checked_mul`, finite checks done; STL BVH tracked in `P2.A1`)_
+- [x] **Guard STL loader against oversized files, 32-bit overflows, `NaN`/`Inf`, and `O(T)` algorithmic DoS (`src/geometry.rs`)**
   - **Context:** `load_stl` (`src/geometry.rs:457-496`) reads the entire file into RAM with `std::fs::read`; binary STL validation (`84 + n * 50 == bytes.len()`, line 462) can overflow `usize` on 32-bit/WASM targets; `Shape::validate()` (`lines 178-207`) checks `<= 0.0` so `NaN` and `+Inf` pass; and `Shape::Stl::{project, best_patch}` / `StlData::x_crossings` scan all triangles linearly (`O(T)` per node/face/ray).
   - **Action:** Cap input file size, use `checked_mul` for triangle buffer checks, reject any non-finite (`!is_finite()`) coordinates/dimensions/parameters across `geometry.rs` and `session.rs`, and build a BVH over STL triangles (matching `radiation.rs`) for `O(log T)` queries.
 - [x] **Guard KiCad S-expression parser & PCB rasterizer against stack overflow and OOM (`src/kicad.rs`, `src/kicad/dc.rs`)**
@@ -152,12 +152,12 @@ If SimCraft remains a **dedicated native laptop/desktop application**, the curre
   - Replace the CPU-rasterized RGBA upload in `viewport()` with an `egui::PaintCallback` (`glow` or `wgpu` on the integrated GPU, preserving `prefer_integrated_gpu()` battery savings).
   - Move deformation animation (`Scale * anim * disp`) into vertex shaders instead of rebuilding `Scene` allocations on CPU every frame (`src/gui.rs:3890-3899`).
   - Retain `render::render_png` strictly for headless MCP `render_image` and `report.rs` HTML exports.
-- [ ] **Upgrade 2 — Non-Blocking Meshing & File Import (`src/gui.rs`, `src/session.rs`, `src/geometry.rs`)**
+- [x] **Upgrade 2 — Non-Blocking Meshing & File Import (`src/gui.rs`, `src/session.rs`, `src/geometry.rs`)**
   - Move `s.ensure_mesh()` out of `viewport()` (`src/gui.rs:3796`) and `net_pads()` out of `open_pcb_dc()` (`src/gui.rs:2325`) onto background worker threads with progress + cancel support.
   - Add an STL triangle BVH in `geometry.rs` so boundary fitting and `x_crossings` don't stall on large CAD meshes.
-- [ ] **Upgrade 3 — Cross-Platform Laptop GPU Adapter Selection (`src/gpu.rs`, `src/fdtd.rs`)**
+- [x] **Upgrade 3 — Cross-Platform Laptop GPU Adapter Selection (`src/gpu.rs`, `src/fdtd.rs`)**
   - Split `gpu::pick_adapter(require_f64: bool)`: use `wgpu::Backends::PRIMARY` (Vulkan + Metal + DX12) without `SHADER_F64` for `f32` `fdtd.rs`, unlocking Apple Silicon and Windows/integrated laptop GPUs; keep `SHADER_F64` strictly for double-precision `gpu.rs` PCG (or add a mixed-precision fallback).
 - [ ] **Upgrade 4 — Core & UI Maintainability Refactors (`src/gui.rs`, `src/session.rs`)**
-  - **Modularize `gui.rs`:** Split the 4,421-line file into `ui/{header,ribbon,browser,properties,viewport,charts,dialogs}.rs` and adopt `egui_dock` + `egui_plot` (or evaluate **Tauri + Web UI + Rust Core** if you eventually want commercial-grade multi-monitor docking, native trackpad/accessibility, *and* a shared codebase for a future web app).
-  - **Remove double JSON serialization for undo (`src/session.rs:517-523`):** Track dirty mutations or command deltas instead of serializing the entire `Model` twice on every tool call (important before `P2.3` STEP B-reps land).
-  - **Replace panic-unwinding cancellation (`src/session.rs:1761-1765`):** Migrate `check_cancel()` from `std::panic::resume_unwind(Box::new(Cancelled))` to cooperative `&AtomicBool` checks returning `Result` so parallel `rayon` loops (`P2.5` octree, `P2.8` transient CFD) and GPU poll loops can cancel cleanly without unwinding hazards.
+  - [ ] **Modularize `gui.rs`:** Split the 4,421-line file into `ui/{header,ribbon,browser,properties,viewport,charts,dialogs}.rs` and adopt `egui_dock` + `egui_plot` (or evaluate **Tauri + Web UI + Rust Core** if you eventually want commercial-grade multi-monitor docking, native trackpad/accessibility, *and* a shared codebase for a future web app).
+  - [x] **Remove double JSON serialization for undo (`src/session.rs:517-523`):** Track dirty mutations or command deltas instead of serializing the entire `Model` twice on every tool call (important before `P2.3` STEP B-reps land).
+  - [x] **Replace panic-unwinding cancellation (`src/session.rs:1761-1765`):** Migrate `check_cancel()` from `std::panic::resume_unwind(Box::new(Cancelled))` to cooperative `&AtomicBool` checks returning `Result` so parallel `rayon` loops (`P2.5` octree, `P2.8` transient CFD) and GPU poll loops can cancel cleanly without unwinding hazards.

@@ -945,7 +945,9 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
             }
             if it % 10 == 0 {
                 let conv = (-(du.max(1e-12)).log10()).clamp(0.0, 6.0) / 6.0;
-                prog((0.97 * conv).max(0.97 * it as f64 / budget as f64).min(0.97), &format!("SIMPLE iteration {it}, change {du:.2e}, continuity {mres:.2e}"));
+                prog.report((0.97 * conv).max(0.97 * it as f64 / budget as f64).min(0.97), &format!("SIMPLE iteration {it}, change {du:.2e}, continuity {mres:.2e}"))?;
+            } else {
+                prog.check()?;
             }
             if !(du.is_finite() && mres.is_finite()) {
                 stalled = true;
@@ -1077,8 +1079,8 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
         });
         let tp = std::time::Instant::now();
         cg_total += match (&psolver, &mg) {
-            (Some(s), _) => s.solve(&a, &rhs, &mut p, 1e-7, &|_| {})?,
-            (None, Some(m)) => m.solve(&rhs, &mut p, 1e-3, 500)?,
+            (Some(s), _) => s.solve(&a, &rhs, &mut p, 1e-7, &prog.check_scalar())?,
+            (None, Some(m)) => m.solve_cancellable(&rhs, &mut p, 1e-3, 500, prog.cancel)?,
             _ => unreachable!(),
         };
         t_pressure += tp.elapsed().as_secs_f64();
@@ -1136,7 +1138,9 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
             let conv = (1.0f64.ln() - change.max(1e-12).ln()).max(0.0) / (1.0f64.ln() - TOL.ln()) * 10.0;
             let frac = (iters as f64 / max_it as f64).max(1.0 - conv / 10.0).min(0.97);
             let tmsg = if buoyant { format!(", ΔT {:.1e}", t_change) } else { String::new() };
-            prog(frac, &format!("CFD iteration {iters}, change {change:.2e}{tmsg}"));
+            prog.report(frac, &format!("CFD iteration {iters}, change {change:.2e}{tmsg}"))?;
+        } else {
+            prog.check()?;
         }
         if !change.is_finite() {
             bail!("CFD diverged; try a coarser mesh or a lower inlet velocity");
@@ -1394,6 +1398,6 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
     res.extra.insert(Field::VelocityY, vy);
     res.extra.insert(Field::VelocityZ, vz);
     res.extra.insert(Field::FluidPressure, ps);
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }

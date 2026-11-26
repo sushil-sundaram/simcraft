@@ -11,12 +11,13 @@
 //!
 //! Temperatures are °C in the solvers and Kelvin here.
 
-use crate::fem::face_shares;
+use crate::fem::{Prog, check_cancel, face_shares};
 use crate::geometry::*;
 use crate::mesh::Mesh;
 use crate::model::{Load, Model};
 use anyhow::{Result, bail};
 use rayon::prelude::*;
+use std::sync::atomic::AtomicBool;
 
 pub const SIGMA: f64 = 5.670_374_419e-8;
 pub const KELVIN: f64 = 273.15;
@@ -203,7 +204,7 @@ pub fn parallel_rectangles_vf(a: f64, b: f64, c: f64) -> f64 {
 
 impl Radiation {
     /// Radiation boundary conditions of the model (None when there are none).
-    pub fn new(model: &Model, mesh: &Mesh, prog: &dyn Fn(&str)) -> Result<Option<Radiation>> {
+    pub fn new(model: &Model, mesh: &Mesh, prog: Prog) -> Result<Option<Radiation>> {
         let mut amb = Vec::new();
         let mut s2s_faces: Vec<(usize, f64, f64, usize)> = Vec::new(); // face, eps, ta, load
         let mut loads = Vec::new();
@@ -231,13 +232,13 @@ impl Radiation {
         }
         let mut rad = Radiation { amb, s2s: None, loads, patches: 0, rays: 0 };
         if !s2s_faces.is_empty() {
-            prog("radiation view factors");
-            rad.s2s = Some(Self::view_factors(mesh, &s2s_faces, &mut rad.patches, &mut rad.rays)?);
+            prog.report(0.0, "radiation view factors")?;
+            rad.s2s = Some(Self::view_factors(mesh, &s2s_faces, &mut rad.patches, &mut rad.rays, prog.cancel)?);
         }
         Ok(Some(rad))
     }
 
-    fn view_factors(mesh: &Mesh, sel: &[(usize, f64, f64, usize)], npatch: &mut usize, nrays: &mut usize) -> Result<S2s> {
+    fn view_factors(mesh: &Mesh, sel: &[(usize, f64, f64, usize)], npatch: &mut usize, nrays: &mut usize, cancel: &AtomicBool) -> Result<S2s> {
         let h = mesh.h;
         // outward normal (unit) and centre of every selected face
         let info: Vec<(V3, V3, f64)> = sel
@@ -304,7 +305,8 @@ impl Radiation {
         // cosine-weighted rays from each patch, spread over its faces by area
         let counts: Vec<(Vec<(usize, f64)>, f64, usize)> = (0..np)
             .into_par_iter()
-            .map(|p| {
+            .map(|p| -> Result<_> {
+                check_cancel(cancel)?;
                 let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ (p as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
                 let mut rnd = || {
                     seed ^= seed << 13;
@@ -344,9 +346,9 @@ impl Radiation {
                         }
                     }
                 }
-                (hits, amb, total)
+                Ok((hits, amb, total))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         *nrays = counts.iter().map(|c| c.2).sum();
         let mut f = vec![0.0; np * np];
         for (i, (hits, _, total)) in counts.iter().enumerate() {

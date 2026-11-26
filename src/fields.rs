@@ -87,9 +87,9 @@ fn solve_scalar(mesh: &Mesh, coef: &[f64], fixed: &[Option<f64>], f: &[f64], pro
     let mut rhs = f.to_vec();
     k.apply_dirichlet(fixed, &mut rhs);
     let mut phi: Vec<f64> = fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
-    prog(0.1, "factorising");
+    prog.report(0.1, "factorising")?;
     let solver = Solver::new(&k)?;
-    let its = solver.solve(&k, &rhs, &mut phi, 1e-10, &|p| prog(0.1 + 0.8 * p, "solving (PCG)"))?;
+    let its = solver.solve(&k, &rhs, &mut phi, 1e-10, &prog.scalar(0.1, 0.8, "solving (PCG)"))?;
     res.info.solver = solver.name().to_string();
     res.info.iterations += its;
     res.info.dofs += mesh.nodes.len();
@@ -151,7 +151,7 @@ pub fn electrostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
     }
     res.extra.insert(Field::ElectricPotential, v);
     res.extra.insert(Field::ElectricField, to_nodes(mesh, &emag, None));
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -203,7 +203,7 @@ pub fn current_flow(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -
     res.extra.insert(Field::ElectricPotential, v);
     res.extra.insert(Field::CurrentDensity, to_nodes(mesh, &jmag.iter().map(|j| j * 1e-6).collect::<Vec<_>>(), None));
     res.extra.insert(Field::JouleHeat, to_nodes(mesh, &q, None));
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(q)
 }
 
@@ -245,7 +245,7 @@ fn grad_integrals() -> Vec<V3> {
 pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<()> {
     let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
-    prog(0.0, "assembling magnetic system");
+    prog.report(0.0, "assembling magnetic system")?;
     let nu: Vec<f64> = mesh.elem_mat.iter().map(|&m| 1.0 / (MU0 * mesh.materials[m as usize].relative_permeability.max(1e-6))).collect();
     let ku = curl_div_unit();
     let mut k = NodeSparse::new(nn, &mesh.elems, 3);
@@ -328,9 +328,9 @@ pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
     let mut rhs = f.clone();
     k.apply_dirichlet(&fixed, &mut rhs);
     let mut a = vec![0.0; nn * 3];
-    prog(0.1, "factorising");
+    prog.report(0.1, "factorising")?;
     let solver = Solver::new(&k)?;
-    let its = solver.solve(&k, &rhs, &mut a, 1e-9, &|p| prog(0.1 + 0.8 * p, "solving (PCG)"))?;
+    let its = solver.solve(&k, &rhs, &mut a, 1e-9, &prog.scalar(0.1, 0.8, "solving (PCG)"))?;
     res.info.solver = solver.name().to_string();
     res.info.iterations += its;
     res.info.dofs = nn * 3;
@@ -356,6 +356,6 @@ pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
     res.quantity("Peak |B| in solids", (0..mesh.elems.len()).filter(|&e| mesh.elem_region[e] == REGION_SOLID).map(|e| bmag[e]).fold(0.0, f64::max), "T");
     res.extra.insert(Field::MagneticFluxDensity, to_nodes(mesh, &bmag, None));
     res.extra.insert(Field::MagneticFieldIntensity, to_nodes(mesh, &hmag, None));
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }

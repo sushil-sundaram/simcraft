@@ -60,8 +60,8 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
     if !(dt > 0.0) {
         bail!("end time must be positive");
     }
-    prog(0.0, "assembling");
-    let rad = crate::radiation::Radiation::new(model, mesh, &|m| prog(0.0, m))?;
+    prog.report(0.0, "assembling")?;
+    let rad = crate::radiation::Radiation::new(model, mesh, prog.slice(0.0, 0.02))?;
     if rad.is_some() || mesh.materials.iter().any(|m| m.temperature_dependent()) {
         return transient_thermal_nl(model, mesh, elem_q, sel, rad, prog, res);
     }
@@ -89,7 +89,7 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
     if profile {
         eprintln!("[thermal] assembled {:.2} s", tprof.elapsed().as_secs_f64());
     }
-    prog(0.02, "factorising");
+    prog.report(0.02, "factorising")?;
     let solver = Solver::new(&a)?;
     if profile {
         eprintln!("[thermal] solver ready ({}) {:.2} s", solver.name(), tprof.elapsed().as_secs_f64());
@@ -101,11 +101,13 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
     let tmax = |t: &[f64]| t.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     res.frames.push(TimeFrame { time: 0.0, disp: None, temp: Some(t.clone()) });
     res.history.push((0.0, tmax(&t)));
+    let check_fn = prog.check_scalar();
     for s in 1..=steps {
+        prog.check()?;
         let mut rhs: Vec<f64> = (0..nn).map(|i| sys.f[i] + cap[i] / dt * t[i]).collect();
         apply_rhs_bc(&mut rhs, &corr, &sys.fixed);
         let mut tn = t.clone();
-        res.info.iterations += solver.solve(&a, &rhs, &mut tn, 1e-10, &|_| {})?;
+        res.info.iterations += solver.solve(&a, &rhs, &mut tn, 1e-10, &check_fn)?;
         t = tn;
         let time = s as f64 * dt;
         res.history.push((time, tmax(&t)));
@@ -113,7 +115,7 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
             res.frames.push(TimeFrame { time, disp: None, temp: Some(t.clone()) });
         }
         if s % 5 == 0 {
-            prog(0.05 + 0.9 * s as f64 / steps as f64, &format!("time step {s}/{steps}"));
+            prog.report(0.05 + 0.9 * s as f64 / steps as f64, &format!("time step {s}/{steps}"))?;
         }
     }
     res.history_label = "max temperature [°C]".into();
@@ -125,7 +127,7 @@ pub fn transient_thermal_sel(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Op
         eprintln!("[thermal] post {:.2} s", tprof.elapsed().as_secs_f64());
     }
     res.temp = Some(t);
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -192,7 +194,7 @@ fn transient_thermal_nl(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Option<
             let solver = Solver::new(&s.k)?;
             res.info.solver = solver.name().to_string();
             let mut tn = cur.clone();
-            res.info.iterations += solver.solve(&s.k, &f, &mut tn, 1e-10, &|_| {})?;
+            res.info.iterations += solver.solve(&s.k, &f, &mut tn, 1e-10, &prog.check_scalar())?;
             change = tn.iter().zip(&cur).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
             cur = tn;
             if change < 1e-4 {
@@ -207,7 +209,9 @@ fn transient_thermal_nl(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Option<
             res.frames.push(TimeFrame { time, disp: None, temp: Some(t.clone()) });
         }
         if step % 5 == 0 {
-            prog(0.05 + 0.9 * step as f64 / steps as f64, &format!("time step {step}/{steps}"));
+            prog.report(0.05 + 0.9 * step as f64 / steps as f64, &format!("time step {step}/{steps}"))?;
+        } else {
+            prog.check()?;
         }
     }
     if worst > 1e-2 {
@@ -219,7 +223,7 @@ fn transient_thermal_nl(model: &Model, mesh: &crate::mesh::Mesh, elem_q: Option<
         crate::fem::radiation_quantities(r, &t, res);
     }
     res.temp = Some(t);
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -240,14 +244,16 @@ fn lumped_mass(mesh: &crate::mesh::Mesh) -> Vec<f64> {
 }
 
 /// Estimate the first natural circular frequency by inverse iteration (K must have BCs applied).
-fn first_omega(k: &NodeSparse, solver: &Solver, m: &[f64], fixed: &[Option<f64>]) -> Result<f64> {
+fn first_omega(k: &NodeSparse, solver: &Solver, m: &[f64], fixed: &[Option<f64>], prog: Prog) -> Result<f64> {
     let n = m.len();
     let mut x: Vec<f64> = (0..n).map(|i| if fixed[i].is_some() { 0.0 } else { 1.0 + ((i * 7919) % 13) as f64 * 0.01 }).collect();
     let mut lam = 0.0;
+    let check_fn = prog.check_scalar();
     for _ in 0..25 {
+        prog.check()?;
         let rhs: Vec<f64> = x.iter().zip(m).map(|(a, b)| a * b).collect();
         let mut y = vec![0.0; n];
-        solver.solve(k, &rhs, &mut y, 1e-8, &|_| {})?;
+        solver.solve(k, &rhs, &mut y, 1e-8, &check_fn)?;
         let mut ky = vec![0.0; n];
         k.matvec(&y, &mut ky);
         let num: f64 = y.iter().zip(&ky).enumerate().filter(|(i, _)| fixed[*i].is_none()).map(|(_, (a, b))| a * b).sum();
@@ -280,13 +286,13 @@ pub fn transient_structural(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog,
     let m = lumped_mass(mesh);
 
     // first frequency for Rayleigh damping
-    prog(0.02, "estimating first natural frequency");
+    prog.report(0.02, "estimating first natural frequency")?;
     let zero_fixed: Vec<Option<f64>> = fixed.iter().map(|g| g.map(|_| 0.0)).collect();
     let mut kz = k0.clone();
     let mut dummy = vec![0.0; n];
     kz.apply_dirichlet(&zero_fixed, &mut dummy);
     let sz = Solver::new(&kz)?;
-    let w1 = first_omega(&kz, &sz, &m, &zero_fixed)?;
+    let w1 = first_omega(&kz, &sz, &m, &zero_fixed, prog)?;
     drop(sz);
     let zeta = st.damping_ratio.max(0.0);
     let (alpha, beta) = if w1 > 0.0 { (zeta * w1, zeta / w1) } else { (0.0, 0.0) };
@@ -307,7 +313,7 @@ pub fn transient_structural(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog,
     }
     let corr = dirichlet_correction(&keff, &fixed);
     keff.apply_dirichlet(&fixed, &mut dummy);
-    prog(0.05, "factorising");
+    prog.report(0.05, "factorising")?;
     let solver = Solver::new(&keff)?;
     res.info.solver = solver.name().to_string();
     res.info.dofs = n;
@@ -322,14 +328,16 @@ pub fn transient_structural(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog,
     res.history.push((0.0, 0.0));
     let mut peak = (0.0, 0.0);
     let mut tmp = vec![0.0; n];
+    let check_fn = prog.check_scalar();
     for s in 1..=steps {
+        prog.check()?;
         // F_eff = F + M(a0 u + a2 v + acc) + C(a1 u + v),  C = αM + βK
         let cvec: Vec<f64> = (0..n).map(|i| a1 * u[i] + v[i]).collect();
         k0.matvec(&cvec, &mut tmp);
         let mut rhs: Vec<f64> = (0..n).map(|i| f_ext[i] + m[i] * (a0 * u[i] + a2 * v[i] + acc[i]) + alpha * m[i] * cvec[i] + beta * tmp[i]).collect();
         apply_rhs_bc(&mut rhs, &corr, &fixed);
         let mut un = u.clone();
-        res.info.iterations += solver.solve(&keff, &rhs, &mut un, 1e-9, &|_| {})?;
+        res.info.iterations += solver.solve(&keff, &rhs, &mut un, 1e-9, &check_fn)?;
         for i in 0..n {
             if fixed[i].is_some() {
                 acc[i] = 0.0;
@@ -351,16 +359,16 @@ pub fn transient_structural(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog,
             res.frames.push(TimeFrame { time, disp: Some(to_mm(&u)), temp: None });
         }
         if s % 5 == 0 {
-            prog(0.1 + 0.8 * s as f64 / steps as f64, &format!("time step {s}/{steps}"));
+            prog.report(0.1 + 0.8 * s as f64 / steps as f64, &format!("time step {s}/{steps}"))?;
         }
     }
     res.history_label = "max displacement [mm]".into();
     res.quantity("Peak displacement", peak.1, "mm");
     res.quantity("Time of peak displacement", peak.0, "s");
-    prog(0.92, "computing stresses");
+    prog.report(0.92, "computing stresses")?;
     structural_post(model, mesh, &u, None, &units, &fixed, &f_ext, &support_nodes, &owner, res);
     res.disp = Some(to_mm(&u));
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -426,23 +434,27 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
     let mut k = k0.clone();
     let mut f = f_ext.clone();
     k.apply_dirichlet(&fixed, &mut f);
-    prog(0.05, "pre-stress: factorising");
+    prog.report(0.05, "pre-stress: factorising")?;
     let solver = Solver::new(&k)?;
     res.info.solver = solver.name().to_string();
     let mut u: Vec<f64> = fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
-    solver.solve(&k, &f, &mut u, 1e-9, &|_| {})?;
+    let check_fn = prog.check_scalar();
+    solver.solve(&k, &f, &mut u, 1e-9, &check_fn)?;
     structural_post(model, mesh, &u, None, &units, &fixed, &f_ext, &support_nodes, &owner, res);
     res.disp = Some((0..nn).map(|q| [u[q * 3] * 1e3, u[q * 3 + 1] * 1e3, u[q * 3 + 2] * 1e3]).collect());
 
     // 2. geometric stiffness
-    prog(0.2, "assembling geometric stiffness");
+    prog.report(0.2, "assembling geometric stiffness")?;
     let bts: Vec<Vec<Vec<[f64; 6]>>> = units.iter().map(btilde).collect();
     let gps = gauss_points();
     let kg_elems: Vec<Vec<f64>> = mesh
         .elems
         .par_iter()
         .enumerate()
-        .map(|(e, en)| {
+        .map(|(e, en)| -> Result<_> {
+            if e % 512 == 0 {
+                prog.check()?;
+            }
             let mi = mesh.elem_mat[e] as usize;
             let m = &mesh.materials[mi];
             let d = dmat(m.poisson_ratio);
@@ -479,9 +491,9 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
                     }
                 }
             }
-            kg
+            Ok(kg)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let mut kg = NodeSparse::new(nn, &mesh.elems, 3);
     for (e, en) in mesh.elems.iter().enumerate() {
         kg.add_element(en, &kg_elems[e], -1.0); // store B = -Kg
@@ -496,7 +508,7 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
             kg.add_diag(i, -1.0);
         }
     }
-    prog(0.3, "factorising");
+    prog.report(0.3, "factorising")?;
     let solver = Solver::new(&kz)?;
 
     // 3. subspace iteration: B φ = μ K φ, largest μ = 1/λ
@@ -514,12 +526,12 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
     let mut old = vec![f64::INFINITY; p];
     let mut tmp = vec![0.0; n];
     for it in 0..60 {
-        prog(0.35 + 0.6 * it as f64 / 60.0, &format!("buckling iteration {}", it + 1));
+        prog.report(0.35 + 0.6 * it as f64 / 60.0, &format!("buckling iteration {}", it + 1))?;
         let mut y = Vec::with_capacity(p);
         for xj in &x {
             kg.matvec(xj, &mut tmp);
             let mut yj = vec![0.0; n];
-            res.info.iterations += solver.solve(&kz, &tmp, &mut yj, 1e-9, &|_| {})?;
+            res.info.iterations += solver.solve(&kz, &tmp, &mut yj, 1e-9, &check_fn)?;
             y.push(yj);
         }
         let ky: Vec<Vec<f64>> = y
@@ -605,7 +617,7 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
     }
     res.quantity("Critical load multiplier (mode 1)", modes[0].load_multiplier.unwrap(), "×");
     res.modes = modes;
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -812,11 +824,11 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
             factorisations += 1;
             res.info.solver = format!("{} (Newton–Raphson, consistent tangent)", solver.name());
             let mut du = vec![0.0; n];
-            solver.solve(&kt, &r, &mut du, 1e-10, &|_| {})?;
+            solver.solve(&kt, &r, &mut du, 1e-10, &prog.check_scalar())?;
             for i in 0..n {
                 u[i] += du[i];
             }
-            prog(0.05 + 0.9 * (lam - 1.0 / nsteps as f64 * (1.0 - (it as f64 + 1.0) / 40.0)), &format!("load step {step}/{nsteps}, Newton iteration {}", it + 1));
+            prog.report(0.05 + 0.9 * (lam - 1.0 / nsteps as f64 * (1.0 - (it as f64 + 1.0) / 40.0)), &format!("load step {step}/{nsteps}, Newton iteration {}", it + 1))?;
         }
         if !converged {
             u = u_start;
@@ -879,6 +891,6 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
         res.reactions.push(Reaction { load_id: *id, label: label.clone(), value: r.map(float) });
     }
     res.disp = Some((0..nn).map(|q| [u[q * 3] * 1e3, u[q * 3 + 1] * 1e3, u[q * 3 + 2] * 1e3]).collect());
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }

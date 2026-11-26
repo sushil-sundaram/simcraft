@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Parameter {
@@ -293,9 +294,13 @@ pub fn response(summary: &Value, mass: f64, volume_mm3: f64, key: &str) -> Resul
 
 /// Solve one design and return its responses.
 pub fn evaluate(model: &Model, responses: &[String]) -> Result<Vec<Option<f64>>> {
+    evaluate_with(model, responses, &fem::NEVER_CANCEL)
+}
+
+fn evaluate_with(model: &Model, responses: &[String], cancel: &AtomicBool) -> Result<Vec<Option<f64>>> {
     let h = model.element_size.unwrap_or_else(|| mesh::auto_size(&model.bodies, model.mesh_with_enclosure()));
-    let m = mesh::build_for(model, h, mesh::max_cells_for(model))?;
-    let res = fem::solve(model, &m, &|_, _| {})?;
+    let m = mesh::build_for_cancellable(model, h, mesh::max_cells_for(model), cancel)?;
+    let res = fem::solve(model, &m, fem::Progress::cancel_only(cancel))?;
     let sum = res.summary(&m);
     Ok(responses.iter().map(|k| response(&sum, res.info.mass_kg, m.volume_mm3(), k).ok()).collect())
 }
@@ -316,7 +321,7 @@ fn validate(model: &Model, params: &[Parameter]) -> Result<()> {
     Ok(())
 }
 
-pub type StudyProg<'a> = &'a dyn Fn(f64, &str);
+pub type StudyProg<'a> = fem::Progress<'a>;
 
 /// Geometry is meshed with cubes, so dimensions effectively change in whole-element steps.
 fn snap_note(model: &Model, params: &[Parameter]) -> String {
@@ -328,10 +333,11 @@ fn snap_note(model: &Model, params: &[Parameter]) -> String {
     format!(". Note: dimensions are meshed in whole elements of {} mm, so nearby values can give identical results; use a smaller element size for finer steps", crate::results::float(h))
 }
 
-fn eval_run(model: &Model, params: &[Parameter], values: Vec<f64>, responses: &[String], phase: &str) -> Run {
-    match apply(model, params, &values).and_then(|m| evaluate(&m, responses)) {
-        Ok(r) => Run { values, responses: r, feasible: true, error: None, phase: phase.into() },
-        Err(e) => Run { values, responses: vec![None; responses.len()], feasible: false, error: Some(format!("{e:#}")), phase: phase.into() },
+fn eval_run(model: &Model, params: &[Parameter], values: Vec<f64>, responses: &[String], phase: &str, cancel: &AtomicBool) -> Result<Run> {
+    match apply(model, params, &values).and_then(|m| evaluate_with(&m, responses, cancel)) {
+        Ok(r) => Ok(Run { values, responses: r, feasible: true, error: None, phase: phase.into() }),
+        Err(e) if e.is::<fem::Cancelled>() => Err(e),
+        Err(e) => Ok(Run { values, responses: vec![None; responses.len()], feasible: false, error: Some(format!("{e:#}")), phase: phase.into() }),
     }
 }
 
@@ -391,8 +397,8 @@ pub fn parameter_study(model: &Model, params: Vec<Parameter>, responses: Vec<Str
     let mut runs = Vec::new();
     let n = designs.len();
     for (i, d) in designs.into_iter().enumerate() {
-        prog(i as f64 / n as f64, &format!("design {}/{n}", i + 1));
-        runs.push(eval_run(model, &params, d, &responses, "doe"));
+        prog.report(i as f64 / n as f64, &format!("design {}/{n}", i + 1))?;
+        runs.push(eval_run(model, &params, d, &responses, "doe", prog.cancel)?);
     }
     let ok = runs.iter().filter(|r| r.error.is_none()).count();
     Ok(Study {
@@ -449,14 +455,14 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
         }
     };
     let mut cache: Vec<(Vec<f64>, f64)> = Vec::new();
-    let mut eval = |u: &[f64], phase: &str, runs: &mut Vec<Run>, scale: &mut Option<f64>| -> f64 {
+    let mut eval = |u: &[f64], phase: &str, runs: &mut Vec<Run>, scale: &mut Option<f64>| -> Result<f64> {
         let u: Vec<f64> = u.iter().map(|x| x.clamp(0.0, 1.0)).collect();
         if let Some((_, f)) = cache.iter().find(|(c, _)| c.iter().zip(&u).all(|(a, b)| (a - b).abs() < 1e-9)) {
-            return *f;
+            return Ok(*f);
         }
         let i = runs.len();
-        prog(i as f64 / budget as f64, &format!("design {}/{budget}", i + 1));
-        let mut run = eval_run(model, &params, denorm(&params, &u), &responses, phase);
+        prog.report(i as f64 / budget as f64, &format!("design {}/{budget}", i + 1))?;
+        let mut run = eval_run(model, &params, denorm(&params, &u), &responses, phase, prog.cancel)?;
         run.feasible = run.error.is_none() && run.responses[0].is_some_and(|v| v.is_finite()) && violation(&constraints, &run.responses, 1).is_some_and(|v| v <= 1e-9);
         if scale.is_none() {
             if let Some(o) = run.responses[0] {
@@ -466,14 +472,14 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
         let f = merit(&run, scale.unwrap_or(1.0));
         runs.push(run);
         cache.push((u, f));
-        f
+        Ok(f)
     };
 
     // 1. exploration
     let m0 = (2 * n + 2).max(5).min(budget / 2).max(2);
     let mut best: (Vec<f64>, f64) = (vec![0.5; n], f64::INFINITY);
     for u in lhs(n, m0, 0xC0FFEE) {
-        let f = eval(&u, "doe", &mut runs, &mut scale);
+        let f = eval(&u, "doe", &mut runs, &mut scale)?;
         if f < best.1 {
             best = (u, f);
         }
@@ -483,7 +489,7 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
     for i in 0..n {
         let mut u = best.0.clone();
         u[i] = if u[i] + 0.2 <= 1.0 { u[i] + 0.2 } else { u[i] - 0.2 };
-        let f = eval(&u, "search", &mut runs, &mut scale);
+        let f = eval(&u, "search", &mut runs, &mut scale)?;
         simplex.push((u, f));
     }
     while runs.len() < budget {
@@ -496,16 +502,16 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
         let centroid: Vec<f64> = (0..n).map(|k| simplex[..n].iter().map(|(u, _)| u[k]).sum::<f64>() / n as f64).collect();
         let pt = |t: f64| -> Vec<f64> { centroid.iter().zip(&worst.0).map(|(c, w)| (c + t * (c - w)).clamp(0.0, 1.0)).collect() };
         let xr = pt(1.0);
-        let fr = eval(&xr, "search", &mut runs, &mut scale);
+        let fr = eval(&xr, "search", &mut runs, &mut scale)?;
         if fr < simplex[0].1 {
             let xe = pt(2.0);
-            let fe = if runs.len() < budget { eval(&xe, "search", &mut runs, &mut scale) } else { f64::INFINITY };
+            let fe = if runs.len() < budget { eval(&xe, "search", &mut runs, &mut scale)? } else { f64::INFINITY };
             simplex[n] = if fe < fr { (xe, fe) } else { (xr, fr) };
         } else if fr < simplex[n - 1].1 {
             simplex[n] = (xr, fr);
         } else {
             let xc = pt(if fr < worst.1 { 0.5 } else { -0.5 });
-            let fc = eval(&xc, "search", &mut runs, &mut scale);
+            let fc = eval(&xc, "search", &mut runs, &mut scale)?;
             if fc < worst.1.min(fr) {
                 simplex[n] = (xc, fc);
             } else {
@@ -516,7 +522,7 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
                         break;
                     }
                     let u: Vec<f64> = simplex[j].0.iter().zip(&b).map(|(x, y)| y + 0.5 * (x - y)).collect();
-                    let f = eval(&u, "search", &mut runs, &mut scale);
+                    let f = eval(&u, "search", &mut runs, &mut scale)?;
                     simplex[j] = (u, f);
                 }
             }
@@ -635,12 +641,13 @@ pub fn surrogate_optimize(model: &Model, params: Vec<Parameter>, objective: Obje
     let mut runs: Vec<Run> = prior;
     let mut solved = 0usize;
     let feasible = |r: &Run| r.error.is_none() && violation(&constraints, &r.responses, 1).is_some_and(|v| v <= 1e-9);
-    let solve = |u: &[f64], phase: &str, runs: &mut Vec<Run>, solved: &mut usize| {
-        prog(*solved as f64 / budget as f64, &format!("verifying design {}/{budget} with a real solve", *solved + 1));
-        let mut r = eval_run(model, &params, denorm(&params, u), &responses, phase);
+    let solve = |u: &[f64], phase: &str, runs: &mut Vec<Run>, solved: &mut usize| -> Result<()> {
+        prog.report(*solved as f64 / budget as f64, &format!("verifying design {}/{budget} with a real solve", *solved + 1))?;
+        let mut r = eval_run(model, &params, denorm(&params, u), &responses, phase, prog.cancel)?;
         r.feasible = feasible(&r);
         runs.push(r);
         *solved += 1;
+        Ok(())
     };
     // initial design if there is too little data
     let ok_runs = |runs: &Vec<Run>| runs.iter().filter(|r| r.error.is_none()).count();
@@ -650,7 +657,7 @@ pub fn surrogate_optimize(model: &Model, params: Vec<Parameter>, objective: Obje
             if solved >= budget {
                 break;
             }
-            solve(&u, "doe", &mut runs, &mut solved);
+            solve(&u, "doe", &mut runs, &mut solved)?;
         }
     }
     let mut note = String::new();
@@ -659,7 +666,7 @@ pub fn surrogate_optimize(model: &Model, params: Vec<Parameter>, objective: Obje
         let data: Vec<&Run> = runs.iter().filter(|r| r.error.is_none() && r.responses.iter().all(|v| v.is_some())).collect();
         if data.len() < 3 {
             let u: Vec<f64> = lhs(n, 1, 0xF00D + solved as u64).remove(0);
-            solve(&u, "doe", &mut runs, &mut solved);
+            solve(&u, "doe", &mut runs, &mut solved)?;
             continue;
         }
         let x: Vec<Vec<f64>> = data.iter().map(|r| norm_values(&params, &r.values)).collect();
@@ -704,7 +711,7 @@ pub fn surrogate_optimize(model: &Model, params: Vec<Parameter>, objective: Obje
         // never re-solve (nearly) the same design
         let dup = runs.iter().any(|r| norm_values(&params, &r.values).iter().zip(&best.0).all(|(a, b)| (a - b).abs() < 1e-3));
         let u = if dup { cands.iter().find(|c| !runs.iter().any(|r| norm_values(&params, &r.values).iter().zip(&c.0).all(|(a, b)| (a - b).abs() < 1e-3))).map(|c| c.0.clone()).unwrap_or(best.0) } else { best.0 };
-        solve(&u, "search", &mut runs, &mut solved);
+        solve(&u, "search", &mut runs, &mut solved)?;
     }
     let best_idx = runs
         .iter()

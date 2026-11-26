@@ -199,7 +199,7 @@ pub fn pcg(
     x: &mut [f64],
     tol: f64,
     max_iter: usize,
-    progress: &dyn Fn(f64),
+    progress: &(dyn Fn(f64) -> Result<()> + Sync),
 ) -> Result<CgStats> {
     let n = b.len();
     let dinv: Vec<f64> = a.diag().iter().map(|d| if d.abs() > 0.0 { 1.0 / d } else { 1.0 }).collect();
@@ -234,7 +234,7 @@ pub fn pcg(
         zip_apply(&mut r, &ap, |ri, api| *ri -= alpha * api);
         let rn = dotp(&r, &r).sqrt() / bnorm;
         if it % 25 == 0 {
-            progress(((log_r0 - rn.max(1e-300).ln()) / (log_r0 - log_tol)).clamp(0.0, 1.0));
+            progress(((log_r0 - rn.max(1e-300).ln()) / (log_r0 - log_tol)).clamp(0.0, 1.0))?;
         }
         if rn < tol {
             return Ok(CgStats { iterations: it, residual: rn });
@@ -593,15 +593,16 @@ impl Solver {
         matches!(self, Solver::Gpu(_))
     }
     /// Solve a x = b; `x` holds the initial guess for the iterative path.
-    pub fn solve(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, progress: &dyn Fn(f64)) -> Result<usize> {
+    pub fn solve(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, progress: &(dyn Fn(f64) -> Result<()> + Sync)) -> Result<usize> {
         let t = std::time::Instant::now();
         let r = self.solve_inner(a, b, x, tol, progress);
         SOLVE_NANOS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         r
     }
-    fn solve_inner(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, progress: &dyn Fn(f64)) -> Result<usize> {
+    fn solve_inner(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, progress: &(dyn Fn(f64) -> Result<()> + Sync)) -> Result<usize> {
         match self {
             Solver::Direct(f) => {
+                progress(0.0)?;
                 let r = f.solve(b);
                 x.copy_from_slice(&r);
                 Ok(0)
@@ -609,6 +610,7 @@ impl Solver {
             Solver::Iterative => Ok(pcg(a, b, x, tol, 30_000, progress)?.iterations),
             Solver::Gpu(g) => match g.solve(a, b, x, tol, 30_000, progress) {
                 Ok(n) => Ok(n),
+                Err(e) if e.is::<crate::fem::Cancelled>() => Err(e),
                 Err(e) => {
                     crate::gpu::note_fallback(format!("GPU solve failed ({e:#}); solved on the CPU instead"));
                     Ok(pcg(a, b, x, tol, 30_000, progress)?.iterations)

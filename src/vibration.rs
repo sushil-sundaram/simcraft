@@ -100,7 +100,7 @@ fn participation(b: &ModalBasis, dir: usize) -> (Vec<f64>, f64) {
 }
 
 fn basis(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<ModalBasis> {
-    let b = fem::modal_basis(model, mesh, modes_for(model), &|f, m| prog(f * 0.6, m), res)?;
+    let b = fem::modal_basis(model, mesh, modes_for(model), prog.slice(0.0, 0.6), res)?;
     if b.omega.first().is_some_and(|w| *w < 1e-3 * b.omega.last().copied().unwrap_or(1.0)) {
         bail!("the model has rigid-body modes (it is not fully supported); add supports before a vibration analysis");
     }
@@ -176,7 +176,9 @@ pub fn harmonic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Re
             peak = (*f, a);
         }
         if k % 20 == 0 {
-            prog(0.6 + 0.35 * k as f64 / total as f64, &format!("frequency {}/{total}", k + 1));
+            prog.report(0.6 + 0.35 * k as f64 / total as f64, &format!("frequency {}/{total}", k + 1))?;
+        } else {
+            prog.check()?;
         }
     }
     // displacement shape at the peak, at the phase where the largest dof peaks
@@ -196,7 +198,7 @@ pub fn harmonic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Re
     res.quantity("Peak displacement amplitude", peak.1 * 1e3, "mm");
     res.quantity("Damping ratio", zeta, "");
     res.info.dofs = n;
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -236,16 +238,16 @@ pub fn spectrum(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Re
         }
         s.max(0.0).sqrt()
     };
-    prog(0.7, "combining modes");
+    prog.report(0.7, "combining modes")?;
     let u: Vec<f64> = (0..n).into_par_iter().map(|dof| combine(&|i| b.phi[i][dof] * d[i])).collect();
     // modal stresses, combined component-wise
     let ms: Vec<Vec<[f64; 6]>> = (0..nm)
-        .map(|i| {
-            prog(0.7 + 0.25 * i as f64 / nm as f64, &format!("mode {} stresses", i + 1));
+        .map(|i| -> Result<_> {
+            prog.report(0.7 + 0.25 * i as f64 / nm as f64, &format!("mode {} stresses", i + 1))?;
             let ui: Vec<f64> = b.phi[i].iter().map(|v| v * d[i]).collect();
-            nodal_stress(model, mesh, &ui, &b.fixed)
+            Ok(nodal_stress(model, mesh, &ui, &b.fixed))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let stress: Vec<[f64; 6]> = (0..mesh.nodes.len())
         .into_par_iter()
         .map(|nd| {
@@ -272,7 +274,7 @@ pub fn spectrum(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Re
     }
     res.note = format!("{} combined peak response (unsigned), base excitation along {}", if cqc { "CQC" } else { "SRSS" }, ["X", "Y", "Z"][dir]);
     res.info.dofs = n;
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -303,7 +305,7 @@ pub fn random(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resu
     fs.sort_by(|a, b| a.total_cmp(b));
     fs.dedup_by(|a, b| (*a - *b).abs() < 1e-12 * a.abs());
     // modal covariance C_ij = ∫ Γ_i Γ_j Re(H_i H_j*) S_a df and C2_ij = ∫ … ω² … (for crossing rate)
-    prog(0.65, "integrating PSD");
+    prog.report(0.65, "integrating PSD")?;
     let mut c = vec![0.0; nm * nm];
     let mut c2 = vec![0.0; nm * nm];
     let mut grms2 = 0.0;
@@ -356,7 +358,7 @@ pub fn random(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resu
     // zero-crossing frequency of the most-responding dof
     let dmax = (0..n).max_by(|&a, &bb| u[a].total_cmp(&u[bb])).unwrap_or(0);
     let nu0 = (quad(&|i| b.phi[i][dmax], &c2) / quad(&|i| b.phi[i][dmax], &c).max(1e-300)).sqrt() / TWO_PI;
-    prog(0.8, "modal stresses");
+    prog.report(0.8, "modal stresses")?;
     let ms: Vec<Vec<[f64; 6]>> = (0..nm).map(|i| nodal_stress(model, mesh, &b.phi[i], &b.fixed)).collect();
     let stress: Vec<[f64; 6]> = (0..mesh.nodes.len())
         .into_par_iter()
@@ -380,6 +382,6 @@ pub fn random(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resu
     res.quantity("Zero-crossing frequency", nu0, "Hz");
     res.note = format!("1σ (RMS) response to the base PSD along {}; multiply by 3 for 3σ", ["X", "Y", "Z"][dir]);
     res.info.dofs = n;
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }

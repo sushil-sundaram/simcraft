@@ -6,11 +6,13 @@
 //! * solids + enclosure (electrostatic, magnetostatic, CFD): the enclosure body (air, water…)
 //!   fills the space around the solids and is meshed as region 1.
 
+use crate::fem::{NEVER_CANCEL, check_cancel};
 use crate::geometry::*;
 use crate::material::Material;
 use anyhow::{Result, bail};
 use rayon::prelude::*;
 use serde::Serialize;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Debug)]
 pub struct BFace {
@@ -192,6 +194,10 @@ fn axis_planes(bodies: &[Body]) -> [Vec<f64>; 3] {
 }
 
 pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclosure: bool, max_cells: usize, conservative: bool) -> Result<Mesh> {
+    build_mesh_ex_cancellable(bodies, h, materials, with_enclosure, max_cells, conservative, &NEVER_CANCEL)
+}
+
+pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material], with_enclosure: bool, max_cells: usize, conservative: bool, cancel: &AtomicBool) -> Result<Mesh> {
     let has_solid = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Solid);
     let mut restored: Vec<String> = Vec::new();
     let has_encl = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Enclosure);
@@ -280,12 +286,15 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
             Shape::Stl { data: Some(d), .. } => {
                 let cols: Vec<(usize, usize, Vec<f64>)> = (0..ny * nz)
                     .into_par_iter()
-                    .map(|jk| {
+                    .map(|jk| -> Result<_> {
+                        if jk % 64 == 0 {
+                            check_cancel(cancel)?;
+                        }
                         let (j, k) = (jk % ny, jk / ny);
                         let c = center(0, j, k);
-                        (j, k, d.x_crossings(c[1] + h * 1.1e-4, c[2] + h * 0.7e-4))
+                        Ok((j, k, d.x_crossings(c[1] + h * 1.1e-4, c[2] + h * 0.7e-4)))
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 for (j, k, xs) in cols {
                     if xs.len() < 2 {
                         continue;
@@ -300,10 +309,14 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
             }
             Shape::Stl { .. } => bail!("STL body '{}' is not loaded", body.name),
             shape => {
-                v.par_iter_mut().enumerate().for_each(|(c, o)| {
+                v.par_iter_mut().enumerate().try_for_each(|(c, o)| -> Result<()> {
+                    if c & 4095 == 0 {
+                        check_cancel(cancel)?;
+                    }
                     let (i, j, k) = (c % nx, (c / nx) % ny, c / (nx * ny));
                     *o = shape.contains(center(i, j, k));
-                });
+                    Ok(())
+                })?;
             }
         }
         Ok(v)
@@ -559,6 +572,7 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
     let (mut elems, mut elem_mat, mut elem_region, mut elem_body, mut elem_cell) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut elem_of_cell = vec![u32::MAX; ncell];
     for k in 0..nz {
+        check_cancel(cancel)?;
         for j in 0..ny {
             for i in 0..nx {
                 let c = cid(i, j, k);
@@ -643,7 +657,11 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
     }
     let assign: Vec<u32> = faces
         .par_iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(fi, f)| -> Result<u32> {
+            if fi & 1023 == 0 {
+                check_cancel(cancel)?;
+            }
             let n = dir_normal(f.dir);
             let want = if f.outer { Role::Enclosure } else { Role::Solid };
             let mut best = (0usize, f64::INFINITY);
@@ -656,9 +674,9 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
                     best = (offsets[bi] + pi, s);
                 }
             }
-            best.0 as u32
+            Ok(best.0 as u32)
         })
-        .collect();
+        .collect::<Result<Vec<u32>>>()?;
     let mut remap = vec![u32::MAX; names.len().max(1)];
     let mut patches: Vec<PatchInfo> = Vec::new();
     let mut patch_src: Vec<(u32, u32)> = Vec::new();
@@ -715,10 +733,14 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
 
 /// Mesh for a model: voxel mesh, boundary-fitted when the analysis asks for it.
 pub fn build_for(model: &crate::model::Model, h: f64, max_cells: usize) -> Result<Mesh> {
+    build_for_cancellable(model, h, max_cells, &NEVER_CANCEL)
+}
+
+pub fn build_for_cancellable(model: &crate::model::Model, h: f64, max_cells: usize, cancel: &AtomicBool) -> Result<Mesh> {
     let fit = model.mesh_fitted();
-    let mut m = build_mesh_ex(&model.bodies, h, &model.materials(), model.mesh_with_enclosure(), max_cells, fit)?;
+    let mut m = build_mesh_ex_cancellable(&model.bodies, h, &model.materials(), model.mesh_with_enclosure(), max_cells, fit, cancel)?;
     if fit {
-        m.fit_boundary(&model.bodies);
+        m.fit_boundary_cancellable(&model.bodies, cancel)?;
     }
     Ok(m)
 }
@@ -780,6 +802,10 @@ impl Mesh {
     /// next layers inward, so curved and off-grid surfaces are represented exactly at the nodes.
     /// Elements that would become too distorted are relaxed back towards the voxel shape.
     pub fn fit_boundary(&mut self, bodies: &[Body]) -> FitReport {
+        self.fit_boundary_cancellable(bodies, &NEVER_CANCEL).unwrap_or_default()
+    }
+
+    pub fn fit_boundary_cancellable(&mut self, bodies: &[Body], cancel: &AtomicBool) -> Result<FitReport> {
         let h = self.h;
         // elements already general (on snapped grid lines) stay general
         let pre_fitted = std::mem::take(&mut self.fitted);
@@ -788,6 +814,7 @@ impl Mesh {
         // (snapped) grid plane stays as it is even when a few faces of the same surface step off it
         // next to a hole, otherwise it would get a zero-thickness pillow that inverts at the edges.
         let n_old = self.nodes.len();
+        check_cancel(cancel)?;
         let face_needs: Vec<bool> = self
             .faces
             .iter()
@@ -903,6 +930,9 @@ impl Mesh {
             pinned[old as usize] = true;
         }
         for n in 0..nn {
+            if n & 511 == 0 {
+                check_cancel(cancel)?;
+            }
             let ps = &node_patches[n];
             if ps.is_empty() {
                 continue;
@@ -1029,6 +1059,7 @@ impl Mesh {
         let touched = |e: usize, d: &[V3]| self.elems[e].iter().any(|&n| norm(d[n as usize]) > 0.0);
         let mut relaxed = vec![false; ne];
         for round in 0..8 {
+            check_cancel(cancel)?;
             let bad: Vec<usize> = (0..ne).filter(|&e| touched(e, &d) && quality(e, &d) < MIN_QUALITY).collect();
             if bad.is_empty() {
                 break;
@@ -1073,7 +1104,7 @@ impl Mesh {
             let a = scale(cross(sub(q[2], q[0]), sub(q[3], q[1])), 0.5);
             self.patches[f.patch as usize].area_mm2 += norm(a);
         }
-        rep
+        Ok(rep)
     }
 
     /// Resolve face selectors into boundary face indices.
