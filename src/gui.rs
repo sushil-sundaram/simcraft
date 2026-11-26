@@ -812,6 +812,8 @@ pub struct SimApp {
     key: Option<RenderKey>,
     /// action waiting for the "save changes?" answer
     confirm: Option<Pending>,
+    /// project waiting for user confirmation before reading external STL / PCB paths
+    confirm_external: Option<(String, Vec<String>)>,
     /// body / load picked in the browser, and the editable copy shown in Properties ("b:Name" / "l:3")
     sel_body: Option<String>,
     sel_load: Option<u32>,
@@ -989,6 +991,7 @@ impl SimApp {
             tex: None,
             key: None,
             confirm: None,
+            confirm_external: None,
             sel_body: None,
             sel_load: None,
             edit_val: None,
@@ -3084,11 +3087,12 @@ impl SimApp {
             }
             Pending::Open => {
                 if let Some(p) = rfd::FileDialog::new().add_filter("SimCraft", &["simcraft", "json"]).pick_file() {
-                    self.run("open_project", json!({"path": p.to_string_lossy()}));
+                    let s = p.to_string_lossy().to_string();
+                    self.open_checked(&s);
                 }
             }
             Pending::OpenPath(p) => {
-                self.run("open_project", json!({"path": p}));
+                self.open_checked(&p);
             }
             Pending::Example(name) => match name {
                 "bracket" => self.example_bracket(),
@@ -3112,8 +3116,54 @@ impl SimApp {
         }
         self.need_fit = true;
     }
+    fn open_checked(&mut self, path: &str) {
+        if std::path::Path::new(path) != crate::session::autosave_path() {
+            if let Ok(ext) = crate::session::external_assets(path) {
+                if !ext.is_empty() {
+                    self.confirm_external = Some((path.to_string(), ext));
+                    return;
+                }
+            }
+        }
+        self.run("open_project", json!({"path": path}));
+    }
+
     /// "Save changes?" dialog, autosave and crash-recovery offer.
     fn safety_ui(&mut self, ctx: &egui::Context) {
+        if let Some((path, assets)) = self.confirm_external.clone() {
+            let p = self.p;
+            let mut choice = None;
+            egui::Modal::new(egui::Id::new("open-external")).show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.label(RichText::new("Project references external files").strong().size(15.0));
+                ui.label(RichText::new("This project loads STL or KiCad files outside its folder:").color(p.weak));
+                ui.add_space(6.0);
+                for a in assets.iter().take(6) {
+                    ui.label(RichText::new(format!("• {a}")).small().monospace());
+                }
+                if assets.len() > 6 {
+                    ui.label(RichText::new(format!("… and {} more", assets.len() - 6)).small().color(p.weak));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add(primary(&p, "Open anyway")).clicked() {
+                        choice = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+            match choice {
+                Some(true) => {
+                    self.confirm_external = None;
+                    self.run("open_project", json!({"path": path}));
+                    self.need_fit = true;
+                }
+                Some(false) => self.confirm_external = None,
+                None => {}
+            }
+        }
         // window close with unsaved work
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             if self.dirty() {
@@ -4405,7 +4455,8 @@ pub fn run(core: Shared, open: Option<String>) -> eframe::Result<()> {
         Err(e) => e,
     };
     if let Some(p) = open {
-        let _ = core.call("open_project", &json!({"path": p}));
+        let handoff = std::env::var_os("SIMCRAFT_HANDOFF_FILE").is_some_and(|h| std::path::Path::new(&p) == std::path::Path::new(&h));
+        let _ = core.call("open_project", &json!({"path": p, "handoff": handoff}));
     }
     let opts = eframe::NativeOptions {
         viewport: {

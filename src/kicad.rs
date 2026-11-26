@@ -24,12 +24,30 @@ const CP_CU: f64 = 385.0;
 /// via barrel plating thickness [mm]
 const PLATING: f64 = 0.025;
 
+const MAX_PCB_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SX_DEPTH: usize = 256;
+const MAX_PCB_PIXELS: usize = 16_000_000;
+const MAX_PCB_LAYERS: usize = 128;
+
 // ------------------------------------------------------------------ S-expressions
 
 #[derive(Debug, Clone)]
 pub enum Sx {
     Atom(String),
     List(Vec<Sx>),
+}
+
+impl Drop for Sx {
+    fn drop(&mut self) {
+        if let Sx::List(top) = self {
+            let mut stack = std::mem::take(top);
+            while let Some(mut item) = stack.pop() {
+                if let Sx::List(ref mut children) = item {
+                    stack.append(children);
+                }
+            }
+        }
+    }
 }
 
 impl Sx {
@@ -62,7 +80,7 @@ impl Sx {
         }
     }
     fn num(&self, i: usize) -> Option<f64> {
-        self.atom(i).and_then(|a| a.parse().ok())
+        self.atom(i).and_then(|a| a.parse::<f64>().ok().filter(|v| v.is_finite()))
     }
     /// (name x y [angle]) → (x, y, angle)
     fn xy(&self, name: &str) -> Option<(f64, f64, f64)> {
@@ -91,6 +109,9 @@ pub fn parse(text: &str) -> Result<Sx> {
         let c = b[i];
         match c {
             b'(' => {
+                if stack.len() >= MAX_SX_DEPTH {
+                    bail!("S-expression nesting exceeds maximum depth ({MAX_SX_DEPTH})");
+                }
                 stack.push(Vec::new());
                 i += 1;
             }
@@ -233,7 +254,7 @@ fn graphic(g: &Sx) -> Option<Vec<P2>> {
                 let ang = g.get("angle")?.num(1)?;
                 let r = ((s[0] - c[0]).powi(2) + (s[1] - c[1]).powi(2)).sqrt();
                 let a0 = (s[1] - c[1]).atan2(s[0] - c[0]);
-                let n = ((ang.abs() / 5.0).ceil() as usize).max(2);
+                let n = ((ang.abs() / 5.0).ceil() as usize).clamp(2, 180);
                 Some((0..=n).map(|i| {
                     let t = a0 + ang.to_radians() * i as f64 / n as f64;
                     [c[0] + r * t.cos(), c[1] + r * t.sin()]
@@ -435,6 +456,10 @@ fn pad_geometry(fx: f64, fy: f64, frot: f64, pad: &Sx) -> Option<PadGeo> {
 
 impl PcbData {
     pub fn load(path: &str) -> Result<PcbData> {
+        let meta = std::fs::metadata(path).map_err(|e| anyhow!("reading {path}: {e}"))?;
+        if meta.len() > MAX_PCB_BYTES {
+            bail!("KiCad board '{path}' is too large ({} MB; limit {} MB)", meta.len() / (1024 * 1024), MAX_PCB_BYTES / (1024 * 1024));
+        }
         let text = std::fs::read_to_string(path).map_err(|e| anyhow!("reading {path}: {e}"))?;
         Self::from_text(&text, path)
     }
@@ -467,6 +492,9 @@ impl PcbData {
         layer_names.dedup();
         if layer_names.is_empty() {
             layer_names = vec!["F.Cu".into(), "B.Cu".into()];
+        }
+        if layer_names.len() > MAX_PCB_LAYERS {
+            bail!("board has too many copper layers ({}; limit {MAX_PCB_LAYERS})", layer_names.len());
         }
         let mut cu_t: BTreeMap<String, f64> = BTreeMap::new();
         let mut stack_total = 0.0;
@@ -647,16 +675,24 @@ impl PcbData {
         let (fx0, fy1) = (lo[0], hi[1]);
         let tf = |p: P2| -> P2 { [p[0] - fx0, fy1 - p[1]] };
         let size = [hi[0] - lo[0], hi[1] - lo[1]];
-        if size[0] <= 0.0 || size[1] <= 0.0 {
+        if !size[0].is_finite() || !size[1].is_finite() || size[0] <= 0.0 || size[1] <= 0.0 {
             bail!("degenerate board outline");
         }
         let loops: Vec<Vec<P2>> = loops.into_iter().map(|l| l.into_iter().map(tf).collect()).collect();
 
         // ---- rasterise copper
         let area = size[0] * size[1];
-        let res = (area / 4.0e6).sqrt().max(0.05).max(0.1f64.min(area.sqrt() / 50.0));
+        let mut res = (area / 4.0e6).sqrt().max(0.05).max(0.1f64.min(area.sqrt() / 50.0));
+        let budget = (MAX_PCB_PIXELS / layers.len().max(1)).max(4) as f64;
+        while ((size[0] / res) + 2.0) * ((size[1] / res) + 2.0) > budget {
+            res *= 1.25;
+        }
         let (nx, ny) = ((size[0] / res).ceil() as usize + 1, (size[1] / res).ceil() as usize + 1);
-        let new_r = || Raster { nx, ny, res, x0: 0.0, y0: 0.0, bits: vec![0u8; nx * ny] };
+        let pixels = nx.checked_mul(ny).ok_or_else(|| anyhow!("board raster dimensions overflow"))?;
+        if pixels.checked_mul(layers.len()).is_none_or(|tot| tot > MAX_PCB_PIXELS * 2) {
+            bail!("board raster exceeds pixel limit");
+        }
+        let new_r = || Raster { nx, ny, res, x0: 0.0, y0: 0.0, bits: vec![0u8; pixels] };
         let mut rasters: Vec<Raster> = layers.iter().map(|_| new_r()).collect();
         let lidx = |name: &str| -> Vec<usize> {
             if name == "*.Cu" {

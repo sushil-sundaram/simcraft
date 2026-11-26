@@ -48,12 +48,14 @@ Command-line options:
 |---|---|
 | `simcraft` | Open the app |
 | `simcraft model.simcraft` | Open the app with a project |
-| `simcraft mcp` | Run the MCP server for AI agents (see §13) |
-| `simcraft serve --port N` | Headless server for Python scripts (no window) |
+| `simcraft mcp [--workspace DIR]` | Run the MCP server for AI agents (see §13) |
+| `simcraft serve [--port N] [--workspace DIR]` | Headless server for Python scripts (no window) |
 | `simcraft schema` | Print every tool with its JSON schema |
 | `SIMCRAFT_GPU=discrete simcraft` | Let the window itself render on the discrete GPU (normally it stays on the integrated GPU) |
 | `SIMCRAFT_PORT=…` | Change the local port used between the app and the MCP server (default 47800) |
+| `SIMCRAFT_WORKSPACE=…` | Confine MCP / headless file tools (`open_project`, `save_project`, `import_stl`, `import_kicad`, `export_vtk`, `make_report`) to this directory |
 | `SIMCRAFT_LLM_URL=…` | Address of the local model server for the Planner (default `http://127.0.0.1:11434`) |
+| `SIMCRAFT_LOCAL_ONLY_LLM=1` | Restrict `SIMCRAFT_LLM_URL` to loopback hosts (`127.0.0.1`, `localhost`, `::1`) |
 
 ---
 
@@ -756,8 +758,11 @@ with `render_image` (contour PNG) and `screenshot_gui` (the whole window), read 
 with `get_selection`, and use the planner (`plan_simulation`, `get_plan`, `set_plan_step`).
 
 **Security** — the window and `simcraft serve` only accept connections that present the token in
-`~/.config/simcraft/token` (created automatically, readable only by you), so other programs on the machine
-cannot drive SimCraft.
+`~/.config/simcraft/token` (created automatically with mode `0600`, readable only by you), so other
+programs on the machine cannot drive SimCraft. To confine an AI agent or headless script to a
+single project directory, pass `--workspace DIR` (or set `SIMCRAFT_WORKSPACE=DIR`); in the desktop
+app, opening a `.simcraft` project that references `.stl` or `.kicad_pcb` files outside its folder
+prompts for confirmation first.
 
 Agents can read this guide with `get_help` (contents, a section by number or name, or a search),
 so they can look up how an analysis or load works before setting it up.

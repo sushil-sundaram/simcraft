@@ -7,8 +7,8 @@
 use crate::sparse::NodeSparse;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use std::cell::{Cell, RefCell};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Where linear solves run.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -23,31 +23,32 @@ pub enum ComputeMode {
     Gpu,
 }
 
-static MODE: AtomicU8 = AtomicU8::new(0);
-pub(crate) static LAST_DEVICE: Mutex<Option<String>> = Mutex::new(None);
-static FALLBACK: Mutex<Option<String>> = Mutex::new(None);
+thread_local! {
+    static MODE: Cell<ComputeMode> = const { Cell::new(ComputeMode::Auto) };
+    static LAST_DEVICE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static FALLBACK: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// Record why a requested GPU solve fell back to the CPU (reported as a result warning).
 pub fn note_fallback(msg: String) {
-    *FALLBACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(msg);
+    FALLBACK.with(|f| *f.borrow_mut() = Some(msg));
 }
 pub fn take_fallback() -> Option<String> {
-    FALLBACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+    FALLBACK.with(|f| f.borrow_mut().take())
 }
 
 pub fn set_mode(m: ComputeMode) {
-    MODE.store(m as u8, Ordering::SeqCst);
+    MODE.with(|c| c.set(m));
 }
 pub fn mode() -> ComputeMode {
-    match MODE.load(Ordering::SeqCst) {
-        1 => ComputeMode::Cpu,
-        2 => ComputeMode::Gpu,
-        _ => ComputeMode::Auto,
-    }
+    MODE.with(|c| c.get())
 }
-/// Name of the GPU used by the last GPU solve (None if no GPU solve has run).
+pub(crate) fn set_last_device(name: String) {
+    LAST_DEVICE.with(|d| *d.borrow_mut() = Some(name));
+}
+/// Name of the GPU used by the last GPU solve on this thread (None if no GPU solve has run).
 pub fn last_device() -> Option<String> {
-    LAST_DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    LAST_DEVICE.with(|d| d.borrow().clone())
 }
 
 const WG: u32 = 256;
@@ -357,7 +358,7 @@ impl GpuSystem {
         let staging_sc = staging(64);
         let staging_x = staging((n * 8) as u64);
         let device_name = info.name.clone();
-        *LAST_DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(device_name.clone());
+        set_last_device(device_name.clone());
         if let Some(e) = pollster::block_on(val_scope.pop()) {
             bail!("GPU setup failed: {e}");
         }

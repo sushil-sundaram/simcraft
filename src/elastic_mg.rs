@@ -255,6 +255,7 @@ impl<'a> FineOp<'a> {
     pub fn apply_k(&self, x: &[f64], y: &mut [f64]) {
         let inv_h = 1.0 / (self.mesh.h * 1e-3);
         y.par_iter_mut().for_each(|v| *v = 0.0);
+        let y_len = y.len();
         let yp = SyncPtr(y.as_mut_ptr());
         for col in &self.colours {
             col.par_iter().with_min_len(64).for_each(|&e| {
@@ -292,6 +293,7 @@ impl<'a> FineOp<'a> {
                 }
                 for b in 0..8 {
                     let base = en[b] as usize * 3;
+                    debug_assert!(base + 2 < y_len);
                     for c in 0..3 {
                         // SAFETY: elements of one colour share no node, so writes are disjoint
                         unsafe { *p.0.add(base + c) += ye[b * 3 + c] };
@@ -698,6 +700,7 @@ impl<'a> ElasticMg<'a> {
                             continue;
                         }
                         let (base, stride) = block_index(a1r, ra as usize, rb).unwrap();
+                        debug_assert!(base + 2 * stride + 2 < a1r.vals.len());
                         for c in 0..3 {
                             for d in 0..3 {
                                 // SAFETY: rows of one colour's cells are disjoint

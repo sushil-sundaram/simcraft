@@ -1044,7 +1044,7 @@ pub fn template() -> Value {
 // ------------------------------------------------------------------ HTML report
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
 fn fmt(v: f64) -> String {
@@ -1179,10 +1179,10 @@ td,th{{padding:3px 10px;border-bottom:1px solid var(--line);text-align:right}}th
 <p class=meta>SimCraft {} · commit {} · {} · {} mode · {} · {} threads · {:.0} s total. Each case runs the public tool API at several mesh sizes; the plot shows the relative error against unknowns (orange: SimCraft, blue diamonds: {} when provided), the dashed line the pass tolerance.</p>
 <div class=summary><div class=tile><b>{}</b>passed</div><div class=tile><b>{}</b>failed</div><div class=tile><b>{}</b>cases</div></div>
 {}</main></body></html>"#,
-        r["simcraft_version"].as_str().unwrap_or(""),
-        r["commit"].as_str().unwrap_or("–"),
-        r["date"].as_str().unwrap_or(""),
-        r["mode"].as_str().unwrap_or(""),
+        esc(r["simcraft_version"].as_str().unwrap_or("")),
+        esc(r["commit"].as_str().unwrap_or("–")),
+        esc(r["date"].as_str().unwrap_or("")),
+        esc(r["mode"].as_str().unwrap_or("")),
         esc(m["cpu"].as_str().unwrap_or("unknown CPU")),
         m["threads"],
         r["seconds"].as_f64().unwrap_or(0.0),

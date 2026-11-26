@@ -293,15 +293,22 @@ impl Session {
         Ok(())
     }
     pub fn open(&mut self, path: &str) -> Result<()> {
-        let txt = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+        self.open_in_workspace(path, None)
+    }
+
+    pub fn open_in_workspace(&mut self, path: &str, workspace: Option<&std::path::Path>) -> Result<()> {
+        let resolved = resolve_io_path(path, workspace, false, &["simcraft", "json"])?;
+        let txt = std::fs::read_to_string(&resolved).with_context(|| format!("reading {path}"))?;
         let v: Value = serde_json::from_str(&txt)?;
         let mut model: Model = serde_json::from_value(v.get("model").cloned().unwrap_or(v.clone()))?;
         for b in model.bodies.iter_mut() {
-            if let Shape::Stl { path, scale, offset, data } = &mut b.shape {
-                *data = Some(Arc::new(load_stl(path, *scale, *offset)?));
+            if let Shape::Stl { path: sp, scale, offset, data } = &mut b.shape {
+                let asset = resolve_io_path(sp, workspace, false, &["stl"])?;
+                *data = Some(Arc::new(load_stl(&asset.to_string_lossy(), *scale, *offset)?));
             }
-            if let Shape::Pcb { path, data, .. } = &mut b.shape {
-                *data = Some(Arc::new(crate::kicad::PcbData::load(path)?));
+            if let Shape::Pcb { path: pp, data, .. } = &mut b.shape {
+                let asset = resolve_io_path(pp, workspace, false, &["kicad_pcb"])?;
+                *data = Some(Arc::new(crate::kicad::PcbData::load(&asset.to_string_lossy())?));
             }
         }
         self.model = model;
@@ -315,7 +322,7 @@ impl Session {
         self.plan = v.get("plan").and_then(|p| serde_json::from_value(p.clone()).ok());
         self.mesh = None;
         self.touch_geometry();
-        self.project_path = Some(path.to_string());
+        self.project_path = Some(resolved.to_string_lossy().to_string());
         self.view_request = Some("fit".into());
         self.log(format!("Opened {path}"));
         Ok(())
@@ -342,6 +349,101 @@ impl Output {
     }
 }
 
+pub const MAX_PROJECT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Resolve and validate a file path for read/write tools.
+/// Checks for NUL bytes, validates the file extension against `allowed_exts` (when non-empty),
+/// and enforces containment inside `workspace` (resolving symlinks and `..`) when set.
+pub fn resolve_io_path(raw: &str, workspace: Option<&std::path::Path>, write: bool, allowed_exts: &[&str]) -> Result<std::path::PathBuf> {
+    if raw.is_empty() || raw.contains('\0') {
+        bail!("invalid file path");
+    }
+    let candidate = std::path::Path::new(raw);
+    if !allowed_exts.is_empty() {
+        let ext = candidate.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if !allowed_exts.iter().any(|a| *a == ext) {
+            bail!("unsupported file extension for '{raw}' (expected: {})", allowed_exts.iter().map(|e| format!(".{e}")).collect::<Vec<_>>().join(", "));
+        }
+    }
+    let Some(root) = workspace else {
+        return Ok(candidate.to_path_buf());
+    };
+    let canon_root = std::fs::canonicalize(root).with_context(|| format!("invalid workspace directory {}", root.display()))?;
+    let joined = if candidate.is_absolute() { candidate.to_path_buf() } else { canon_root.join(candidate) };
+    if !write {
+        let canon = std::fs::canonicalize(&joined).with_context(|| format!("reading {raw}"))?;
+        if !canon.starts_with(&canon_root) {
+            bail!("path '{raw}' is outside workspace {}", canon_root.display());
+        }
+        return Ok(canon);
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&joined) {
+        if meta.file_type().is_symlink() {
+            let target = std::fs::canonicalize(&joined).with_context(|| format!("resolving {raw}"))?;
+            if !target.starts_with(&canon_root) {
+                bail!("path '{raw}' points outside workspace {}", canon_root.display());
+            }
+        }
+    }
+    // Walk up to the deepest existing ancestor so we can canonicalize it and validate relative tail.
+    let mut existing = joined.as_path();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            bail!("invalid output path '{raw}'");
+        };
+        tail.push(name.to_os_string());
+        let Some(p) = existing.parent() else {
+            bail!("invalid output path '{raw}'");
+        };
+        existing = p;
+    }
+    let mut out = std::fs::canonicalize(existing).with_context(|| format!("resolving parent of {raw}"))?;
+    if !out.starts_with(&canon_root) {
+        bail!("path '{raw}' is outside workspace {}", canon_root.display());
+    }
+    for comp in tail.into_iter().rev() {
+        if comp == ".." {
+            bail!("path '{raw}' contains invalid traversal");
+        }
+        out.push(comp);
+    }
+    Ok(out)
+}
+
+/// External STL / KiCad PCB paths referenced inside a `.simcraft` project that lie outside the
+/// project's own directory (or its subdirectories).
+pub fn external_assets(project_path: &str) -> Result<Vec<String>> {
+    let p = std::path::Path::new(project_path);
+    let meta = std::fs::metadata(p).with_context(|| format!("reading {project_path}"))?;
+    if meta.len() > MAX_PROJECT_BYTES {
+        bail!("project file '{project_path}' is too large ({} MB)", meta.len() / (1024 * 1024));
+    }
+    let txt = std::fs::read_to_string(p).with_context(|| format!("reading {project_path}"))?;
+    let v: Value = serde_json::from_str(&txt)?;
+    let model: Model = serde_json::from_value(v.get("model").cloned().unwrap_or(v))?;
+    let base = p.parent().and_then(|d| std::fs::canonicalize(d).ok());
+    let mut out = Vec::new();
+    for b in &model.bodies {
+        let asset = match &b.shape {
+            Shape::Stl { path, .. } | Shape::Pcb { path, .. } => Some(path.as_str()),
+            _ => None,
+        };
+        if let Some(ap) = asset {
+            let ap_path = std::path::Path::new(ap);
+            let inside = match (&base, std::fs::canonicalize(ap_path).ok()) {
+                (Some(dir), Some(canon)) => canon.starts_with(dir),
+                (Some(dir), None) if !ap_path.is_absolute() => !ap_path.components().any(|c| matches!(c, std::path::Component::ParentDir)) && dir.join(ap_path).starts_with(dir),
+                _ => false,
+            };
+            if !inside && !out.iter().any(|x| x == ap) {
+                out.push(ap.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub struct Core {
     pub session: Mutex<Session>,
     pub progress: Mutex<Progress>,
@@ -351,6 +453,17 @@ pub struct Core {
     pub notify: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Set by the GUI so `screenshot_gui` can capture the window.
     pub gui_ctx: Mutex<Option<eframe::egui::Context>>,
+    /// Optional root directory confining file-taking tools (`SIMCRAFT_WORKSPACE` / `--workspace`).
+    workspace: Mutex<Option<std::path::PathBuf>>,
+}
+
+impl Core {
+    pub fn set_workspace(&self, dir: Option<std::path::PathBuf>) {
+        *self.workspace.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = dir;
+    }
+    pub fn workspace_dir(&self) -> Option<std::path::PathBuf> {
+        self.workspace.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
 }
 
 pub type Shared = Arc<Core>;
@@ -431,7 +544,8 @@ impl Drop for JobGuard<'_> {
 }
 
 pub fn new_core() -> Shared {
-    Arc::new(Core { session: Mutex::new(Session::default()), progress: Mutex::new(Progress::default()), busy: AtomicBool::new(false), cancel: AtomicBool::new(false), notify: Mutex::new(None), gui_ctx: Mutex::new(None) })
+    let workspace = std::env::var_os("SIMCRAFT_WORKSPACE").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    Arc::new(Core { session: Mutex::new(Session::default()), progress: Mutex::new(Progress::default()), busy: AtomicBool::new(false), cancel: AtomicBool::new(false), notify: Mutex::new(None), gui_ctx: Mutex::new(None), workspace: Mutex::new(workspace) })
 }
 
 // ---------- argument helpers ----------
@@ -443,7 +557,11 @@ fn v3(a: &Value, k: &str) -> Result<V3> {
     }
     let mut o = [0.0; 3];
     for i in 0..3 {
-        o[i] = arr[i].as_f64().ok_or_else(|| anyhow!("'{k}' must contain numbers"))?;
+        let x = arr[i].as_f64().ok_or_else(|| anyhow!("'{k}' must contain finite numbers"))?;
+        if !x.is_finite() {
+            bail!("'{k}' must contain finite numbers");
+        }
+        o[i] = x;
     }
     Ok(o)
 }
@@ -451,10 +569,14 @@ fn v3_or(a: &Value, k: &str, d: V3) -> Result<V3> {
     if a.get(k).is_some_and(|v| !v.is_null()) { v3(a, k) } else { Ok(d) }
 }
 fn num(a: &Value, k: &str) -> Result<f64> {
-    a.get(k).and_then(|v| v.as_f64()).ok_or_else(|| anyhow!("missing number '{k}'"))
+    let x = a.get(k).and_then(|v| v.as_f64()).ok_or_else(|| anyhow!("missing number '{k}'"))?;
+    if !x.is_finite() {
+        bail!("'{k}' must be finite");
+    }
+    Ok(x)
 }
 fn opt_num(a: &Value, k: &str) -> Option<f64> {
-    a.get(k).and_then(|v| v.as_f64())
+    a.get(k).and_then(|v| v.as_f64()).filter(|x| x.is_finite())
 }
 fn opt_str<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
     a.get(k).and_then(|v| v.as_str())
@@ -588,6 +710,8 @@ impl Core {
         if self.is_busy() && !matches!(tool, "get_model" | "get_help" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets") {
             bail!("a solve is running; wait for it to finish (use get_status)");
         }
+        let ws = self.workspace_dir();
+        let ws_ref = ws.as_deref();
         let mut guard = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let s = &mut *guard;
         match tool {
@@ -631,31 +755,37 @@ impl Core {
                 Ok(Output::text(format!("Added sphere '{n}'. Its face is {n}.surface.")))
             }
             "import_stl" => {
-                let path = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path'"))?.to_string();
+                let raw = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path'"))?;
+                let resolved = resolve_io_path(raw, ws_ref, false, &["stl"])?;
+                let path = resolved.to_string_lossy().to_string();
                 let sc = opt_num(a, "scale").unwrap_or(1.0);
                 let off = v3_or(a, "offset", [0.0; 3])?;
                 let data = Arc::new(load_stl(&path, sc, off)?);
                 let nseg = data.n_segments;
                 let ntri = data.tris.len();
-                let stem = std::path::Path::new(&path).file_stem().and_then(|x| x.to_str()).unwrap_or("Part").to_string();
+                let stem = resolved.file_stem().and_then(|x| x.to_str()).unwrap_or("Part").to_string();
                 let shape = Shape::Stl { path: path.clone(), scale: sc, offset: off, data: Some(data) };
                 let n = s.add_body(Some(opt_str(a, "name").unwrap_or(&stem)), "Part", shape, op(a)?, opt_str(a, "material"))?;
                 s.view_request = Some("fit".into());
                 Ok(Output::text(format!("Imported '{path}' as body '{n}' ({ntri} triangles, {nseg} smooth faces). Use list_faces to see face names.")))
             }
             "pcb_nets" => {
-                let path = match opt_str(a, "path") {
+                let raw = match opt_str(a, "path") {
                     Some(p) => p.to_string(),
                     None => s.pcb_path().ok_or_else(|| anyhow!("give 'path' (.kicad_pcb) or import a board first"))?,
                 };
+                let resolved = resolve_io_path(&raw, ws_ref, false, &["kicad_pcb"])?;
+                let path = resolved.to_string_lossy().to_string();
                 let nets = crate::kicad::dc::net_pads(&path)?;
                 Ok(Output::json(json!({"path": path, "nets": nets.iter().map(|(n, p)| json!({"net": n, "pads": p})).collect::<Vec<_>>()})))
             }
             "pcb_dc" => {
-                let path = match opt_str(a, "path") {
+                let raw = match opt_str(a, "path") {
                     Some(p) => p.to_string(),
                     None => s.pcb_path().ok_or_else(|| anyhow!("give 'path' (.kicad_pcb) or import a board first"))?,
                 };
+                let resolved = resolve_io_path(&raw, ws_ref, false, &["kicad_pcb"])?;
+                let path = resolved.to_string_lossy().to_string();
                 let from = opt_str(a, "from").ok_or_else(|| anyhow!("missing 'from' (pad as REFERENCE.PAD, e.g. U1.3)"))?;
                 let to = opt_str(a, "to").ok_or_else(|| anyhow!("missing 'to' (pad as REFERENCE.PAD, e.g. J1.1)"))?;
                 let current = opt_num(a, "current").unwrap_or(1.0);
@@ -664,7 +794,9 @@ impl Core {
                 Ok(Output::json(r))
             }
             "import_kicad" => {
-                let path = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path' (.kicad_pcb file)"))?.to_string();
+                let raw = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path' (.kicad_pcb file)"))?;
+                let resolved = resolve_io_path(raw, ws_ref, false, &["kicad_pcb"])?;
+                let path = resolved.to_string_lossy().to_string();
                 let data = std::sync::Arc::new(crate::kicad::PcbData::load(&path)?);
                 let off = v3_or(a, "offset", [0.0; 3])?;
                 let bname = s.add_body(Some(opt_str(a, "name").unwrap_or("Board")), "Board", Shape::Pcb { path: path.clone(), offset: off, data: Some(data.clone()) }, Op::Add, Some(opt_str(a, "material").unwrap_or("FR-4 (PCB laminate)")))?;
@@ -752,8 +884,8 @@ impl Core {
                 let table = |k: &str| -> Result<Option<Vec<[f64; 2]>>> {
                     let Some(v) = a.get(k) else { return Ok(None) };
                     let rows: Vec<[f64; 2]> = serde_json::from_value(v.clone()).map_err(|_| anyhow!("{k} must be [[temperature °C, value], …]"))?;
-                    if rows.windows(2).any(|w| w[1][0] <= w[0][0]) || rows.iter().any(|r| !(r[1] > 0.0)) {
-                        bail!("{k}: temperatures must increase and values must be > 0");
+                    if rows.iter().any(|r| !r[0].is_finite() || !r[1].is_finite() || !(r[1] > 0.0)) || rows.windows(2).any(|w| w[1][0] <= w[0][0]) {
+                        bail!("{k}: temperatures must increase and values must be finite and > 0");
                     }
                     Ok(Some(rows))
                 };
@@ -767,6 +899,14 @@ impl Core {
                 }
                 if let Some(t) = table("specific_heat_table")? {
                     m.specific_heat_table = t;
+                }
+                let finite_ok = [
+                    m.youngs_modulus_gpa, m.poisson_ratio, m.density, m.yield_strength_mpa, m.ultimate_strength_mpa,
+                    m.thermal_conductivity, m.thermal_expansion, m.specific_heat, m.relative_permittivity,
+                    m.electrical_conductivity, m.relative_permeability, m.loss_tangent,
+                ].iter().all(|v| v.is_finite());
+                if !finite_ok {
+                    bail!("invalid material: all numeric properties must be finite");
                 }
                 if m.relative_permittivity < 1.0 || m.electrical_conductivity < 0.0 || m.relative_permeability <= 0.0 || m.loss_tangent < 0.0 {
                     bail!("invalid electromagnetic properties: need εr ≥ 1, σ ≥ 0, μr > 0, tan δ ≥ 0");
@@ -1344,14 +1484,18 @@ impl Core {
                 Ok(Output { text, image_png: Some(png) })
             }
             "export_vtk" => {
-                let path = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path'"))?;
+                let raw = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path'"))?;
+                let resolved = resolve_io_path(raw, ws_ref, true, &["vtk"])?;
+                let path = resolved.to_string_lossy().to_string();
                 let m = s.ensure_mesh()?;
-                crate::vtk::export(path, &m, s.results.as_deref())?;
+                crate::vtk::export(&path, &m, s.results.as_deref())?;
                 s.log(format!("Exported VTK {path}"));
                 Ok(Output::text(format!("Wrote {path} (open with ParaView).")))
             }
             "save_project" => {
-                let path = opt_str(a, "path").map(String::from).or(s.project_path.clone()).ok_or_else(|| anyhow!("missing 'path'"))?;
+                let raw = opt_str(a, "path").map(String::from).or(s.project_path.clone()).ok_or_else(|| anyhow!("missing 'path'"))?;
+                let resolved = resolve_io_path(&raw, ws_ref, true, &["simcraft", "json"])?;
+                let path = resolved.to_string_lossy().to_string();
                 s.save(&path)?;
                 s.project_path = Some(path.clone());
                 s.mark_saved();
@@ -1361,16 +1505,26 @@ impl Core {
                 Ok(Output::text(format!("Saved project to {path}.")))
             }
             "open_project" => {
-                let path = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path'"))?;
-                s.open(path)?;
+                let raw = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path'"))?;
+                let is_autosave = std::path::Path::new(raw) == autosave_path();
+                let is_handoff = a.get("handoff").and_then(|v| v.as_bool()).unwrap_or(false)
+                    || std::env::var_os("SIMCRAFT_HANDOFF_FILE").is_some_and(|h| std::path::Path::new(raw) == std::path::Path::new(&h));
+                // Autosave/handoff paths live outside SIMCRAFT_WORKSPACE, while embedded assets still obey ws_ref.
+                let proj_ws = if is_autosave || is_handoff { None } else { ws_ref };
+                let resolved = resolve_io_path(raw, proj_ws, false, &["simcraft", "json"])?;
+                let path = resolved.to_string_lossy().to_string();
+                s.open_in_workspace(&path, ws_ref)?;
                 s.mark_saved();
-                if std::path::Path::new(path) != autosave_path() {
-                    push_recent(path);
-                    s.project_path = Some(path.to_string());
+                if !is_autosave && !is_handoff {
+                    push_recent(&path);
+                    s.project_path = Some(path);
                 } else {
-                    // a recovered autosave has no project file yet and is unsaved work
+                    // a recovered autosave or MCP handoff has no user project file yet
                     s.project_path = None;
                     s.saved_model.clear();
+                    if is_handoff {
+                        let _ = std::fs::remove_file(&resolved);
+                    }
                 }
                 Ok(Output::json(s.model_json()))
             }
@@ -1400,11 +1554,15 @@ impl Core {
                     stale: s.results_stale,
                 })?;
                 let path = match opt_str(a, "path") {
-                    Some(p) => p.to_string(),
+                    Some(p) => resolve_io_path(p, ws_ref, true, &["html", "htm"])?.to_string_lossy().to_string(),
                     None => {
-                        let dir = match &s.project_path {
-                            Some(p) => std::path::Path::new(p).parent().map(|d| d.to_path_buf()).unwrap_or_else(std::env::temp_dir),
-                            None => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("SimCraft"),
+                        let dir = if let Some(ws_dir) = ws_ref {
+                            std::fs::canonicalize(ws_dir).unwrap_or_else(|_| ws_dir.to_path_buf())
+                        } else {
+                            match &s.project_path {
+                                Some(p) => std::path::Path::new(p).parent().map(|d| d.to_path_buf()).unwrap_or_else(std::env::temp_dir),
+                                None => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("SimCraft"),
+                            }
                         };
                         std::fs::create_dir_all(&dir)?;
                         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -1612,6 +1770,27 @@ impl Core {
             }
             _ => {
                 let mesh = mesh.unwrap();
+                let ws = self.workspace_dir();
+                let ws_ref = ws.as_deref();
+                let path = match opt_str(a, "export_path") {
+                    Some(p) => resolve_io_path(p, ws_ref, true, &["stl"])?.to_string_lossy().to_string(),
+                    None => {
+                        let dir = if let Some(ws_dir) = ws_ref {
+                            std::fs::canonicalize(ws_dir).unwrap_or_else(|_| ws_dir.to_path_buf())
+                        } else {
+                            match &project {
+                                Some(p) => std::path::Path::new(p).parent().map(|d| d.to_path_buf()).unwrap_or_else(std::env::temp_dir),
+                                None => {
+                                    let d = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("SimCraft");
+                                    std::fs::create_dir_all(&d)?;
+                                    d
+                                }
+                            }
+                        };
+                        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        dir.join(format!("optimized-{stamp}.stl")).to_string_lossy().to_string()
+                    }
+                };
                 let settings = crate::topo::TopoSettings {
                     volume_fraction: opt_num(a, "volume_fraction").unwrap_or(0.4),
                     iterations: opt_num(a, "iterations").unwrap_or(40.0) as usize,
@@ -1619,21 +1798,6 @@ impl Core {
                     penal: 3.0,
                 };
                 let tr = crate::topo::run(&model, &mesh, &settings, &prog)?;
-                let path = match opt_str(a, "export_path") {
-                    Some(p) => p.to_string(),
-                    None => {
-                        let dir = match &project {
-                            Some(p) => std::path::Path::new(p).parent().map(|d| d.to_path_buf()).unwrap_or_else(std::env::temp_dir),
-                            None => {
-                                let d = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join("SimCraft");
-                                std::fs::create_dir_all(&d)?;
-                                d
-                            }
-                        };
-                        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-                        dir.join(format!("optimized-{stamp}.stl")).to_string_lossy().to_string()
-                    }
-                };
                 let ntri = crate::topo::write_stl(&mesh, &tr.density, 0.5, &path)?;
                 let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.results = Some(Arc::new(tr.results));

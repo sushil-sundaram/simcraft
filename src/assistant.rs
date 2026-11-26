@@ -7,8 +7,35 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+const MAX_LLM_BYTES: u64 = 8 * 1024 * 1024;
+
 pub fn base_url() -> String {
     std::env::var("SIMCRAFT_LLM_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into())
+}
+
+fn validated_base_url() -> Result<String> {
+    let raw = base_url();
+    let trimmed = raw.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .ok_or_else(|| anyhow!("SIMCRAFT_LLM_URL must use http:// or https://"))?;
+    let host_port = rest.split('/').next().unwrap_or("");
+    if host_port.is_empty() {
+        bail!("SIMCRAFT_LLM_URL is missing a host");
+    }
+    let local_only = std::env::var("SIMCRAFT_LOCAL_ONLY_LLM").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    if local_only {
+        let host = if host_port.starts_with('[') {
+            host_port.split(']').next().map(|h| h.trim_start_matches('[')).unwrap_or("")
+        } else {
+            host_port.split(':').next().unwrap_or("")
+        };
+        if !matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "localhost" | "::1") {
+            bail!("SIMCRAFT_LOCAL_ONLY_LLM requires a loopback SIMCRAFT_LLM_URL host, got '{host}'");
+        }
+    }
+    Ok(trimmed.to_string())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -51,10 +78,15 @@ pub struct Plan {
 
 /// Models installed in the local Ollama server.
 pub fn list_models() -> Result<Vec<String>> {
-    let v: Value = ureq::get(format!("{}/api/tags", base_url()))
+    let url = validated_base_url()?;
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(10))).build().into();
+    let v: Value = agent
+        .get(format!("{url}/api/tags"))
         .call()
-        .map_err(|e| anyhow!("cannot reach the local model server at {} ({e}). Install Ollama (https://ollama.com) and run `ollama pull qwen2.5:7b`", base_url()))?
+        .map_err(|e| anyhow!("cannot reach the local model server at {url} ({e}). Install Ollama (https://ollama.com) and run `ollama pull qwen2.5:7b`"))?
         .body_mut()
+        .with_config()
+        .limit(MAX_LLM_BYTES)
         .read_json()?;
     Ok(v["models"].as_array().map(|a| a.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect()).unwrap_or_default())
 }
@@ -231,12 +263,15 @@ pub fn plan(goal: &str, model: &str) -> Result<Plan> {
             {"role": "user", "content": goal}
         ]
     });
+    let url = validated_base_url()?;
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(600))).build().into();
     let resp: Value = agent
-        .post(format!("{}/api/chat", base_url()))
+        .post(format!("{url}/api/chat"))
         .send_json(&body)
         .map_err(|e| anyhow!("local model request failed ({e}); is Ollama running and is '{model}' installed?"))?
         .body_mut()
+        .with_config()
+        .limit(MAX_LLM_BYTES)
         .read_json()
         .context("reading the model response")?;
     let content = resp["message"]["content"].as_str().ok_or_else(|| anyhow!("unexpected model response: {resp}"))?;

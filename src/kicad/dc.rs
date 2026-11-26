@@ -56,13 +56,17 @@ fn net_name(s: &Sx, table: &BTreeMap<String, String>) -> Option<String> {
 
 /// Solve the DC flow of `current` amps from pad `from` to pad `to` ("U1.3" = reference U1, pad 3).
 pub fn dc_drop(path: &str, net: Option<&str>, from: &str, to: &str, current: f64, temperature_c: f64) -> Result<Value> {
+    let meta = std::fs::metadata(path).map_err(|e| anyhow!("reading {path}: {e}"))?;
+    if meta.len() > MAX_PCB_BYTES {
+        bail!("KiCad board '{path}' is too large ({} MB; limit {} MB)", meta.len() / (1024 * 1024), MAX_PCB_BYTES / (1024 * 1024));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| anyhow!("reading {path}: {e}"))?;
     dc_drop_text(&text, path, net, from, to, current, temperature_c)
 }
 
 pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &str, current: f64, temperature_c: f64) -> Result<Value> {
-    if !(current > 0.0) {
-        bail!("current must be > 0 A");
+    if !current.is_finite() || !(current > 0.0) || !temperature_c.is_finite() {
+        bail!("current must be finite and > 0 A, and temperature must be finite");
     }
     let board = PcbData::from_text(text, path)?;
     let root = parse(text)?;
@@ -187,13 +191,20 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
         wmin = 0.5;
     }
     let (sx, sy) = (hi[0] - lo[0], hi[1] - lo[1]);
+    if !sx.is_finite() || !sy.is_finite() {
+        bail!("net copper bounds are not finite");
+    }
     let mut res = (wmin / 4.0).clamp(0.02, 0.25);
-    while (sx / res) * (sy / res) * nl as f64 > MAX_PIXELS as f64 {
+    while ((sx / res) + 3.0) * ((sy / res) + 3.0) * nl as f64 > MAX_PIXELS as f64 {
         res *= 1.25;
     }
     let (nx, ny) = ((sx / res).ceil() as usize + 2, (sy / res).ceil() as usize + 2);
+    let np = nx.checked_mul(ny).ok_or_else(|| anyhow!("DC raster dimensions overflow"))?;
+    if nl.checked_mul(np).is_none_or(|tot| tot > MAX_PIXELS * 2) {
+        bail!("DC raster exceeds pixel limit");
+    }
     let (x0, y0) = (lo[0] - res, lo[1] - res);
-    let new_r = || Raster { nx, ny, res, x0, y0, bits: vec![0u8; nx * ny] };
+    let new_r = || Raster { nx, ny, res, x0, y0, bits: vec![0u8; np] };
     let mut cu: Vec<Raster> = (0..nl).map(|_| new_r()).collect();
     for (layer, a, b, w) in &tracks {
         for li in lidx(layer) {
@@ -548,6 +559,10 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
 /// Nets of a board with their pads ("REF.PAD"), for choosing `pcb_dc` terminals. Nets with fewer
 /// than two pads are left out; sorted by name.
 pub fn net_pads(path: &str) -> Result<Vec<(String, Vec<String>)>> {
+    let meta = std::fs::metadata(path).map_err(|e| anyhow!("reading {path}: {e}"))?;
+    if meta.len() > MAX_PCB_BYTES {
+        bail!("KiCad board '{path}' is too large ({} MB; limit {} MB)", meta.len() / (1024 * 1024), MAX_PCB_BYTES / (1024 * 1024));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| anyhow!("reading {path}: {e}"))?;
     net_pads_text(&text)
 }

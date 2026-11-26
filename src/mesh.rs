@@ -202,19 +202,27 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
     for b in bodies {
         b.shape.validate()?;
     }
-    if !(h > 0.0) {
-        bail!("element size must be positive");
+    if !h.is_finite() || h <= 0.0 {
+        bail!("element size must be finite and positive");
     }
     let (lo, hi) = domain_bounds(bodies, with_enclosure);
     let size = sub(hi, lo);
+    if !lo.iter().chain(&hi).chain(&size).all(|v| v.is_finite()) {
+        bail!("geometry bounds are not finite");
+    }
     let mut dims = [0usize; 3];
     let mut origin = [0.0; 3];
+    let grid_cap = max_cells.saturating_mul(4);
     for k in 0..3 {
-        dims[k] = ((size[k] / h) - 1e-6).ceil().max(1.0) as usize;
+        let count = ((size[k] / h) - 1e-6).ceil().max(1.0);
+        if !count.is_finite() || count > grid_cap as f64 {
+            bail!("element size {h} mm is too small for this geometry; use a larger element size");
+        }
+        dims[k] = count as usize;
         origin[k] = lo[k] - (dims[k] as f64 * h - size[k]) / 2.0;
     }
-    let ncell = dims[0] * dims[1] * dims[2];
-    if ncell > max_cells * 4 {
+    let ncell = dims[0].checked_mul(dims[1]).and_then(|v| v.checked_mul(dims[2])).unwrap_or(usize::MAX);
+    if ncell > grid_cap {
         bail!("element size {h} mm is too small for this geometry ({ncell} grid cells); use a larger element size");
     }
     let [nx, ny, nz] = dims;

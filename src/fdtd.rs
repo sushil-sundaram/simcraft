@@ -648,7 +648,7 @@ impl Gpu {
         if let Some(err) = pollster::block_on(oom.pop()) {
             bail!("not enough free GPU memory for the FDTD grid ({} MB): {err}", (f * 9) / 1_000_000);
         }
-        *crate::gpu::LAST_DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(info.name.clone());
+        crate::gpu::set_last_device(info.name.clone());
         Ok(Gpu { device, queue, pipes, bind, params, dbuf: d, staging, groups: (gx, gy), params_data, name: info.name, fault })
     }
     fn check(&self) -> Result<()> {
