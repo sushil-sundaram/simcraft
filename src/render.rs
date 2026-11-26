@@ -208,6 +208,11 @@ pub fn load_color(l: &Load) -> [u8; 3] {
         Load::Outlet { .. } => [150, 200, 40],
         Load::Coil { .. } => [200, 120, 40],
         Load::Magnet { .. } => [200, 50, 80],
+        Load::BoltPretension { .. } => [210, 130, 30],
+        Load::Spring { .. } => [40, 185, 160],
+        Load::RemoteForce { .. } => [220, 75, 110],
+        Load::RemoteDisplacement { .. } => [125, 85, 225],
+        Load::PointMass { .. } => [80, 155, 105],
         _ => [160, 160, 160],
     }
 }

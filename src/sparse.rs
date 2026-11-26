@@ -15,10 +15,22 @@ pub struct NodeSparse {
 
 impl NodeSparse {
     pub fn new(n_nodes: usize, elems: &[[u32; 8]], bs: usize) -> Self {
+        Self::new_with_edges(n_nodes, elems, &[], bs)
+    }
+
+    pub fn new_with_edges(n_nodes: usize, elems: &[[u32; 8]], extra_edges: &[(u32, u32)], bs: usize) -> Self {
         let mut lists: Vec<Vec<u32>> = vec![Vec::new(); n_nodes];
         for e in elems {
             for &a in e {
                 lists[a as usize].extend_from_slice(e);
+            }
+        }
+        for &(u, v) in extra_edges {
+            if (u as usize) < n_nodes && (v as usize) < n_nodes {
+                lists[u as usize].push(u);
+                lists[u as usize].push(v);
+                lists[v as usize].push(u);
+                lists[v as usize].push(v);
             }
         }
         let mut ptr = Vec::with_capacity(n_nodes + 1);
@@ -35,6 +47,38 @@ impl NodeSparse {
         }
         let vals = vec![0.0; adj.len() * bs * bs];
         NodeSparse { bs, ptr, adj, vals }
+    }
+
+    /// Copy sparsity pattern with all values reset to zero.
+    pub fn empty_like(&self) -> Self {
+        NodeSparse { bs: self.bs, ptr: self.ptr.clone(), adj: self.adj.clone(), vals: vec![0.0; self.vals.len()] }
+    }
+
+    /// Add a bs × bs row-major block into entry `(row_node, col_node)`.
+    pub fn add_block(&mut self, row_node: usize, col_node: usize, block: &[f64]) {
+        let bs = self.bs;
+        debug_assert_eq!(block.len(), bs * bs);
+        let pos = self.find(row_node, col_node as u32);
+        for c in 0..bs {
+            let rs = self.row_start(row_node, c) + pos * bs;
+            for d in 0..bs {
+                self.vals[rs + d] += block[c * bs + d];
+            }
+        }
+    }
+
+    /// Symmetric pair coupling `[+K, -K; -K, +K]` between nodes `a` and `b` (`K` is `bs × bs` row-major).
+    pub fn add_symmetric_pair(&mut self, a: usize, b: usize, k_mat: &[f64]) {
+        let bs = self.bs;
+        debug_assert_eq!(k_mat.len(), bs * bs);
+        self.add_block(a, a, k_mat);
+        if a == b {
+            return;
+        }
+        self.add_block(b, b, k_mat);
+        let neg: Vec<f64> = k_mat.iter().map(|v| -v).collect();
+        self.add_block(a, b, &neg);
+        self.add_block(b, a, &neg);
     }
 
     pub fn n(&self) -> usize {

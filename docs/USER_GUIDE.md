@@ -388,6 +388,16 @@ Fields: **Fatigue Safety Factor** (stress factor to reach the design life; cappe
 Life** (cycles; 10¹² = infinite) and **Fatigue Damage** (Miner sum for the design life or exposure;
 ≥ 1 means failure). Safety-factor and life plots use a reversed colour scale: **red = critical**.
 
+**Contact interfaces (bonded, no separation, frictionless, frictional)** — touching bodies are bonded by default (they share mesh nodes). To model separate parts in **Static Structural** or **Thermal-Stress**, add a **Contact Pair** (`SETUP ▸ Contact Pair`, MCP `add_contact`):
+- **Bonded**: shared nodes (rigidly welded across the interface).
+- **No Separation**: ties normal motion (`g_n = 0`) while allowing free tangential sliding.
+- **Frictionless**: transmits compression and separates freely when pulled into tension; solves fitted curved-on-flat contact (e.g. Hertz cylinder-on-flat) cleanly via Augmented Lagrange.
+- **Frictional (μ)**: Coulomb stick/slip with friction coefficient `μ` and optional normal `offset_mm` (`> 0` interference / shrink fit, `< 0` initial clearance). Outputs **Contact Pressure** contours plus normal/tangential contact forces and open/closed node counts.
+
+**Bolt pretension** (`SETUP ▸ Bolt Pretension`, MCP `add_bolt_pretension`) — splits a bolt body across an interior cut plane (defaulting to its cylinder/length axis midpoint) and solves in two steps: **Step 1** applies the target preload force (`force_n` N) or shortening (`adjustment_mm` mm) against supports and contacts; **Step 2** locks that adjustment and applies all external mechanical and thermal loads, reporting Step 1/2 bolt forces, locked adjustment, and **preload loss**.
+
+**Connections (`Spring`, `Remote Force`, `Remote Displacement`, `Point Mass`)** — elastic springs (`N/mm` + optional preload, face-to-ground or face-to-face); distributing RBE3 **Remote Force / Moment** (`N` and `N·m` at any 3D point with zero face stiffening); **Remote Displacement** (`mm` and `rad` at a remote pilot, distributing RBE3 or rigid RBE2); and **Point Mass** (`kg`, surface or offset) participating in **Gravity**, **Modal**, **Vibration**, and **Transient Structural** analyses.
+
 **Contact (compression-only support)** — available in Static Structural: the faces rest on a rigid
 surface that pushes back but cannot pull. SimCraft finds which nodes stay in contact. If everything
 lifts off, the part is free and you will get an "under-constrained" message.
@@ -558,6 +568,11 @@ are ignored — that exchange is computed; use them on the enclosure's outer fac
 | Fixed Support | faces | — | all directions fixed |
 | Displacement | faces | x, y, z (mm), each optional | leave a component free for rollers |
 | Compression-only | faces | — | rigid frictionless contact, static structural |
+| Bolt Pretension | body | force_n (N) or adjustment_mm (mm), axis, cut_mm | two-step preload + locked working load |
+| Elastic Spring | faces (+ optional to_faces) | stiffness_n_per_mm (N/mm), preload_n (N), anchor | face-to-ground or face-to-face |
+| Remote Force | faces | point (mm), force (N), moment (N·m) | RBE3 distributing load (zero face stiffening) |
+| Remote Displacement | faces | point (mm), x/y/z (mm), rx/ry/rz (rad), rigid | RBE3 distributing or RBE2 rigid spider |
+| Point Mass | faces | mass_kg (kg), optional point (mm) | participates in Gravity and modal/vibration/transient |
 | Symmetry | faces | — | zero normal motion (structural) / free-slip (CFD) |
 | Force | faces | vector (N) | total force shared over the faces |
 | Pressure | faces | MPa | positive pushes into the surface |

@@ -267,7 +267,6 @@ fn first_omega(k: &NodeSparse, solver: &Solver, m: &[f64], fixed: &[Option<f64>]
 
 pub fn transient_structural(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut Results) -> Result<()> {
     let nn = mesh.nodes.len();
-    let n = nn * 3;
     let st = &model.analysis;
     let steps = st.time_steps.clamp(1, 5000);
     let dt = st.end_time / steps as f64;
@@ -275,15 +274,20 @@ pub fn transient_structural(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog,
         bail!("end time must be positive");
     }
     let (asm, units) = assemble_structural(model, mesh, prog)?;
-    let Assembled { k: k0, fixed, support_nodes, contact, owner } = asm;
+    let Assembled { k: mut k0, fixed, support_nodes, contact, owner, couplings } = asm;
+    couplings.apply_linear_interface_ties(mesh, &mut k0);
+    let n = k0.n();
     if support_nodes.is_empty() {
         bail!("no supports defined: add a Fixed Support so the part cannot fly away");
     }
     if !contact.is_empty() {
         res.warnings.push("compression-only supports are treated as fixed in transient analyses".into());
     }
-    let f_ext = external_forces(model, mesh, None)?;
-    let m = lumped_mass(mesh);
+    let mut f_ext = external_forces(model, mesh, None)?;
+    f_ext.resize(n, 0.0);
+    let mut m = lumped_mass(mesh);
+    m.resize(n, 0.0);
+    couplings.apply_mass_diag(&mut m);
 
     // first frequency for Rayleigh damping
     prog.report(0.02, "estimating first natural frequency")?;
@@ -366,7 +370,7 @@ pub fn transient_structural(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog,
     res.quantity("Peak displacement", peak.1, "mm");
     res.quantity("Time of peak displacement", peak.0, "s");
     prog.report(0.92, "computing stresses")?;
-    structural_post(model, mesh, &u, None, &units, &fixed, &f_ext, &support_nodes, &owner, res);
+    structural_post_ex(model, mesh, &u, None, &units, &fixed, &f_ext, &support_nodes, &owner, Some(&couplings), res);
     res.disp = Some(to_mm(&u));
     prog.report(1.0, "done")?;
     Ok(())
@@ -420,13 +424,15 @@ fn von_mises(s: &[f64; 6]) -> f64 {
 pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut Results) -> Result<()> {
     let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
-    let n = nn * 3;
     let (asm, units) = assemble_structural(model, mesh, prog)?;
-    let Assembled { k: k0, fixed, support_nodes, owner, .. } = asm;
+    let Assembled { k: mut k0, fixed, support_nodes, owner, couplings, .. } = asm;
+    couplings.apply_linear_interface_ties(mesh, &mut k0);
+    let n = k0.n();
     if support_nodes.is_empty() {
         bail!("no supports defined: add a Fixed Support");
     }
-    let f_ext = external_forces(model, mesh, None)?;
+    let mut f_ext = external_forces(model, mesh, None)?;
+    f_ext.resize(n, 0.0);
     if f_ext.iter().all(|v| *v == 0.0) && fixed.iter().all(|g| g.is_none_or(|v| v == 0.0)) {
         bail!("linear buckling needs a load (e.g. a compressive Force) to scale");
     }
@@ -440,7 +446,7 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
     let mut u: Vec<f64> = fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
     let check_fn = prog.check_scalar();
     solver.solve(&k, &f, &mut u, 1e-9, &check_fn)?;
-    structural_post(model, mesh, &u, None, &units, &fixed, &f_ext, &support_nodes, &owner, res);
+    structural_post_ex(model, mesh, &u, None, &units, &fixed, &f_ext, &support_nodes, &owner, Some(&couplings), res);
     res.disp = Some((0..nn).map(|q| [u[q * 3] * 1e3, u[q * 3 + 1] * 1e3, u[q * 3 + 2] * 1e3]).collect());
 
     // 2. geometric stiffness
@@ -494,7 +500,7 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
             Ok(kg)
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut kg = NodeSparse::new(nn, &mesh.elems, 3);
+    let mut kg = k0.empty_like();
     for (e, en) in mesh.elems.iter().enumerate() {
         kg.add_element(en, &kg_elems[e], -1.0); // store B = -Kg
     }
@@ -681,16 +687,17 @@ fn return_map(eps: &[f64; 6], st: &GpState, e: f64, nu: f64, sy: f64, hmod: f64)
 pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut Results) -> Result<()> {
     let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
-    let n = nn * 3;
     let (asm, units) = assemble_structural(model, mesh, prog)?;
-    let Assembled { fixed, support_nodes, contact, owner, .. } = asm;
+    let Assembled { k: k_base, fixed, support_nodes, contact, owner, couplings } = asm;
+    let n = k_base.n();
     if support_nodes.is_empty() {
         bail!("no supports defined: add a Fixed Support");
     }
     if !contact.is_empty() {
         res.warnings.push("compression-only supports are treated as fixed in nonlinear analyses".into());
     }
-    let f_ext = external_forces(model, mesh, None)?;
+    let mut f_ext = external_forces(model, mesh, None)?;
+    f_ext.resize(n, 0.0);
     let zero_fixed: Vec<Option<f64>> = fixed.iter().map(|g| g.map(|_| 0.0)).collect();
     res.info.dofs = n;
 
@@ -769,7 +776,7 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
             })
             .collect()
     };
-    let gather = |outs: &[ElemOut]| -> Vec<f64> {
+    let gather = |outs: &[ElemOut], u: &[f64]| -> Vec<f64> {
         let mut fint = vec![0.0; n];
         for (e, o) in outs.iter().enumerate() {
             for (a, &nd) in mesh.elems[e].iter().enumerate() {
@@ -778,6 +785,7 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
                 }
             }
         }
+        couplings.add_internal_forces(u, &mut fint);
         fint
     };
 
@@ -794,7 +802,7 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
         let mut converged = false;
         for it in 0..40 {
             let outs = evaluate(&u, &committed, true);
-            let fint = gather(&outs);
+            let fint = gather(&outs, &u);
             let mut r: Vec<f64> = (0..n).map(|i| if fixed[i].is_some() { 0.0 } else { lam * f_ext[i] - fint[i] }).collect();
             let rn = r.iter().map(|v| v * v).sum::<f64>().sqrt();
             let react = fint.iter().zip(&fixed).filter(|(_, g)| g.is_some()).map(|(f, _)| f * f).sum::<f64>().sqrt();
@@ -807,10 +815,12 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
                 break;
             }
             // tangent stiffness
-            let mut kt = NodeSparse::new(nn, &mesh.elems, 3);
+            let mut kt = k_base.empty_like();
             for (e, o) in outs.iter().enumerate() {
                 kt.add_element(&mesh.elems[e], &o.ke, 1.0);
             }
+            couplings.apply_elastic_couplings(&mut kt);
+            couplings.apply_linear_interface_ties(mesh, &mut kt);
             for (i, g) in zero_fixed.iter().enumerate() {
                 if g.is_some() {
                     r[i] = 0.0;
@@ -880,7 +890,7 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
     res.quantity("Max equivalent plastic strain", pe.iter().cloned().fold(0.0, f64::max), "mm/mm");
     res.extra.insert(Field::PlasticStrain, pe);
     // reactions per support dof owner
-    let fint = gather(&last);
+    let fint = gather(&last, &u);
     for (id, label, _) in &support_nodes {
         let mut r = [0.0; 3];
         for dof in 0..n {

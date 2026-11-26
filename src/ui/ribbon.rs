@@ -152,6 +152,11 @@ impl SimApp {
                                 self.form = Form::Load(lk);
                             }
                         }
+                        if name == "STRUCTURAL" && matches!(kind, AnalysisType::StaticStructural | AnalysisType::ThermalStress | AnalysisType::Modal | AnalysisType::TransientStructural | AnalysisType::LinearBuckling | AnalysisType::NonlinearStructural) {
+                            if tool(ui, &p, "🤝", "Contact Pair", Some(Color32::from_rgb(55, 175, 225)), true) {
+                                self.form = Form::Contact;
+                            }
+                        }
                     });
                 }
                 if kind.requires_enclosure() && !has_enc {
@@ -544,7 +549,7 @@ impl SimApp {
         };
         let groups: [(&str, &[(Field, &str, &str)]); 7] = [
             ("DEFORMATION", &[(Field::TotalDeformation, "📐", "Total"), (Field::DeformationX, "X", "Dir. X"), (Field::DeformationY, "Y", "Dir. Y"), (Field::DeformationZ, "Z", "Dir. Z")]),
-            ("STRESS", &[(Field::VonMises, "🔶", "Von Mises"), (Field::MaxPrincipal, "⬆", "Max Princ."), (Field::MinPrincipal, "⬇", "Min Princ."), (Field::RadialStress, "◎", "Radial"), (Field::HoopStress, "⭕", "Hoop"), (Field::AxialStress, "↕", "Axial"), (Field::SafetyFactor, "🛡", "Safety"), (Field::PlasticStrain, "〰", "Plastic ε")]),
+            ("STRESS", &[(Field::VonMises, "🔶", "Von Mises"), (Field::MaxPrincipal, "⬆", "Max Princ."), (Field::MinPrincipal, "⬇", "Min Princ."), (Field::RadialStress, "◎", "Radial"), (Field::HoopStress, "⭕", "Hoop"), (Field::AxialStress, "↕", "Axial"), (Field::ContactPressure, "🤝", "Contact P"), (Field::SafetyFactor, "🛡", "Safety"), (Field::PlasticStrain, "〰", "Plastic ε")]),
             ("THERMAL", &[(Field::Temperature, "🌡", "Temperature"), (Field::HeatFlux, "☀", "Heat Flux")]),
             ("ELECTRIC", &[(Field::ElectricPotential, "⚡", "Potential"), (Field::ElectricField, "↯", "E-Field"), (Field::CurrentDensity, "🔌", "Current"), (Field::JouleHeat, "🔥", "Joule Heat")]),
             ("RF", &[(Field::AbsorbedPower, "♨", "Absorbed"), (Field::Sar, "🩺", "SAR")]),

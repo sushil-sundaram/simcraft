@@ -106,6 +106,43 @@ fn load_to_draft(id: u32, load: &Load) -> LoadDraft {
             f.port_te10 = profile != "uniform";
             LoadKind::Port
         }
+        Load::BoltPretension { body: b, force_n, adjustment_mm, .. } => {
+            body = b.clone();
+            f.bolt_by_force = force_n.is_some();
+            f.bolt_force = force_n.unwrap_or(1000.0);
+            f.bolt_adj = adjustment_mm.unwrap_or(0.05);
+            LoadKind::BoltPretension
+        }
+        Load::Spring { to_faces, stiffness_n_per_mm, preload_n, anchor, .. } => {
+            f.spring_k = *stiffness_n_per_mm;
+            f.spring_pre = *preload_n;
+            f.spring_to = to_faces.as_ref().map(|v| v.join(", ")).unwrap_or_default();
+            if let Some(a) = anchor {
+                f.remote_pt = *a;
+            }
+            LoadKind::Spring
+        }
+        Load::RemoteForce { point, force, moment, .. } => {
+            f.remote_pt = *point;
+            f.vector = *force;
+            f.remote_moment = *moment;
+            LoadKind::RemoteForce
+        }
+        Load::RemoteDisplacement { point, x, y, z, rx, ry, rz, rigid, .. } => {
+            f.remote_pt = *point;
+            f.dcomp = [(x.is_some(), x.unwrap_or(0.0)), (y.is_some(), y.unwrap_or(0.0)), (z.is_some(), z.unwrap_or(0.0))];
+            f.remote_rot = [(rx.is_some(), rx.unwrap_or(0.0)), (ry.is_some(), ry.unwrap_or(0.0)), (rz.is_some(), rz.unwrap_or(0.0))];
+            f.remote_rigid = *rigid;
+            LoadKind::RemoteDisplacement
+        }
+        Load::PointMass { mass_kg, point, .. } => {
+            f.value = *mass_kg;
+            f.mass_offset = point.is_some();
+            if let Some(pt) = point {
+                f.remote_pt = *pt;
+            }
+            LoadKind::PointMass
+        }
     };
     faces.shrink_to_fit();
     LoadDraft { id, kind, f, faces, body }
@@ -154,6 +191,33 @@ fn load_from_draft(k: LoadKind, f: &Forms, faces: Vec<String>, body: &str, is_ch
             polarization: ax(f.port_pol),
             profile: if f.port_te10 { "te10" } else { "uniform" }.into(),
         },
+        LoadKind::BoltPretension => Load::BoltPretension {
+            body: body.to_string(),
+            force_n: f.bolt_by_force.then_some(f.bolt_force),
+            adjustment_mm: (!f.bolt_by_force).then_some(f.bolt_adj),
+            axis: None,
+            cut_mm: None,
+        },
+        LoadKind::Spring => Load::Spring {
+            faces,
+            to_faces: (!f.spring_to.trim().is_empty()).then(|| f.spring_to.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()),
+            stiffness_n_per_mm: f.spring_k,
+            anchor: None,
+            preload_n: f.spring_pre,
+        },
+        LoadKind::RemoteForce => Load::RemoteForce { faces, point: f.remote_pt, force: f.vector, moment: f.remote_moment },
+        LoadKind::RemoteDisplacement => Load::RemoteDisplacement {
+            faces,
+            point: f.remote_pt,
+            x: f.dcomp[0].0.then_some(f.dcomp[0].1),
+            y: f.dcomp[1].0.then_some(f.dcomp[1].1),
+            z: f.dcomp[2].0.then_some(f.dcomp[2].1),
+            rx: f.remote_rot[0].0.then_some(f.remote_rot[0].1),
+            ry: f.remote_rot[1].0.then_some(f.remote_rot[1].1),
+            rz: f.remote_rot[2].0.then_some(f.remote_rot[2].1),
+            rigid: f.remote_rigid,
+        },
+        LoadKind::PointMass => Load::PointMass { faces, mass_kg: f.value.max(1e-9), point: f.mass_offset.then_some(f.remote_pt) },
     }
 }
 
@@ -200,6 +264,45 @@ fn load_tool_args(k: LoadKind, f: &Forms, sel: &[String], body: &str, is_cht: bo
         LoadKind::MovingWall => ("add_moving_wall", json!({"faces": fa, "velocity": f.wall_v})),
         LoadKind::Outlet => ("add_outlet", json!({"faces": fa, "pressure": f.outlet_p})),
         LoadKind::Port => ("add_port", json!({"faces": fa, "power": f.port_power, "polarization": (["x", "y", "z"])[f.port_pol], "profile": if f.port_te10 { "te10" } else { "uniform" }})),
+        LoadKind::BoltPretension => {
+            if f.bolt_by_force {
+                ("add_bolt_pretension", json!({"body": body, "force_n": f.bolt_force}))
+            } else {
+                ("add_bolt_pretension", json!({"body": body, "adjustment_mm": f.bolt_adj}))
+            }
+        }
+        LoadKind::Spring => {
+            let mut a = json!({"faces": fa, "stiffness_n_per_mm": f.spring_k, "preload_n": f.spring_pre});
+            if !f.spring_to.trim().is_empty() {
+                let to: Vec<String> = f.spring_to.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                if !to.is_empty() {
+                    a["to_faces"] = json!(to);
+                }
+            }
+            ("add_spring", a)
+        }
+        LoadKind::RemoteForce => ("add_remote_force", json!({"faces": fa, "point": f.remote_pt, "force": f.vector, "moment": f.remote_moment})),
+        LoadKind::RemoteDisplacement => {
+            let mut a = json!({"faces": fa, "point": f.remote_pt, "rigid": f.remote_rigid});
+            for (i, c) in ["x", "y", "z"].iter().enumerate() {
+                if f.dcomp[i].0 {
+                    a[*c] = json!(f.dcomp[i].1);
+                }
+            }
+            for (i, c) in ["rx", "ry", "rz"].iter().enumerate() {
+                if f.remote_rot[i].0 {
+                    a[*c] = json!(f.remote_rot[i].1);
+                }
+            }
+            ("add_remote_displacement", a)
+        }
+        LoadKind::PointMass => {
+            let mut a = json!({"faces": fa, "mass_kg": f.value.max(1e-9)});
+            if f.mass_offset {
+                a["point"] = json!(f.remote_pt);
+            }
+            ("add_point_mass", a)
+        }
     }
 }
 
@@ -356,6 +459,75 @@ fn load_definition_ui(ui: &mut egui::Ui, p: &super::theme::Pal, units: UnitSyste
             });
             ui.checkbox(&mut f.port_te10, "Waveguide (TE10) profile");
             ui.label(RichText::new("Pick an air/dielectric opening; E-field axis must lie in the face.").small().color(p.weak));
+        }
+        LoadKind::BoltPretension => {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut f.bolt_by_force, true, "Preload force");
+                ui.selectable_value(&mut f.bolt_by_force, false, "Adjustment Δ");
+            });
+            if f.bolt_by_force {
+                drag_scaled(ui, &mut f.bolt_force, units.force_scale(), units.force_suffix(), 10.0, None);
+            } else {
+                drag_scaled(ui, &mut f.bolt_adj, units.len_scale(), units.len_suffix(), 0.005, None);
+            }
+            ui.label(RichText::new("Step 1 applies preload across the bolt cut; Step 2 locks Δ under working loads.").small().color(p.weak));
+        }
+        LoadKind::Spring => {
+            egui::Grid::new(format!("{id_salt}-spr")).num_columns(2).show(ui, |ui| {
+                ui.label("Stiffness");
+                ui.add(egui::DragValue::new(&mut f.spring_k).speed(1.0).range(1e-6..=1e12).suffix(" N/mm"));
+                ui.end_row();
+                ui.label("Preload");
+                drag_scaled(ui, &mut f.spring_pre, units.force_scale(), units.force_suffix(), 1.0, None);
+                ui.end_row();
+            });
+            ui.horizontal(|ui| {
+                ui.label("To faces");
+                ui.add(egui::TextEdit::singleline(&mut f.spring_to).hint_text("ground (empty) or face1, ...").desired_width(f32::INFINITY));
+            });
+        }
+        LoadKind::RemoteForce => {
+            ui.label(RichText::new(format!("Remote point ({})", units.len_suffix().trim())).small().color(p.weak));
+            xyz_scaled(ui, &format!("{id_salt}-rfpt"), &mut f.remote_pt, units.len_scale(), "", 0.5);
+            ui.label(RichText::new(format!("Force ({})", units.force_suffix().trim())).small().color(p.weak));
+            xyz_scaled(ui, &format!("{id_salt}-rf"), &mut f.vector, units.force_scale(), "", 1.0);
+            ui.label(RichText::new("Moment (N·m)").small().color(p.weak));
+            xyz(ui, &format!("{id_salt}-rm"), &mut f.remote_moment, " N·m", 0.5);
+        }
+        LoadKind::RemoteDisplacement => {
+            ui.label(RichText::new(format!("Remote point ({})", units.len_suffix().trim())).small().color(p.weak));
+            xyz_scaled(ui, &format!("{id_salt}-rdpt"), &mut f.remote_pt, units.len_scale(), "", 0.5);
+            ui.checkbox(&mut f.remote_rigid, "Rigid spider (RBE2; off = distributing RBE3)");
+            for (i, c) in ["X", "Y", "Z"].iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut f.dcomp[i].0, *c);
+                    if f.dcomp[i].0 {
+                        drag_scaled(ui, &mut f.dcomp[i].1, units.len_scale(), units.len_suffix(), 0.01, None);
+                    } else {
+                        ui.label(RichText::new("free").color(p.weak));
+                    }
+                });
+            }
+            for (i, c) in ["RX", "RY", "RZ"].iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut f.remote_rot[i].0, *c);
+                    if f.remote_rot[i].0 {
+                        ui.add(egui::DragValue::new(&mut f.remote_rot[i].1).speed(0.001).suffix(" rad"));
+                    } else {
+                        ui.label(RichText::new("free").color(p.weak));
+                    }
+                });
+            }
+        }
+        LoadKind::PointMass => {
+            ui.horizontal(|ui| {
+                ui.label("Mass");
+                ui.add(egui::DragValue::new(&mut f.value).speed(0.1).range(1e-9..=1e9).suffix(" kg"));
+            });
+            ui.checkbox(&mut f.mass_offset, "Explicit mass center");
+            if f.mass_offset {
+                xyz_scaled(ui, &format!("{id_salt}-pm"), &mut f.remote_pt, units.len_scale(), "", 0.5);
+            }
         }
     }
 }
@@ -885,6 +1057,78 @@ impl SimApp {
                 }
             }
             Form::Load(k) => self.load_form(ui, k, mesh.as_ref()),
+            Form::Contact => {
+                ui.heading("Contact Pair");
+                let bodies: Vec<String> = self
+                    .core
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .model
+                    .bodies
+                    .iter()
+                    .filter(|b| b.role == Role::Solid && b.op == Op::Add)
+                    .map(|b| b.name.clone())
+                    .collect();
+                if bodies.len() >= 2 {
+                    if !bodies.contains(&self.f.contact_a) {
+                        self.f.contact_a = bodies[0].clone();
+                    }
+                    if !bodies.contains(&self.f.contact_b) || self.f.contact_b == self.f.contact_a {
+                        self.f.contact_b = bodies.iter().find(|n| **n != self.f.contact_a).cloned().unwrap_or_default();
+                    }
+                }
+                card(ui, &p, |ui| {
+                    if bodies.len() < 2 {
+                        ui.label(RichText::new("Add at least two solid bodies to define a contact pair.").color(p.warn));
+                    } else {
+                        egui::Grid::new("contact-form").num_columns(2).show(ui, |ui| {
+                            ui.label("Body A");
+                            egui::ComboBox::from_id_salt("cbodya").width(150.0).selected_text(&self.f.contact_a).show_ui(ui, |ui| {
+                                for b in &bodies {
+                                    ui.selectable_value(&mut self.f.contact_a, b.clone(), b);
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Body B");
+                            egui::ComboBox::from_id_salt("cbodyb").width(150.0).selected_text(&self.f.contact_b).show_ui(ui, |ui| {
+                                for b in &bodies {
+                                    ui.selectable_value(&mut self.f.contact_b, b.clone(), b);
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Behaviour");
+                            let labels = ["Bonded", "No Separation", "Frictionless", "Frictional"];
+                            egui::ComboBox::from_id_salt("ckind").width(150.0).selected_text(labels[self.f.contact_kind.min(3)]).show_ui(ui, |ui| {
+                                for (idx, l) in labels.iter().enumerate() {
+                                    ui.selectable_value(&mut self.f.contact_kind, idx, *l);
+                                }
+                            });
+                            ui.end_row();
+                            if self.f.contact_kind == 3 {
+                                ui.label("Friction μ");
+                                ui.add(egui::DragValue::new(&mut self.f.contact_mu).speed(0.01).range(0.0..=5.0));
+                                ui.end_row();
+                            }
+                            ui.label("Offset");
+                            drag_scaled(ui, &mut self.f.contact_off, ls, lsf, 0.005, None);
+                            ui.end_row();
+                        });
+                    }
+                });
+                ui.add_space(8.0);
+                let ok = bodies.len() >= 2 && !self.f.contact_a.is_empty() && !self.f.contact_b.is_empty() && self.f.contact_a != self.f.contact_b;
+                let keys = ["bonded", "no_separation", "frictionless", "frictional"];
+                if ui.add_enabled(ok, primary(&p, "Create")).clicked() {
+                    self.run("add_contact", json!({
+                        "body_a": self.f.contact_a,
+                        "body_b": self.f.contact_b,
+                        "kind": keys[self.f.contact_kind.min(3)],
+                        "friction": self.f.contact_mu,
+                        "offset_mm": self.f.contact_off,
+                    }));
+                }
+            }
             Form::Study | Form::Optimize | Form::Convergence | Form::Topology => {
                 let f = self.form;
                 self.opt_form(ui, f);

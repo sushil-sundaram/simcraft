@@ -261,8 +261,13 @@ impl Session {
         self.model.next_id = id + 1;
         let label = load.label();
         let summary = load.summary();
+        let needs_remesh = matches!(load, Load::BoltPretension { .. });
         self.model.loads.push(LoadItem { id, load });
-        self.touch_setup();
+        if needs_remesh {
+            self.touch_geometry();
+        } else {
+            self.touch_setup();
+        }
         self.log(format!("Added {label} #{id}: {summary}"));
         Ok(id)
     }
@@ -280,6 +285,12 @@ impl Session {
             .iter()
             .map(|l| json!({"id": l.id, "type": l.load.label(), "summary": l.load.summary(), "definition": l.load}))
             .collect();
+        let contacts: Vec<Value> = self
+            .model
+            .contacts
+            .iter()
+            .map(|c| json!({"id": c.id, "summary": c.summary(), "definition": c}))
+            .collect();
         let mesh = if self.mesh_valid() {
             let m = self.mesh.as_ref().unwrap();
             json!({"element_size_mm": m.h, "elements": m.elems.len(), "nodes": m.nodes.len(), "faces": m.patches.len(), "volume_mm3": m.volume_mm3(), "warnings": m.warnings})
@@ -287,8 +298,9 @@ impl Session {
             json!({"element_size_mm": self.model.element_size, "status": "not generated (generated automatically on solve)"})
         };
         json!({
-            "units": "mm, N, MPa, °C, s",
+            "units": "mm, N, MPa, N·m, °C, s",
             "bodies": bodies,
+            "contacts": contacts,
             "analysis": {"type": self.model.analysis.kind, "label": self.model.analysis.kind.label(), "modes": self.model.analysis.modes, "reference_temperature_c": self.model.analysis.reference_temperature},
             "loads": loads,
             "mesh": mesh,
@@ -677,6 +689,9 @@ fn tool_may_mutate(tool: &str) -> bool {
             | "add_radiation" | "add_heat_generation" | "add_compression_only_support"
             | "add_symmetry" | "add_voltage" | "add_current" | "add_coil" | "add_magnet"
             | "add_inlet" | "add_moving_wall" | "add_port" | "add_outlet"
+            | "add_contact" | "remove_contact" | "clear_contacts"
+            | "add_bolt_pretension" | "add_spring" | "add_remote_force"
+            | "add_remote_displacement" | "add_point_mass"
     )
 }
 
@@ -799,7 +814,7 @@ impl Core {
             "new_model" => {
                 let rev = s.revision;
                 let next = s.next_model_rev;
-                let empty = s.model_rev == 0 && s.model.bodies.is_empty() && s.model.loads.is_empty() && s.model.custom_materials.is_empty() && s.model.element_size.is_none();
+                let empty = s.model_rev == 0 && s.model.bodies.is_empty() && s.model.loads.is_empty() && s.model.contacts.is_empty() && s.model.custom_materials.is_empty() && s.model.element_size.is_none();
                 // the theme and edge display are user preferences, not part of the model
                 let (dark, show_mesh) = (s.display.dark, s.display.show_mesh);
                 let plan = s.plan.take();
@@ -1211,6 +1226,154 @@ impl Core {
                 Ok(load_out(s.add_load(Load::Port { faces: faces(a)?, power, polarization, profile })?))
             }
             "add_outlet" => Ok(load_out(s.add_load(Load::Outlet { faces: faces(a)?, pressure: opt_num(a, "pressure").unwrap_or(0.0) })?)),
+            "add_contact" => {
+                let kind_str = opt_str(a, "kind").unwrap_or("bonded").to_lowercase();
+                let kind: crate::model::ContactKind = serde_json::from_value(json!(kind_str)).map_err(|_| {
+                    anyhow!("contact kind must be bonded, no_separation, frictionless, or frictional")
+                })?;
+                let faces_a = a.get("faces_a").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()
+                }).unwrap_or_default();
+                let faces_b = a.get("faces_b").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()
+                }).unwrap_or_default();
+                let body_a = opt_str(a, "body_a").map(String::from).unwrap_or_else(|| {
+                    faces_a.first().and_then(|f| f.split('.').next()).unwrap_or("").to_string()
+                });
+                let body_b = opt_str(a, "body_b").map(String::from).unwrap_or_else(|| {
+                    faces_b.first().and_then(|f| f.split('.').next()).unwrap_or("").to_string()
+                });
+                if body_a.is_empty() || body_b.is_empty() || body_a.eq_ignore_ascii_case(&body_b) {
+                    bail!("give two distinct solid bodies ('body_a' and 'body_b', or 'faces_a' and 'faces_b')");
+                }
+                for bn in [&body_a, &body_b] {
+                    if !s.model.bodies.iter().any(|b| b.name.eq_ignore_ascii_case(bn) && b.role == Role::Solid) {
+                        bail!("no solid body named '{bn}'");
+                    }
+                }
+                let friction = opt_num(a, "friction").unwrap_or(0.2);
+                let offset_mm = opt_num(a, "offset_mm").unwrap_or(0.0);
+                if !friction.is_finite() || friction < 0.0 {
+                    bail!("friction must be finite and ≥ 0");
+                }
+                if !offset_mm.is_finite() {
+                    bail!("offset_mm must be finite");
+                }
+                let id = s.model.next_id.max(1);
+                s.model.next_id = id + 1;
+                let cp = crate::model::ContactPair { id, body_a, body_b, faces_a, faces_b, kind, friction, offset_mm };
+                let sum = cp.summary();
+                let splits = cp.kind.splits_mesh();
+                s.model.contacts.push(cp);
+                if splits {
+                    s.touch_geometry();
+                } else {
+                    s.touch_setup();
+                }
+                s.log(format!("Added Contact #{id}: {sum}"));
+                Ok(Output::text(format!("Added contact #{id}: {sum}.")))
+            }
+            "remove_contact" => {
+                let id = num(a, "id")? as u32;
+                let idx = s.model.contacts.iter().position(|c| c.id == id).ok_or_else(|| anyhow!("no contact with id {id}"))?;
+                let splits = s.model.contacts[idx].kind.splits_mesh();
+                s.model.contacts.remove(idx);
+                if splits {
+                    s.touch_geometry();
+                } else {
+                    s.touch_setup();
+                }
+                s.log(format!("Removed contact #{id}"));
+                Ok(Output::text(format!("Removed contact #{id}.")))
+            }
+            "clear_contacts" => {
+                if !s.model.contacts.is_empty() {
+                    let had_split = s.model.contacts.iter().any(|c| c.kind.splits_mesh());
+                    s.model.contacts.clear();
+                    if had_split {
+                        s.touch_geometry();
+                    } else {
+                        s.touch_setup();
+                    }
+                }
+                Ok(Output::text("All contact pairs removed."))
+            }
+            "add_bolt_pretension" => {
+                let body = opt_str(a, "body").ok_or_else(|| anyhow!("missing 'body'"))?.to_string();
+                let force_n = opt_num(a, "force_n");
+                let adjustment_mm = opt_num(a, "adjustment_mm");
+                if force_n.is_none() && adjustment_mm.is_none() {
+                    bail!("specify 'force_n' [N] or 'adjustment_mm' [mm]");
+                }
+                if force_n.is_some_and(|v| !v.is_finite()) || adjustment_mm.is_some_and(|v| !v.is_finite()) {
+                    bail!("force_n and adjustment_mm must be finite");
+                }
+                let ax = if opt_str(a, "axis").is_some() { Some(axis(a)?) } else { None };
+                let cut_mm = opt_num(a, "cut_mm");
+                Ok(load_out(s.add_load(Load::BoltPretension { body, force_n, adjustment_mm, axis: ax, cut_mm })?))
+            }
+            "add_spring" => {
+                let fs = faces(a)?;
+                let to_faces = a.get("to_faces").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>()
+                }).filter(|v| !v.is_empty());
+                if let Some(tf) = &to_faces {
+                    let m = s.ensure_mesh()?;
+                    m.resolve_faces(tf)?;
+                }
+                let k = num(a, "stiffness_n_per_mm")?;
+                if !k.is_finite() || k <= 0.0 {
+                    bail!("stiffness_n_per_mm must be finite and > 0");
+                }
+                let anchor = if a.get("anchor").is_some_and(|v| !v.is_null()) { Some(v3(a, "anchor")?) } else { None };
+                let preload_n = opt_num(a, "preload_n").unwrap_or(0.0);
+                if !preload_n.is_finite() {
+                    bail!("preload_n must be finite");
+                }
+                Ok(load_out(s.add_load(Load::Spring { faces: fs, to_faces, stiffness_n_per_mm: k, anchor, preload_n })?))
+            }
+            "add_remote_force" => {
+                let fs = faces(a)?;
+                let m = s.ensure_mesh()?;
+                let rfs = m.resolve_faces(&fs)?;
+                let spec_c = crate::fem::surface_spec(&m, &fs)?;
+                let point = if a.get("point").is_some_and(|v| !v.is_null()) {
+                    v3(a, "point")?
+                } else {
+                    let _ = rfs;
+                    spec_c.centroid_m.map(|v| v * 1e3)
+                };
+                let force = v3_or(a, "force", [0.0; 3])?;
+                let moment = v3_or(a, "moment", [0.0; 3])?;
+                Ok(load_out(s.add_load(Load::RemoteForce { faces: fs, point, force, moment })?))
+            }
+            "add_remote_displacement" => {
+                let fs = faces(a)?;
+                let m = s.ensure_mesh()?;
+                let spec_c = crate::fem::surface_spec(&m, &fs)?;
+                let point = if a.get("point").is_some_and(|v| !v.is_null()) { v3(a, "point")? } else { spec_c.centroid_m.map(|v| v * 1e3) };
+                let rigid = a.get("rigid").and_then(|v| v.as_bool()).unwrap_or(false);
+                Ok(load_out(s.add_load(Load::RemoteDisplacement {
+                    faces: fs,
+                    point,
+                    x: opt_num(a, "x"),
+                    y: opt_num(a, "y"),
+                    z: opt_num(a, "z"),
+                    rx: opt_num(a, "rx"),
+                    ry: opt_num(a, "ry"),
+                    rz: opt_num(a, "rz"),
+                    rigid,
+                })?))
+            }
+            "add_point_mass" => {
+                let fs = faces(a)?;
+                let mass_kg = num(a, "mass_kg")?;
+                if !mass_kg.is_finite() || mass_kg <= 0.0 {
+                    bail!("mass_kg must be finite and > 0");
+                }
+                let point = if a.get("point").is_some_and(|v| !v.is_null()) { Some(v3(a, "point")?) } else { None };
+                Ok(load_out(s.add_load(Load::PointMass { faces: fs, mass_kg, point })?))
+            }
             "add_enclosure" => {
                 let (lo, hi) = mesh::additive_bounds(&s.model.bodies);
                 if lo == hi && !a.get("size").is_some() {
@@ -1344,25 +1507,47 @@ impl Core {
                 }
                 s.model.bodies[bi] = b.clone();
                 if let Some(n) = &new_name {
-                    // keep loads pointing at the renamed body
+                    // keep loads and contacts pointing at the renamed body
                     let (op, np) = (format!("{}.", old.name), format!("{n}."));
+                    let rename_vec = |arr: &mut Vec<Value>| {
+                        for f in arr.iter_mut() {
+                            if let Some(t) = f.as_str() {
+                                if t == old.name {
+                                    *f = json!(n);
+                                } else if let Some(rest) = t.strip_prefix(&op) {
+                                    *f = json!(format!("{np}{rest}"));
+                                }
+                            }
+                        }
+                    };
                     for it in s.model.loads.iter_mut() {
                         let mut v = serde_json::to_value(&it.load)?;
-                        if let Some(fs) = v.get_mut("faces").and_then(|f| f.as_array_mut()) {
-                            for f in fs.iter_mut() {
-                                if let Some(t) = f.as_str() {
-                                    if t == old.name {
-                                        *f = json!(n);
-                                    } else if let Some(rest) = t.strip_prefix(&op) {
-                                        *f = json!(format!("{np}{rest}"));
-                                    }
-                                }
+                        for key in ["faces", "to_faces"] {
+                            if let Some(fs) = v.get_mut(key).and_then(|f| f.as_array_mut()) {
+                                rename_vec(fs);
                             }
                         }
                         if v.get("body").and_then(|x| x.as_str()) == Some(old.name.as_str()) {
                             v["body"] = json!(n);
                         }
                         it.load = serde_json::from_value(v)?;
+                    }
+                    for cp in s.model.contacts.iter_mut() {
+                        if cp.body_a.eq_ignore_ascii_case(&old.name) {
+                            cp.body_a = n.clone();
+                        }
+                        if cp.body_b.eq_ignore_ascii_case(&old.name) {
+                            cp.body_b = n.clone();
+                        }
+                        for arr in [&mut cp.faces_a, &mut cp.faces_b] {
+                            for f in arr.iter_mut() {
+                                if f == &old.name {
+                                    *f = n.clone();
+                                } else if let Some(rest) = f.strip_prefix(&op) {
+                                    *f = format!("{np}{rest}");
+                                }
+                            }
+                        }
                     }
                 }
                 s.touch_geometry();
@@ -1378,7 +1563,14 @@ impl Core {
                     if k == "id" || k == "kind" {
                         continue;
                     }
-                    if v.get(k).is_none() && !matches!(k.as_str(), "body" | "temperature" | "power" | "profile") {
+                    if v.get(k).is_none()
+                        && !matches!(
+                            k.as_str(),
+                            "body" | "temperature" | "power" | "profile" | "to_faces" | "anchor" | "point"
+                                | "cut_mm" | "axis" | "x" | "y" | "z" | "rx" | "ry" | "rz"
+                                | "force_n" | "adjustment_mm" | "rigid" | "preload_n"
+                        )
+                    {
                         bail!("a {} load has no '{k}' (it has: {})", s.model.loads[li].load.label(), v.as_object().map(|o| o.keys().filter(|x| *x != "kind").cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default());
                     }
                     v[k] = val.clone();
@@ -1397,8 +1589,14 @@ impl Core {
                         bail!("no body named '{b}'");
                     }
                 }
+                let was_bolt = matches!(s.model.loads[li].load, Load::BoltPretension { .. });
+                let is_bolt = matches!(load, Load::BoltPretension { .. });
                 s.model.loads[li].load = load.clone();
-                s.touch_setup();
+                if was_bolt || is_bolt {
+                    s.touch_geometry();
+                } else {
+                    s.touch_setup();
+                }
                 s.log(format!("Edited load #{id}"));
                 Ok(Output::json(json!({"edited": id, "load": load, "summary": load.summary()})))
             }
@@ -1457,19 +1655,26 @@ impl Core {
             }
             "remove_load" => {
                 let id = num(a, "id")? as u32;
-                let before = s.model.loads.len();
-                s.model.loads.retain(|l| l.id != id);
-                if before == s.model.loads.len() {
-                    bail!("no load with id {id}");
+                let idx = s.model.loads.iter().position(|l| l.id == id).ok_or_else(|| anyhow!("no load with id {id}"))?;
+                let was_bolt = matches!(s.model.loads[idx].load, Load::BoltPretension { .. });
+                s.model.loads.remove(idx);
+                if was_bolt {
+                    s.touch_geometry();
+                } else {
+                    s.touch_setup();
                 }
-                s.touch_setup();
                 s.log(format!("Removed load #{id}"));
                 Ok(Output::text(format!("Removed load #{id}.")))
             }
             "clear_loads" => {
                 if !s.model.loads.is_empty() {
+                    let had_bolt = s.model.loads.iter().any(|l| matches!(l.load, Load::BoltPretension { .. }));
                     s.model.loads.clear();
-                    s.touch_setup();
+                    if had_bolt {
+                        s.touch_geometry();
+                    } else {
+                        s.touch_setup();
+                    }
                 }
                 Ok(Output::text("All supports and loads removed."))
             }
@@ -2335,6 +2540,14 @@ pub fn tool_defs() -> Vec<Value> {
         t("add_moving_wall", "No-slip wall sliding tangentially with the given velocity [m/s] (lid-driven cavity, conveyor belt). Fluid and conjugate heat transfer analyses.", json!({"faces": faces, "velocity": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "m/s"}}), &["faces", "velocity"]),
         t("add_port", "RF / microwave feed for full_wave_em and microwave_heating: a current sheet on the faces (e.g. a waveguide opening on the cavity wall, usually an Enclosure face) delivering 'power' watts with the electric field along 'polarization'. profile te10 (default) = half-sine across the face like a rectangular waveguide's TE10 mode; uniform = constant.", json!({"faces": faces, "power": {"type": "number", "description": "delivered power [W], e.g. 800 for a domestic oven"}, "polarization": {"type": "string", "enum": ["x", "y", "z"], "description": "E-field direction; must lie in the face (for a WR-340 feed: along the short side)"}, "profile": {"type": "string", "enum": ["te10", "uniform"]}}), &["faces", "power", "polarization"]),
         t("add_outlet", "Fluid pressure outlet [Pa] (usually Enclosure.xmax, 0 Pa).", json!({"faces": faces, "pressure": {"type": "number"}}), &["faces"]),
+        t("add_contact", "Define pairwise interface contact behaviour between two bodies: bonded (default), no_separation (normal tied, free slip), frictionless (compression + lift-off, zero friction), or frictional (Coulomb friction μ with stick/slip and optional offset_mm > 0 interference / < 0 clearance).", json!({"body_a": {"type": "string"}, "body_b": {"type": "string"}, "faces_a": faces, "faces_b": faces, "kind": {"type": "string", "enum": ["bonded", "no_separation", "frictionless", "frictional"]}, "friction": {"type": "number", "description": "Coulomb coefficient μ ≥ 0 (default 0.2)"}, "offset_mm": {"type": "number", "description": "Normal offset mm (>0 interference/shrink-fit, <0 clearance; default 0)"}}), &["kind"]),
+        t("remove_contact", "Remove a contact pair by id.", json!({"id": {"type": "integer"}}), &["id"]),
+        t("clear_contacts", "Remove all explicit contact pairs (all touching bodies return to bonded).", json!({}), &[]),
+        t("add_bolt_pretension", "Apply bolt pretension across an interior cut plane of 'body' as Step 1 (preload) -> Step 2 (external loads with locked shortening). Give 'force_n' [N] or 'adjustment_mm' [mm]; axis and cut_mm default to the bolt's length axis and midpoint.", json!({"body": {"type": "string"}, "force_n": {"type": "number", "description": "Target preload force [N] in Step 1"}, "adjustment_mm": {"type": "number", "description": "Axial shortening Δ [mm]"}, "axis": {"type": "string", "enum": ["x", "y", "z"]}, "cut_mm": {"type": "number"}}), &["body"]),
+        t("add_spring", "Attach an elastic spring of stiffness 'stiffness_n_per_mm' [N/mm] (with optional preload_n [N]) from 'faces' to ground (at 'anchor' mm) or face-to-face ('to_faces').", json!({"faces": faces, "to_faces": faces, "stiffness_n_per_mm": {"type": "number"}, "anchor": v3s("Ground anchor [x,y,z] mm when to_faces omitted"), "preload_n": {"type": "number"}}), &["faces", "stiffness_n_per_mm"]),
+        t("add_remote_force", "Apply a statically equivalent remote force [N] and/or moment [N·m] at 'point' mm distributed over 'faces' (RBE3, no artificial stiffening).", json!({"faces": faces, "point": v3s("Remote point [x,y,z] mm (default face centroid)"), "force": v3s("Force vector [Fx,Fy,Fz] N"), "moment": v3s("Moment vector [Mx,My,Mz] N·m")}), &["faces"]),
+        t("add_remote_displacement", "Couple a remote point at 'point' mm to 'faces' (rigid RBE2 or distributing RBE3) constraining any combination of translations x,y,z [mm] and rotations rx,ry,rz [rad].", json!({"faces": faces, "point": v3s("Remote point [x,y,z] mm (default face centroid)"), "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}, "rx": {"type": "number"}, "ry": {"type": "number"}, "rz": {"type": "number"}, "rigid": {"type": "boolean", "description": "true = rigid spider (RBE2), false = distributing (RBE3, default)"}}), &["faces"]),
+        t("add_point_mass", "Attach a concentrated mass [kg] to 'faces' (optionally offset at 'point' mm). Participates in Gravity, Modal, Vibration and Transient Structural analyses.", json!({"faces": faces, "mass_kg": {"type": "number"}, "point": v3s("Mass center [x,y,z] mm (default face centroid)")}), &["faces", "mass_kg"]),
         t("add_enclosure", "Add the surrounding air/fluid box used by electrostatic, magnetostatic and CFD analyses. By default it pads the parts by 50% of their size on every side; give padding (fraction), padding_mm [xmin,xmax,ymin,ymax,zmin,zmax] or explicit min/size. Its faces are Enclosure.xmin … Enclosure.zmax.", json!({"material": {"type": "string", "description": "Air (default), Water or Engine Oil"}, "padding": {"type": "number"}, "padding_mm": {"type": "array", "items": {"type": "number"}, "minItems": 6, "maxItems": 6}, "min": v3s("Explicit min corner mm"), "size": v3s("Explicit size mm"), "name": {"type": "string"}}), &[]),
         t("remove_load", "Remove a support/load by id (ids are shown in get_model).", json!({"id": {"type": "integer"}}), &["id"]),
         t("clear_loads", "Remove all supports and loads.", json!({}), &[]),
