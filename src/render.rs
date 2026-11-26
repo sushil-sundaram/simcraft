@@ -11,18 +11,22 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+pub const TAN_HALF_FOV: f64 = 0.3249196962329063; // tan(18 deg) => 36 deg vertical FOV
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Camera {
     pub yaw: f64,
     pub pitch: f64,
-    /// pixels per mm
+    /// pixels per mm (at `target` when `perspective` is enabled)
     pub zoom: f64,
     pub target: V3,
+    #[serde(default)]
+    pub perspective: bool,
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        Camera { yaw: -60f64.to_radians(), pitch: 28f64.to_radians(), zoom: 4.0, target: [0.0; 3] }
+        Camera { yaw: -60f64.to_radians(), pitch: 28f64.to_radians(), zoom: 4.0, target: [0.0; 3], perspective: false }
     }
 }
 
@@ -63,12 +67,39 @@ impl Camera {
             sx = sx.max(dot(d, r).abs());
             sy = sy.max(dot(d, u).abs());
         }
-        self.zoom = 0.84 * (w / (2.0 * sx)).min(h / (2.0 * sy));
+        let scale_p = if self.perspective { 0.78 } else { 0.84 };
+        self.zoom = scale_p * (w / (2.0 * sx)).min(h / (2.0 * sy));
+    }
+    fn perspective_dist(&self, h: f64) -> f64 {
+        ((h.max(16.0) * 0.5) / (self.zoom.max(1e-9) * TAN_HALF_FOV)).max(1e-3)
     }
     pub fn project(&self, p: V3, w: f64, h: f64) -> (f64, f64, f64) {
         let (r, u, f) = self.basis();
         let d = sub(p, self.target);
-        (w / 2.0 + dot(d, r) * self.zoom, h / 2.0 - dot(d, u) * self.zoom, dot(d, f))
+        let pz = dot(d, f);
+        if self.perspective {
+            let dist = self.perspective_dist(h);
+            let w_clip = (dist + pz).max(1e-4 * dist);
+            let k = dist / w_clip;
+            (w / 2.0 + dot(d, r) * self.zoom * k, h / 2.0 - dot(d, u) * self.zoom * k, w_clip)
+        } else {
+            (w / 2.0 + dot(d, r) * self.zoom, h / 2.0 - dot(d, u) * self.zoom, pz)
+        }
+    }
+    /// World-space picking ray `(origin_mm, unit_dir)` matching `project` at screen pixel `(sx, sy)`.
+    pub fn ray(&self, sx: f64, sy: f64, w: f64, h: f64, half_depth: f64) -> (V3, V3) {
+        let (r, u, f) = self.basis();
+        let dx = (sx - w * 0.5) / self.zoom.max(1e-9);
+        let dy = (h * 0.5 - sy) / self.zoom.max(1e-9);
+        if self.perspective {
+            let dist = self.perspective_dist(h);
+            let eye = sub(self.target, scale(f, dist));
+            let dir = normalize(add(scale(f, dist), add(scale(r, dx), scale(u, dy))));
+            (eye, dir)
+        } else {
+            let p_plane = add(self.target, add(scale(r, dx), scale(u, dy)));
+            (sub(p_plane, scale(f, half_depth)), f)
+        }
     }
     pub fn orbit(&mut self, dx: f64, dy: f64) {
         self.yaw -= dx * 0.008;
@@ -100,6 +131,12 @@ pub struct Display {
     /// Axis used when displaying Cylindrical stress fields (radial, hoop, axial).
     #[serde(default)]
     pub cylindrical: CylindricalAxis,
+    /// Perspective projection in the 3D viewport (default orthographic).
+    #[serde(default)]
+    pub perspective: bool,
+    /// Draw enclosure walls as translucent glass instead of backface-culling only near walls.
+    #[serde(default)]
+    pub translucent_enclosure: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -111,7 +148,19 @@ pub struct Section {
 }
 impl Default for Display {
     fn default() -> Self {
-        Display { show_results: false, field: Field::TotalDeformation, mode: 0, deformation_scale: None, show_mesh: true, show_undeformed: false, dark: false, section: None, cylindrical: CylindricalAxis::default() }
+        Display {
+            show_results: false,
+            field: Field::TotalDeformation,
+            mode: 0,
+            deformation_scale: None,
+            show_mesh: true,
+            show_undeformed: false,
+            dark: false,
+            section: None,
+            cylindrical: CylindricalAxis::default(),
+            perspective: false,
+            translucent_enclosure: false,
+        }
     }
 }
 
@@ -155,6 +204,387 @@ pub fn load_color(l: &Load) -> [u8; 3] {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuVertex {
+    pub pos: [f32; 3],
+    pub disp: [f32; 3],
+    pub norm: [f32; 3],
+    pub color: [f32; 3],
+    pub uv: [f32; 2],
+    /// Normalized scalar contour in [0, 1], or -1.0 when flat-colored with `color`.
+    pub t: f32,
+    /// 0.0 = solid surface, 1.0 = enclosure wall, 2.0 = section cut.
+    pub kind: f32,
+}
+
+pub struct PickQuad {
+    pub p0: [V3; 4],
+    pub disp: [V3; 4],
+    pub face: u32,
+    pub kind: u8,
+}
+
+#[derive(Clone, Copy)]
+struct PickNode {
+    lo: V3,
+    hi: V3,
+    max_d: f64,
+    start: usize,
+    len: usize,
+    left: usize,
+    right: usize,
+}
+
+/// BVH over selectable quads for sub-millisecond hardware-viewport face picking without GL readbacks.
+pub struct QuadPicker {
+    quads: Vec<PickQuad>,
+    indices: Vec<usize>,
+    nodes: Vec<PickNode>,
+}
+
+impl QuadPicker {
+    pub fn build(quads: Vec<PickQuad>) -> Self {
+        let mut indices: Vec<usize> = (0..quads.len()).collect();
+        let mut nodes = Vec::new();
+        if !indices.is_empty() {
+            Self::build_node(&quads, &mut indices, 0, quads.len(), &mut nodes);
+        }
+        Self { quads, indices, nodes }
+    }
+
+    fn quad_bounds(q: &PickQuad) -> (V3, V3, f64) {
+        let (mut lo, mut hi, mut md) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3], 0.0f64);
+        for i in 0..4 {
+            for c in 0..3 {
+                lo[c] = lo[c].min(q.p0[i][c]);
+                hi[c] = hi[c].max(q.p0[i][c]);
+            }
+            md = md.max(norm(q.disp[i]));
+        }
+        (lo, hi, md)
+    }
+
+    fn build_node(quads: &[PickQuad], indices: &mut [usize], start: usize, end: usize, nodes: &mut Vec<PickNode>) -> usize {
+        let idx = nodes.len();
+        let (mut lo, mut hi, mut max_d) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3], 0.0f64);
+        for &qi in &indices[start..end] {
+            let (qlo, qhi, qd) = Self::quad_bounds(&quads[qi]);
+            for c in 0..3 {
+                lo[c] = lo[c].min(qlo[c]);
+                hi[c] = hi[c].max(qhi[c]);
+            }
+            max_d = max_d.max(qd);
+        }
+        nodes.push(PickNode { lo, hi, max_d, start, len: end - start, left: usize::MAX, right: usize::MAX });
+        if end - start <= 8 {
+            return idx;
+        }
+        let span = sub(hi, lo);
+        let ax = if span[1] > span[0] && span[1] >= span[2] { 1 } else if span[2] > span[0] { 2 } else { 0 };
+        let mid_coord = 0.5 * (lo[ax] + hi[ax]);
+        let mut mid = start;
+        for i in start..end {
+            let q = &quads[indices[i]];
+            let cx = 0.25 * (q.p0[0][ax] + q.p0[1][ax] + q.p0[2][ax] + q.p0[3][ax]);
+            if cx <= mid_coord {
+                indices.swap(i, mid);
+                mid += 1;
+            }
+        }
+        if mid == start || mid == end {
+            mid = (start + end) / 2;
+        }
+        let left = Self::build_node(quads, indices, start, mid, nodes);
+        let right = Self::build_node(quads, indices, mid, end, nodes);
+        nodes[idx].left = left;
+        nodes[idx].right = right;
+        idx
+    }
+
+    fn ray_aabb(orig: V3, inv_d: V3, lo: V3, hi: V3, pad: f64, t_max: f64) -> Option<f64> {
+        let (mut t0, mut t1) = (0.0f64, t_max);
+        for c in 0..3 {
+            let a = (lo[c] - pad - orig[c]) * inv_d[c];
+            let b = (hi[c] + pad - orig[c]) * inv_d[c];
+            let (mn, mx) = if a <= b { (a, b) } else { (b, a) };
+            t0 = t0.max(mn);
+            t1 = t1.min(mx);
+            if t1 < t0 {
+                return None;
+            }
+        }
+        Some(t0)
+    }
+
+    fn ray_tri(orig: V3, dir: V3, a: V3, b: V3, c: V3) -> Option<f64> {
+        let e1 = sub(b, a);
+        let e2 = sub(c, a);
+        let h = cross(dir, e2);
+        let det = dot(e1, h);
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let inv = 1.0 / det;
+        let s = sub(orig, a);
+        let u = dot(s, h) * inv;
+        if !(-1e-6..=1.0 + 1e-6).contains(&u) {
+            return None;
+        }
+        let q = cross(s, e1);
+        let v = dot(dir, q) * inv;
+        if v < -1e-6 || u + v > 1.0 + 1e-6 {
+            return None;
+        }
+        let t = dot(e2, q) * inv;
+        (t > 1e-6).then_some(t)
+    }
+
+    /// Pick the closest visible face along camera ray at viewport coordinates `(sx, sy)` in points.
+    pub fn pick(&self, cam: &Camera, sx: f64, sy: f64, w: f64, h: f64, anim: f64, skip_enclosure: bool) -> Option<(u32, V3)> {
+        if self.nodes.is_empty() || w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let root = &self.nodes[0];
+        let half_depth = (norm(sub(root.hi, root.lo)) + root.max_d * anim.abs()).max(10.0) * 2.0;
+        let (orig, dir) = cam.ray(sx, sy, w, h, half_depth);
+        let inv_d = [
+            if dir[0].abs() > 1e-12 { 1.0 / dir[0] } else { 1e12_f64.copysign(dir[0]) },
+            if dir[1].abs() > 1e-12 { 1.0 / dir[1] } else { 1e12_f64.copysign(dir[1]) },
+            if dir[2].abs() > 1e-12 { 1.0 / dir[2] } else { 1e12_f64.copysign(dir[2]) },
+        ];
+        let mut best_t = f64::INFINITY;
+        let mut best_face = None;
+        let mut stack = vec![0usize];
+        let mut anim_scale = anim.abs();
+        if anim_scale < 1e-6 {
+            anim_scale = 0.0;
+        }
+        while let Some(ni) = stack.pop() {
+            let nd = &self.nodes[ni];
+            if Self::ray_aabb(orig, inv_d, nd.lo, nd.hi, nd.max_d * anim_scale + 1e-4, best_t).is_none() {
+                continue;
+            }
+            if nd.left == usize::MAX {
+                for &qi in &self.indices[nd.start..nd.start + nd.len] {
+                    let q = &self.quads[qi];
+                    if skip_enclosure && q.kind == 1 {
+                        continue;
+                    }
+                    let p = [
+                        add(q.p0[0], scale(q.disp[0], anim)),
+                        add(q.p0[1], scale(q.disp[1], anim)),
+                        add(q.p0[2], scale(q.disp[2], anim)),
+                        add(q.p0[3], scale(q.disp[3], anim)),
+                    ];
+                    let nrm = normalize(cross(sub(p[1], p[0]), sub(p[3], p[0])));
+                    match q.kind {
+                        0 if dot(nrm, dir) > 0.05 => continue,
+                        1 if dot(nrm, dir) < -0.05 => continue,
+                        _ => {}
+                    }
+                    let hit = Self::ray_tri(orig, dir, p[0], p[1], p[2]).or_else(|| Self::ray_tri(orig, dir, p[0], p[2], p[3]));
+                    if let Some(t) = hit {
+                        if t < best_t {
+                            best_t = t;
+                            best_face = Some((q.face, add(orig, scale(dir, t))));
+                        }
+                    }
+                }
+            } else {
+                let dl = Self::ray_aabb(orig, inv_d, self.nodes[nd.left].lo, self.nodes[nd.left].hi, self.nodes[nd.left].max_d * anim_scale + 1e-4, best_t);
+                let dr = Self::ray_aabb(orig, inv_d, self.nodes[nd.right].lo, self.nodes[nd.right].hi, self.nodes[nd.right].max_d * anim_scale + 1e-4, best_t);
+                match (dl, dr) {
+                    (Some(tl), Some(tr)) if tl <= tr => {
+                        stack.push(nd.right);
+                        stack.push(nd.left);
+                    }
+                    (Some(_), Some(_)) => {
+                        stack.push(nd.left);
+                        stack.push(nd.right);
+                    }
+                    (Some(_), None) => stack.push(nd.left),
+                    (None, Some(_)) => stack.push(nd.right),
+                    (None, None) => {}
+                }
+            }
+        }
+        best_face
+    }
+}
+
+pub struct GpuScene {
+    pub vertices: Vec<GpuVertex>,
+    pub solid_indices: Vec<u32>,
+    pub enclosure_indices: Vec<u32>,
+    pub undeformed_lines: Vec<[f32; 3]>,
+    pub picker: QuadPicker,
+    pub range: Option<(f64, f64)>,
+    pub reversed: bool,
+    pub scale_used: f64,
+    pub lo: V3,
+    pub hi: V3,
+    pub has_enclosure: bool,
+}
+
+/// Shared scene preparation used by both CPU `build_scene` and GPU `build_gpu_scene`.
+struct RawQuad {
+    p0: [V3; 4],
+    disp: [V3; 4],
+    t: [f64; 4],
+    color: [[u8; 3]; 4],
+    face: u32,
+    kind: u8,
+}
+
+struct PreparedScene {
+    quads: Vec<RawQuad>,
+    undeformed: Vec<V3>,
+    range: Option<(f64, f64)>,
+    reversed: bool,
+    scale_used: f64,
+    has_enclosure: bool,
+}
+
+fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &Display, highlight: &HashSet<u32>) -> PreparedScene {
+    let use_res = disp.show_results && results.is_some();
+    let mut range = None;
+    let mut values: Option<Vec<f64>> = None;
+    let mut defl: Option<&[V3]> = None;
+    let mut scale_used = 0.0;
+    if use_res {
+        let r = results.unwrap();
+        let field = if r.has(disp.field) { disp.field } else { r.available_fields().first().copied().unwrap_or(Field::TotalDeformation) };
+        if let Some(v) = r.scalar_at(mesh, field, disp.mode, disp.cylindrical) {
+            let mn = v.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mx = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            range = Some((mn, mx));
+            values = Some(v);
+        }
+        if let Some(d) = r.deformation(disp.mode) {
+            if d.len() == mesh.nodes.len() {
+                scale_used = disp.deformation_scale.unwrap_or_else(|| auto_scale(mesh, d));
+                defl = Some(d);
+            }
+        }
+    }
+    let mut face_color: Vec<Option<[u8; 3]>> = vec![None; mesh.faces.len()];
+    if !use_res {
+        for it in &model.loads {
+            if let Ok(fs) = mesh.resolve_faces(it.load.faces()) {
+                for f in fs {
+                    face_color[f as usize] = Some(load_color(&it.load));
+                }
+            }
+        }
+        for it in &model.loads {
+            if let Some(b) = it.load.body() {
+                if let Ok(els) = mesh.body_elems(b) {
+                    let set: HashSet<u32> = els.iter().map(|&e| e as u32).collect();
+                    for (fi, f) in mesh.faces.iter().enumerate() {
+                        if !f.outer && set.contains(&f.elem) && face_color[fi].is_none() {
+                            face_color[fi] = Some(load_color(&it.load));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let section = disp.section.map(|sec| {
+        let a = sec.axis.min(2);
+        (a, mesh.bbox.0[a] + sec.position.clamp(0.0, 1.0) * (mesh.bbox.1[a] - mesh.bbox.0[a]))
+    });
+    let rev = disp.field.reversed_scale();
+    let norm_t = |v: f64| {
+        let t = match range {
+            Some((mn, mx)) if mx - mn > 1e-30 * mx.abs().max(1.0) => (v - mn) / (mx - mn),
+            _ => 0.5,
+        };
+        if rev { 1.0 - t } else { t }
+    };
+
+    let mut quads = Vec::with_capacity(mesh.faces.len());
+    let mut undeformed = Vec::new();
+    let mut has_enclosure = false;
+    for (fi, f) in mesh.faces.iter().enumerate() {
+        if let Some((a, pc)) = section {
+            if !f.outer && mesh.elem_center(f.elem as usize)[a] < pc {
+                continue;
+            }
+        }
+        if f.outer {
+            has_enclosure = true;
+        }
+        let hl = highlight.contains(&f.patch);
+        let mut p0 = [[0.0; 3]; 4];
+        let mut dv = [[0.0; 3]; 4];
+        let mut tv = [f64::NAN; 4];
+        let mut cv = [[0u8; 3]; 4];
+        for (vi, &nid) in f.nodes.iter().enumerate() {
+            let base = mesh.nodes[nid as usize];
+            p0[vi] = base;
+            dv[vi] = match defl {
+                Some(d) => scale(d[nid as usize], scale_used),
+                None => [0.0; 3],
+            };
+            if disp.show_undeformed && defl.is_some() {
+                undeformed.push(base);
+            }
+            let (t, col) = match (&values, range) {
+                (Some(v), Some(_)) => (norm_t(v[nid as usize]), [0, 0, 0]),
+                _ => {
+                    let c0 = if f.outer { if disp.dark { [70, 78, 92] } else { [214, 222, 234] } } else { [178, 182, 190] };
+                    (f64::NAN, if hl { [40, 200, 90] } else { face_color[fi].unwrap_or(c0) })
+                }
+            };
+            tv[vi] = t;
+            cv[vi] = col;
+        }
+        quads.push(RawQuad { p0, disp: dv, t: tv, color: cv, face: fi as u32, kind: if f.outer { 1 } else { 0 } });
+    }
+    if let Some((a, pc)) = section {
+        let (b, c) = ((a + 1) % 3, (a + 2) % 3);
+        let h = mesh.h;
+        for (e, en) in mesh.elems.iter().enumerate() {
+            let lower = mesh.origin[a] + mesh.elem_cell[e][a] as f64 * h;
+            if !(pc >= lower && pc < lower + h) {
+                continue;
+            }
+            let w = (pc - lower) / h;
+            let mut p0 = [[0.0; 3]; 4];
+            let mut dv = [[0.0; 3]; 4];
+            let mut tv = [f64::NAN; 4];
+            let mut cv = [[0u8; 3]; 4];
+            for (vi, (ob, oc)) in [(0usize, 0usize), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
+                let pick = |da: usize| {
+                    let mut d = [0usize; 3];
+                    d[a] = da;
+                    d[b] = ob;
+                    d[c] = oc;
+                    en[crate::mesh::CORNER.iter().position(|q| *q == d).unwrap()] as usize
+                };
+                let (n0, n1) = (pick(0), pick(1));
+                let mut pos = mesh.nodes[n0];
+                pos[a] = pc;
+                p0[vi] = pos;
+                dv[vi] = match defl {
+                    Some(d) => scale(add(scale(d[n0], 1.0 - w), scale(d[n1], w)), scale_used),
+                    None => [0.0; 3],
+                };
+                match &values {
+                    Some(v) => tv[vi] = norm_t((1.0 - w) * v[n0] + w * v[n1]),
+                    None => {
+                        let solid = mesh.elem_region[e] == crate::mesh::REGION_SOLID;
+                        cv[vi] = if solid { [160, 166, 176] } else if disp.dark { [60, 90, 120] } else { [190, 215, 240] };
+                    }
+                }
+            }
+            quads.push(RawQuad { p0, disp: dv, t: tv, color: cv, face: u32::MAX, kind: 2 });
+        }
+    }
+    PreparedScene { quads, undeformed, range, reversed: rev, scale_used, has_enclosure }
+}
+
 pub struct Scene {
     /// Quad corner positions (mm, deformed) — 4 per face.
     pub pos: Vec<V3>,
@@ -186,170 +616,97 @@ pub fn auto_scale(mesh: &Mesh, d: &[V3]) -> f64 {
     (s / p).round() * p
 }
 
-pub fn build_scene(
-    mesh: &Mesh,
-    model: &Model,
-    results: Option<&Results>,
-    disp: &Display,
-    highlight: &HashSet<u32>,
-    anim: f64,
-) -> Scene {
-    let use_res = disp.show_results && results.is_some();
-    let mut range = None;
-    let mut values: Option<Vec<f64>> = None;
-    let mut defl: Option<&[V3]> = None;
-    let mut scale_used = 0.0;
-    if use_res {
-        let r = results.unwrap();
-        let field = if r.has(disp.field) { disp.field } else { r.available_fields().first().copied().unwrap_or(Field::TotalDeformation) };
-        if let Some(v) = r.scalar_at(mesh, field, disp.mode, disp.cylindrical) {
-            let mn = v.iter().cloned().fold(f64::INFINITY, f64::min);
-            let mx = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            range = Some((mn, mx));
-            values = Some(v);
-        }
-        if let Some(d) = r.deformation(disp.mode) {
-            if d.len() == mesh.nodes.len() {
-                scale_used = disp.deformation_scale.unwrap_or_else(|| auto_scale(mesh, d));
-                defl = Some(d);
-            }
-        }
-    }
-    // face -> load overlay colour
-    let mut face_color: Vec<Option<[u8; 3]>> = vec![None; mesh.faces.len()];
-    if !use_res {
-        for it in &model.loads {
-            if let Ok(fs) = mesh.resolve_faces(it.load.faces()) {
-                for f in fs {
-                    face_color[f as usize] = Some(load_color(&it.load));
-                }
-            }
-        }
-    }
-    let n = mesh.faces.len() * 4;
+pub fn build_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &Display, highlight: &HashSet<u32>, anim: f64) -> Scene {
+    let prep = prepare_scene(mesh, model, results, disp, highlight);
+    let n = prep.quads.len() * 4;
     let mut s = Scene {
         pos: Vec::with_capacity(n),
         t: Vec::with_capacity(n),
         color: Vec::with_capacity(n),
-        face: Vec::with_capacity(mesh.faces.len()),
-        kind: Vec::with_capacity(mesh.faces.len()),
-        undeformed: Vec::new(),
-        range,
-        reversed: disp.field.reversed_scale(),
-        scale_used,
+        face: Vec::with_capacity(prep.quads.len()),
+        kind: Vec::with_capacity(prep.quads.len()),
+        undeformed: prep.undeformed,
+        range: prep.range,
+        reversed: prep.reversed,
+        scale_used: prep.scale_used,
         lo: [f64::INFINITY; 3],
         hi: [f64::NEG_INFINITY; 3],
     };
-    if !use_res {
-        for it in &model.loads {
-            if let Some(b) = it.load.body() {
-                if let Ok(els) = mesh.body_elems(b) {
-                    let set: HashSet<u32> = els.iter().map(|&e| e as u32).collect();
-                    for (fi, f) in mesh.faces.iter().enumerate() {
-                        if !f.outer && set.contains(&f.elem) && face_color[fi].is_none() {
-                            face_color[fi] = Some(load_color(&it.load));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let section = disp.section.map(|sec| {
-        let a = sec.axis.min(2);
-        (a, mesh.bbox.0[a] + sec.position.clamp(0.0, 1.0) * (mesh.bbox.1[a] - mesh.bbox.0[a]))
-    });
-    let defl = if section.is_some() { None } else { defl };
-    let rev = disp.field.reversed_scale();
-    let norm_t = |v: f64| {
-        let t = match range {
-            Some((mn, mx)) if mx - mn > 1e-30 * mx.abs().max(1.0) => (v - mn) / (mx - mn),
-            _ => 0.5,
-        };
-        if rev { 1.0 - t } else { t }
-    };
-    let k = scale_used * anim;
-    for (fi, f) in mesh.faces.iter().enumerate() {
-        if let Some((a, pc)) = section {
-            // cut away the half in front of the plane
-            if !f.outer && mesh.elem_center(f.elem as usize)[a] < pc {
-                continue;
-            }
-        }
-        let hl = highlight.contains(&f.patch);
-        for &nid in &f.nodes {
-            let base = mesh.nodes[nid as usize];
-            let p = match defl {
-                Some(d) => add(base, scale(d[nid as usize], k)),
-                None => base,
-            };
+    for q in &prep.quads {
+        for vi in 0..4 {
+            let p = add(q.p0[vi], scale(q.disp[vi], anim));
             for c in 0..3 {
                 s.lo[c] = s.lo[c].min(p[c]);
                 s.hi[c] = s.hi[c].max(p[c]);
             }
             s.pos.push(p);
-            if disp.show_undeformed && defl.is_some() {
-                s.undeformed.push(base);
-            }
-            let (t, col) = match (&values, range) {
-                (Some(v), Some(_)) => {
-                    let t = norm_t(v[nid as usize]);
-                    (t, [0, 0, 0])
-                }
-                _ => {
-                    let base = if f.outer { if disp.dark { [70, 78, 92] } else { [214, 222, 234] } } else { [178, 182, 190] };
-                    let c = if hl { [40, 200, 90] } else { face_color[fi].unwrap_or(base) };
-                    (f64::NAN, c)
-                }
-            };
-            s.t.push(t);
-            s.color.push(col);
+            s.t.push(q.t[vi]);
+            s.color.push(q.color[vi]);
         }
-        s.face.push(fi as u32);
-        s.kind.push(if f.outer { 1 } else { 0 });
-    }
-    // section quads through every element cut by the plane
-    if let Some((a, pc)) = section {
-        let (b, c) = ((a + 1) % 3, (a + 2) % 3);
-        let h = mesh.h;
-        for (e, en) in mesh.elems.iter().enumerate() {
-            let lower = mesh.origin[a] + mesh.elem_cell[e][a] as f64 * h;
-            if !(pc >= lower && pc < lower + h) {
-                continue;
-            }
-            let w = (pc - lower) / h;
-            for (ob, oc) in [(0usize, 0usize), (1, 0), (1, 1), (0, 1)] {
-                let pick = |da: usize| {
-                    let mut d = [0usize; 3];
-                    d[a] = da;
-                    d[b] = ob;
-                    d[c] = oc;
-                    en[crate::mesh::CORNER.iter().position(|q| *q == d).unwrap()] as usize
-                };
-                let (n0, n1) = (pick(0), pick(1));
-                let mut pos = mesh.nodes[n0];
-                pos[a] = pc;
-                s.pos.push(pos);
-                for q in 0..3 {
-                    s.lo[q] = s.lo[q].min(pos[q]);
-                    s.hi[q] = s.hi[q].max(pos[q]);
-                }
-                match &values {
-                    Some(v) => {
-                        s.t.push(norm_t((1.0 - w) * v[n0] + w * v[n1]));
-                        s.color.push([0, 0, 0]);
-                    }
-                    None => {
-                        s.t.push(f64::NAN);
-                        let solid = mesh.elem_region[e] == crate::mesh::REGION_SOLID;
-                        s.color.push(if solid { [160, 166, 176] } else if disp.dark { [60, 90, 120] } else { [190, 215, 240] });
-                    }
-                }
-            }
-            s.face.push(u32::MAX);
-            s.kind.push(2);
-        }
+        s.face.push(q.face);
+        s.kind.push(q.kind);
     }
     s
+}
+
+/// Build GPU vertex/index buffers and BVH face picker once per `(rev, sel, mesh)` without `anim`.
+pub fn build_gpu_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &Display, highlight: &HashSet<u32>) -> GpuScene {
+    let prep = prepare_scene(mesh, model, results, disp, highlight);
+    let uvs = [[0.0f32, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let mut vertices = Vec::with_capacity(prep.quads.len() * 4);
+    let mut solid_indices = Vec::with_capacity(prep.quads.len() * 6);
+    let mut enclosure_indices = Vec::new();
+    let mut pick_quads = Vec::with_capacity(prep.quads.len());
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+
+    for q in &prep.quads {
+        let nrm = normalize(cross(sub(q.p0[1], q.p0[0]), sub(q.p0[3], q.p0[0])));
+        let nrm_f = [nrm[0] as f32, nrm[1] as f32, nrm[2] as f32];
+        let base = vertices.len() as u32;
+        for vi in 0..4 {
+            for c in 0..3 {
+                let d_abs = q.disp[vi][c].abs();
+                lo[c] = lo[c].min(q.p0[vi][c] - d_abs);
+                hi[c] = hi[c].max(q.p0[vi][c] + d_abs);
+            }
+            vertices.push(GpuVertex {
+                pos: [q.p0[vi][0] as f32, q.p0[vi][1] as f32, q.p0[vi][2] as f32],
+                disp: [q.disp[vi][0] as f32, q.disp[vi][1] as f32, q.disp[vi][2] as f32],
+                norm: nrm_f,
+                color: [q.color[vi][0] as f32 / 255.0, q.color[vi][1] as f32 / 255.0, q.color[vi][2] as f32 / 255.0],
+                uv: uvs[vi],
+                t: if q.t[vi].is_nan() { -1.0 } else { q.t[vi].clamp(0.0, 1.0) as f32 },
+                kind: q.kind as f32,
+            });
+        }
+        let target_idx = if q.kind == 1 { &mut enclosure_indices } else { &mut solid_indices };
+        target_idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        if q.face != u32::MAX {
+            pick_quads.push(PickQuad { p0: q.p0, disp: q.disp, face: q.face, kind: q.kind });
+        }
+    }
+    let mut undeformed_lines = Vec::with_capacity(prep.undeformed.len() * 2);
+    for quad in prep.undeformed.chunks_exact(4) {
+        for e in 0..4 {
+            let a = quad[e];
+            let b = quad[(e + 1) % 4];
+            undeformed_lines.push([a[0] as f32, a[1] as f32, a[2] as f32]);
+            undeformed_lines.push([b[0] as f32, b[1] as f32, b[2] as f32]);
+        }
+    }
+    GpuScene {
+        vertices,
+        solid_indices,
+        enclosure_indices,
+        undeformed_lines,
+        picker: QuadPicker::build(pick_quads),
+        range: prep.range,
+        reversed: prep.reversed,
+        scale_used: prep.scale_used,
+        lo,
+        hi,
+        has_enclosure: prep.has_enclosure,
+    }
 }
 
 pub struct Frame {

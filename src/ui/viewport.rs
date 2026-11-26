@@ -1,0 +1,498 @@
+//! Central 3D viewport: non-blocking meshing coordinator, hardware GL PaintCallback (with
+//! software rasterizer fallback), BVH face picking, probes/path overlay, legend, and view toolbar.
+
+use super::gl_viewport::{DrawParams, UploadKey};
+use super::{DrawerTab, MeshJob, RenderKey, SimApp};
+use crate::geometry::{add, dot, scale};
+use crate::render;
+use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
+use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+impl SimApp {
+    pub(super) fn viewport(&mut self, ui: &mut egui::Ui) {
+        let p = self.p;
+        let rect = ui.available_rect_before_wrap();
+        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+
+        if let Some(job) = &self.mesh_job {
+            let done = job.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            if let Some(res) = done {
+                let finished = self.mesh_job.take().unwrap();
+                let cancelled = finished.cancel.load(Ordering::Relaxed);
+                match res {
+                    Ok(m) if !cancelled => {
+                        let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if s.mesh_key() == finished.key {
+                            let _ = s.install_mesh(m, finished.key.0, (finished.key.1, finished.key.2));
+                            self.mesh_err = None;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) if cancelled => {}
+                    Err(e) => {
+                        self.mesh_err = Some((finished.key, e));
+                    }
+                }
+            }
+        }
+
+        let (mesh, model, results, display, rev, view_req, stale) = {
+            let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if s.model.bodies.is_empty() {
+                if let Some(old) = self.mesh_job.take() {
+                    old.cancel.store(true, Ordering::Relaxed);
+                }
+                self.mesh_err = None;
+            } else if s.mesh_valid() {
+                if let Some(old) = self.mesh_job.take() {
+                    old.cancel.store(true, Ordering::Relaxed);
+                }
+                self.mesh_err = None;
+            } else {
+                let key = s.mesh_key();
+                if self.mesh_err.as_ref().is_some_and(|(k, _)| *k != key) {
+                    self.mesh_err = None;
+                }
+                if self.mesh_err.is_none() && self.mesh_job.as_ref().is_none_or(|j| j.key != key) {
+                    if let Some(old) = self.mesh_job.take() {
+                        old.cancel.store(true, Ordering::Relaxed);
+                    }
+                    let model = s.model.clone();
+                    let h = s.element_size();
+                    let limit = crate::mesh::max_cells_for(&model);
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let done = Arc::new(std::sync::Mutex::new(None));
+                    let (c2, d2, ctx2) = (cancel.clone(), done.clone(), ui.ctx().clone());
+                    std::thread::spawn(move || {
+                        let r = crate::mesh::build_for_cancellable(&model, h, limit, &c2).map_err(|e| format!("{e:#}"));
+                        *d2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
+                        ctx2.request_repaint();
+                    });
+                    self.mesh_job = Some(MeshJob { key, cancel, done });
+                }
+            }
+            let mesh = if s.model.bodies.is_empty() { None } else { s.mesh.clone() };
+            (mesh, s.model.clone(), s.results.clone(), s.display.clone(), s.revision, s.view_request.take(), s.results_stale)
+        };
+        if self.mesh_job.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+        }
+        self.cam.perspective = display.perspective;
+
+        let (_, bb) = render::background(self.dark);
+        let c32 = |c: [f32; 3]| Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
+        let Some(mesh) = mesh else {
+            painter.rect_filled(rect, 0.0, c32(bb));
+            if self.mesh_job.is_some() {
+                painter.text(rect.center() - vec2(0.0, 22.0), Align2::CENTER_CENTER, "⚙  Meshing geometry…", FontId::proportional(20.0), p.text);
+                painter.text(rect.center() + vec2(0.0, 4.0), Align2::CENTER_CENTER, "Window stays responsive while building the mesh", FontId::proportional(13.0), p.weak);
+                let btn = Rect::from_center_size(rect.center() + vec2(0.0, 34.0), vec2(110.0, 26.0));
+                if ui.put(btn, egui::Button::new("Cancel meshing")).clicked() {
+                    if let Some(j) = self.mesh_job.take() {
+                        j.cancel.store(true, Ordering::Relaxed);
+                        self.mesh_err = Some((j.key, "Meshing cancelled.".into()));
+                    }
+                }
+            } else {
+                let (title, sub) = match &self.mesh_err {
+                    Some((_, e)) => ("⚠  Geometry / mesh notice".to_string(), e.clone()),
+                    None => ("Start a new simulation".into(), "GEOMETRY ▸ Box / Cylinder / Import STL      or      Examples ▸ Cantilever bracket".into()),
+                };
+                painter.text(rect.center() - vec2(0.0, 14.0), Align2::CENTER_CENTER, title, FontId::proportional(22.0), p.text);
+                painter.text(rect.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, sub, FontId::proportional(13.0), p.weak);
+                if self.mesh_err.is_some() {
+                    let btn = Rect::from_center_size(rect.center() + vec2(0.0, 46.0), vec2(100.0, 26.0));
+                    if ui.put(btn, egui::Button::new("Retry mesh")).clicked() {
+                        self.mesh_err = None;
+                    }
+                }
+            }
+            return;
+        };
+
+        let mptr = Arc::as_ptr(&mesh) as usize;
+        if mptr != self.mesh_ptr {
+            self.mesh_ptr = mptr;
+            self.selected.clear();
+            self.sel_version += 1;
+        }
+        {
+            let names = self.selected_names(Some(&mesh));
+            let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if s.selection != names {
+                s.selection = names;
+            }
+        }
+
+        if let Some(v) = view_req {
+            if v != "fit" {
+                self.cam.set_view(&v);
+            }
+            self.need_fit = true;
+        }
+        if self.need_fit {
+            let reserve = if display.show_results && rect.width() > 760.0 { 240.0 } else { 0.0 };
+            self.cam.fit(mesh.bbox.0, mesh.bbox.1, (rect.width() - reserve) as f64, rect.height() as f64);
+            self.cam.pan(-(reserve as f64) / 2.0, 0.0);
+            self.need_fit = false;
+        }
+
+        // ---- input
+        let dragging = resp.dragged();
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            let d = resp.drag_delta();
+            self.cam.orbit(d.x as f64, d.y as f64);
+        } else if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            let d = resp.drag_delta();
+            self.cam.pan(d.x as f64, d.y as f64);
+        }
+        if resp.hovered() {
+            let dy = ui.input(|i| i.smooth_scroll_delta.y);
+            if dy != 0.0 {
+                let old = self.cam.zoom;
+                let new = (old * (dy as f64 * 0.003).exp()).clamp(1e-4, 1e6);
+                if let Some(hp) = resp.hover_pos() {
+                    let (r, u, _) = self.cam.basis();
+                    let k = 1.0 / old - 1.0 / new;
+                    let ox = (hp.x - rect.center().x) as f64 * k;
+                    let oy = (rect.center().y - hp.y) as f64 * k;
+                    self.cam.target = add(self.cam.target, add(scale(r, ox), scale(u, oy)));
+                }
+                self.cam.zoom = new;
+            }
+        }
+
+        // ---- animation
+        let anim_on = self.animate && display.show_results && results.as_ref().is_some_and(|r| r.deformation(display.mode).is_some());
+        let anim = if anim_on {
+            ui.ctx().request_repaint();
+            (ui.input(|i| i.time) * std::f64::consts::TAU * 0.7).sin()
+        } else {
+            1.0
+        };
+
+        // ---- render (hardware GL viewport when available, else software rasterizer fallback)
+        let mut gpu_scene_opt: Option<Arc<render::GpuScene>> = None;
+        if let Some(gl_vp) = &self.gl_vp {
+            let gkey = (rev, self.sel_version, mptr, self.dark);
+            let gs = match &self.gpu_scene {
+                Some((k, sc)) if *k == gkey => sc.clone(),
+                _ => {
+                    let sc = Arc::new(render::build_gpu_scene(&mesh, &model, results.as_deref(), &display, &self.selected));
+                    self.gpu_scene = Some((gkey, sc.clone()));
+                    sc
+                }
+            };
+            self.legend = gs.range.map(|r| (r, gs.scale_used));
+            painter.add(gl_vp.paint_callback(
+                rect,
+                DrawParams {
+                    cam: self.cam,
+                    w_pts: rect.width(),
+                    h_pts: rect.height(),
+                    anim,
+                    show_mesh: display.show_mesh,
+                    dark: self.dark,
+                    translucent_enclosure: display.translucent_enclosure,
+                    scene: gs.clone(),
+                    upload_key: UploadKey { rev, sel: self.sel_version, mesh: mptr, dark: self.dark },
+                },
+            ));
+            gpu_scene_opt = Some(gs);
+        } else {
+            let ppp = ui.ctx().pixels_per_point();
+            self.render_scale = ppp * if dragging || anim_on { 0.6 } else { 1.0 };
+            let w = ((rect.width() * self.render_scale) as usize).max(16);
+            let h = ((rect.height() * self.render_scale) as usize).max(16);
+            let key = RenderKey { rev, cam: self.cam, w, h, sel: self.sel_version, anim: (anim * 1000.0) as i64, mesh: mptr, dark: self.dark };
+            if self.key.as_ref() != Some(&key) {
+                let skey = (key.rev, key.sel, key.anim, key.mesh);
+                let scene = match &self.scene {
+                    Some((k, sc)) if *k == skey => sc.clone(),
+                    _ => {
+                        let sc = Arc::new(render::build_scene(&mesh, &model, results.as_deref(), &display, &self.selected, anim));
+                        self.scene = Some((skey, sc.clone()));
+                        sc
+                    }
+                };
+                let mut cam = self.cam;
+                cam.zoom *= self.render_scale as f64;
+                let frame = render::rasterize(&scene, &cam, w, h, display.show_mesh && !anim_on, self.dark);
+                let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &frame.rgba);
+                match &mut self.tex {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => self.tex = Some(ui.ctx().load_texture("viewport", img, egui::TextureOptions::LINEAR)),
+                }
+                self.face_buf = frame.face_id;
+                self.buf_size = (w, h);
+                self.key = Some(key);
+                self.legend = scene.range.map(|r| (r, scene.scale_used));
+            }
+            if let Some(t) = &self.tex {
+                painter.image(t.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+        }
+
+        // ---- picking + hover (evaluated upfront before mutating UI drawer state)
+        let clicked_pos = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
+        let hover_pos = (!dragging).then(|| resp.hover_pos()).flatten();
+        let (clicked_fid, hover_fid) = {
+            let pick = |pos: Pos2| -> Option<u32> {
+                if let Some(gs) = &gpu_scene_opt {
+                    gs.picker.pick(&self.cam, (pos.x - rect.min.x) as f64, (pos.y - rect.min.y) as f64, rect.width() as f64, rect.height() as f64, anim, false).map(|(f, _)| f)
+                } else {
+                    let x = ((pos.x - rect.min.x) * self.render_scale) as usize;
+                    let y = ((pos.y - rect.min.y) * self.render_scale) as usize;
+                    let (bw, bh) = self.buf_size;
+                    (x < bw && y < bh).then(|| self.face_buf[y * bw + x]).filter(|f| *f != u32::MAX)
+                }
+            };
+            (clicked_pos.and_then(pick), hover_pos.and_then(pick))
+        };
+        let res_id = results.as_ref().map(|r| Arc::as_ptr(r) as u64).unwrap_or(0);
+        let probing = self.probe_mode && display.show_results && results.is_some();
+        let path_picking = self.path.picking > 0 && display.show_results && results.is_some();
+        let cam = self.cam;
+        let legend = self.legend;
+        let node_screen = |n: usize| -> Pos2 {
+            let mut q = mesh.nodes[n];
+            if let (Some(r), Some((_, sc))) = (&results, legend) {
+                if let Some(d) = r.deformation(display.mode) {
+                    if d.len() == mesh.nodes.len() && sc > 0.0 {
+                        q = add(q, scale(d[n], sc * anim));
+                    }
+                }
+            }
+            let (x, y, _) = cam.project(q, rect.width() as f64, rect.height() as f64);
+            rect.min + vec2(x as f32, y as f32)
+        };
+        let world_screen = |q: [f64; 3]| -> Pos2 {
+            let (x, y, _) = cam.project(q, rect.width() as f64, rect.height() as f64);
+            rect.min + vec2(x as f32, y as f32)
+        };
+        if (probing || path_picking) && clicked_pos.is_some() {
+            if let (Some(pos), Some(fid)) = (clicked_pos, clicked_fid) {
+                let n = mesh.faces[fid as usize].nodes.iter().copied().min_by(|a, b| node_screen(*a as usize).distance(pos).total_cmp(&node_screen(*b as usize).distance(pos))).unwrap();
+                if path_picking {
+                    if self.path.picking == 1 {
+                        self.path.from = mesh.nodes[n as usize];
+                        self.path.picking = 2;
+                        self.toast = Some(("Path start A set — click end point B on the model".into(), false, 4.0));
+                    } else {
+                        self.path.to = mesh.nodes[n as usize];
+                        self.path.picking = 0;
+                        self.path.tab = 1;
+                        self.open_drawer(DrawerTab::Charts);
+                        self.toast = Some(("Path end B set".into(), false, 3.0));
+                    }
+                } else {
+                    self.probes.retain(|(_, rid)| *rid == res_id);
+                    if !self.probes.iter().any(|(m, _)| *m == n) {
+                        self.probes.push((n, res_id));
+                        if self.probes.len() > 8 {
+                            self.probes.remove(0);
+                        }
+                    }
+                }
+            }
+        } else if clicked_pos.is_some() {
+            let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
+            match clicked_fid {
+                Some(fid) => {
+                    let patch = mesh.faces[fid as usize].patch;
+                    if shift {
+                        if !self.selected.remove(&patch) {
+                            self.selected.insert(patch);
+                        }
+                    } else if self.selected.len() == 1 && self.selected.contains(&patch) {
+                        self.selected.clear();
+                    } else {
+                        self.selected.clear();
+                        self.selected.insert(patch);
+                    }
+                }
+                None if !shift => self.selected.clear(),
+                None => {}
+            }
+            self.sel_version += 1;
+        }
+        let text_col = if self.dark { Color32::from_gray(235) } else { Color32::from_gray(25) };
+        let card_fill = p.card.gamma_multiply(0.92);
+        if let (Some(hp), Some(fid)) = (hover_pos, hover_fid) {
+            if let Some(pi) = mesh.patches.get(mesh.faces[fid as usize].patch as usize) {
+                let galley = painter.layout_no_wrap(pi.name.clone(), FontId::proportional(12.0), text_col);
+                let r = Rect::from_min_size(hp + vec2(14.0, 12.0), galley.size() + vec2(12.0, 6.0));
+                painter.rect(r, 5.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+                painter.galley(r.min + vec2(6.0, 3.0), galley, text_col);
+            }
+        }
+
+        // ---- probe markers & path line
+        if display.show_results {
+            if let Some(r) = &results {
+                let f = if r.has(display.field) { display.field } else { r.available_fields()[0] };
+                if let Some(vals) = r.scalar_at(&mesh, f, display.mode, display.cylindrical) {
+                    for (n, rid) in &self.probes {
+                        if *rid != res_id || *n as usize >= vals.len() {
+                            continue;
+                        }
+                        let sp = node_screen(*n as usize);
+                        if !rect.contains(sp) {
+                            continue;
+                        }
+                        painter.circle(sp, 4.5, p.accent, Stroke::new(1.5, Color32::WHITE));
+                        let txt = format!("{} {}", render::fmt_val(vals[*n as usize]), f.unit());
+                        let galley = painter.layout_no_wrap(txt, FontId::monospace(12.0), Color32::WHITE);
+                        let br = Rect::from_min_size(sp + vec2(8.0, -22.0), galley.size() + vec2(10.0, 6.0));
+                        painter.rect_filled(br, 4.0, Color32::from_black_alpha(190));
+                        painter.galley(br.min + vec2(5.0, 3.0), galley, Color32::WHITE);
+                    }
+                }
+                if (self.show_chart && self.path.tab == 1 && self.path.inited_res == res_id) || self.path.picking > 0 {
+                    let a = world_screen(self.path.from);
+                    let b = world_screen(self.path.to);
+                    painter.line_segment([a, b], Stroke::new(2.5, p.accent));
+                    for (pt, lbl, col) in [(a, "A", p.accent), (b, "B", p.ok)] {
+                        painter.circle(pt, 5.0, col, Stroke::new(1.5, Color32::WHITE));
+                        painter.text(pt + vec2(7.0, -14.0), Align2::LEFT_CENTER, lbl, FontId::monospace(12.0), Color32::WHITE);
+                    }
+                }
+            }
+        }
+
+        // ---- title + legend card
+        let o = rect.left_top() + vec2(14.0, 14.0);
+        if display.show_results {
+            if let (Some(r), Some(((mn, mx), sc))) = (&results, self.legend) {
+                let f = if r.has(display.field) { display.field } else { r.available_fields()[0] };
+                let mut title = f.label().to_string();
+                let mut unit = f.unit().to_string();
+                if !r.modes.is_empty() {
+                    title = r.step_label(display.mode);
+                    if f.is_deformation() {
+                        unit = "normalised".into();
+                    }
+                } else if r.n_steps() > 1 {
+                    title = format!("{title} · {}", r.step_label(display.mode));
+                }
+                let mut sub = model.analysis.kind.label().to_string();
+                if sc > 0.0 {
+                    sub += &format!("  ·  scale ×{}", render::fmt_val(sc));
+                }
+                let compact = rect.width() < 700.0 || rect.height() < 560.0;
+                let bh = if compact { 14.0 } else { 22.0 };
+                let card_r = Rect::from_min_size(o, vec2(if compact { 170.0 } else { 220.0 }, 62.0 + bh * 9.0 + 14.0));
+                painter.rect(card_r, 10.0, p.card.gamma_multiply(0.80), Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+                let i = card_r.min + vec2(12.0, 10.0);
+                painter.text(i, Align2::LEFT_TOP, &title, FontId::proportional(14.0), text_col);
+                painter.text(i + vec2(0.0, 19.0), Align2::LEFT_TOP, format!("{unit}   {sub}"), FontId::proportional(11.0), p.weak);
+                if stale {
+                    painter.text(i + vec2(0.0, 33.0), Align2::LEFT_TOP, "⚠ results stale — solve again", FontId::proportional(11.0), p.warn);
+                }
+                let top = i + vec2(0.0, 52.0);
+                for b in 0..9 {
+                    let c = render::BANDS[if f.reversed_scale() { b } else { 8 - b }];
+                    let rr = Rect::from_min_size(top + vec2(0.0, b as f32 * bh), vec2(16.0, bh));
+                    painter.rect_filled(rr, 0.0, Color32::from_rgb(c[0], c[1], c[2]));
+                }
+                painter.rect_stroke(Rect::from_min_size(top, vec2(16.0, bh * 9.0)), 2.0, Stroke::new(1.0, p.border), egui::StrokeKind::Outside);
+                for b in 0..=9 {
+                    let mut v = mx - (mx - mn) * b as f64 / 9.0;
+                    if v.abs() < 1e-9 * mx.abs().max(mn.abs()) {
+                        v = 0.0;
+                    }
+                    let tag = match b {
+                        0 => "  max",
+                        9 => "  min",
+                        _ => "",
+                    };
+                    painter.text(top + vec2(24.0, b as f32 * bh), Align2::LEFT_CENTER, format!("{}{tag}", render::fmt_val(v)), FontId::monospace(if compact { 10.0 } else { 11.5 }), text_col);
+                }
+            }
+        } else {
+            let t = format!("{}  ·  model", model.analysis.kind.label());
+            let galley = painter.layout_no_wrap(t, FontId::proportional(13.0), text_col);
+            let r = Rect::from_min_size(o, galley.size() + vec2(20.0, 12.0));
+            painter.rect(r, 8.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            painter.galley(r.min + vec2(10.0, 6.0), galley, text_col);
+        }
+
+        // ---- axis triad
+        let (r, u, _) = self.cam.basis();
+        let c0 = Pos2::new(rect.left() + 52.0, rect.bottom() - 52.0);
+        painter.circle(c0, 40.0, card_fill, Stroke::new(1.0, p.border));
+        for (k, (name, col)) in [("X", Color32::from_rgb(225, 70, 70)), ("Y", Color32::from_rgb(70, 180, 90)), ("Z", Color32::from_rgb(70, 120, 235))].iter().enumerate() {
+            let mut e = [0.0; 3];
+            e[k] = 1.0;
+            let d = vec2((dot(e, r) * 26.0) as f32, -(dot(e, u) * 26.0) as f32);
+            painter.line_segment([c0, c0 + d], Stroke::new(2.5, *col));
+            painter.text(c0 + d * 1.28, Align2::CENTER_CENTER, *name, FontId::proportional(11.0), *col);
+        }
+
+        // ---- view toolbar (top right)
+        let has_enc = mesh.with_enclosure;
+        let views = [("⛶", "fit", "Fit all"), ("◩", "iso", "Isometric"), ("▣", "front", "Front"), ("⬒", "top", "Top"), ("◨", "right", "Right"), ("◧", "left", "Left")];
+        let extra = if has_enc { 2 } else { 1 };
+        let tbw = views.len() as f32 * 30.0 + extra as f32 * 52.0 + 10.0;
+        let tby = if rect.width() < 640.0 { rect.bottom() - 48.0 } else { rect.top() + 14.0 };
+        let tb = Rect::from_min_size(pos2(rect.right() - 14.0 - tbw, tby), vec2(tbw, 34.0));
+        painter.rect(tb, 10.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+        for (i, (icon, view, tip)) in views.iter().enumerate() {
+            let br = Rect::from_min_size(tb.min + vec2(4.0 + i as f32 * 30.0, 4.0), vec2(28.0, 26.0));
+            let r = ui.interact(br, ui.scope_id().with(("view", i)), Sense::click()).on_hover_text(*tip);
+            if r.hovered() {
+                painter.rect_filled(br, 6.0, p.hover);
+            }
+            painter.text(br.center(), Align2::CENTER_CENTER, *icon, FontId::proportional(15.0), text_col);
+            if r.clicked() {
+                if *view != "fit" {
+                    self.cam.set_view(view);
+                }
+                self.need_fit = true;
+                ui.ctx().request_repaint();
+            }
+        }
+        let mut ex = tb.min.x + 6.0 + views.len() as f32 * 30.0;
+        let p_rect = Rect::from_min_size(pos2(ex, tb.min.y + 4.0), vec2(48.0, 26.0));
+        let pr = ui.interact(p_rect, ui.scope_id().with("persp"), Sense::click()).on_hover_text("Toggle Orthographic / Perspective projection");
+        if display.perspective {
+            painter.rect_filled(p_rect, 6.0, p.accent.gamma_multiply(0.22));
+        } else if pr.hovered() {
+            painter.rect_filled(p_rect, 6.0, p.hover);
+        }
+        painter.text(p_rect.center(), Align2::CENTER_CENTER, if display.perspective { "Persp" } else { "Ortho" }, FontId::proportional(11.5), if display.perspective { p.accent } else { text_col });
+        if pr.clicked() {
+            self.run("set_display", json!({"perspective": !display.perspective}));
+        }
+        ex += 50.0;
+        if has_enc {
+            let g_rect = Rect::from_min_size(pos2(ex, tb.min.y + 4.0), vec2(48.0, 26.0));
+            let gr = ui.interact(g_rect, ui.scope_id().with("glass"), Sense::click()).on_hover_text("Toggle translucent glass enclosure");
+            if display.translucent_enclosure {
+                painter.rect_filled(g_rect, 6.0, p.accent.gamma_multiply(0.22));
+            } else if gr.hovered() {
+                painter.rect_filled(g_rect, 6.0, p.hover);
+            }
+            painter.text(g_rect.center(), Align2::CENTER_CENTER, "Glass", FontId::proportional(11.5), if display.translucent_enclosure { p.accent } else { text_col });
+            if gr.clicked() {
+                self.run("set_display", json!({"translucent_enclosure": !display.translucent_enclosure}));
+            }
+        }
+
+        if self.mesh_job.is_some() {
+            let pill = Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 24.0), vec2(210.0, 28.0));
+            painter.rect(pill, 8.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            painter.text(pill.left_center() + vec2(12.0, 0.0), Align2::LEFT_CENTER, "⚙  Updating mesh…", FontId::proportional(12.5), text_col);
+            let cbtn = Rect::from_min_size(pos2(pill.right() - 62.0, pill.top() + 4.0), vec2(54.0, 20.0));
+            if ui.put(cbtn, egui::Button::new(RichText::new("Cancel").small())).clicked() {
+                if let Some(j) = self.mesh_job.take() {
+                    j.cancel.store(true, Ordering::Relaxed);
+                    self.mesh_err = Some((j.key, "Meshing cancelled.".into()));
+                }
+            }
+        }
+    }
+}

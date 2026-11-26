@@ -29,5 +29,6 @@ pub mod sparse;
 pub mod study;
 pub mod surrogate;
 pub mod topo;
+pub mod ui;
 pub mod vibration;
 pub mod vtk;

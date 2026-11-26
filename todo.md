@@ -86,9 +86,9 @@ Today SimCraft runs as a single-user local desktop binary where `docs/ROADMAP.md
 ### Friction Points Found & UX To-Do
 
 #### 3D Viewport & Direct Manipulation
-- [ ] **Upgrade from CPU software rasterization (`0.6×` drag blur) to hardware 3D rendering**
-  - **Context:** `render::rasterize` (`src/render.rs`) draws flat-shaded quads on the CPU, drops to `0.6×` scale during drag/animation (`src/gui.rs:3887`), has no MSAA or perspective toggle, disables deformation whenever a section cut is active (`src/render.rs:258`), and lacks translucent body rendering.
-  - **Action:** Add smooth/perspective camera toggle, MSAA, hardware depth-peeling or translucent enclosures (so internal CFD/EM/PCB heat is visible without hiding walls), deformed section cuts, and an interactive **ViewCube** (corner click-to-orient) alongside the axis triad.
+- [x] **Upgrade from CPU software rasterization (`0.6×` drag blur) to hardware 3D rendering** *(P2.A2: `src/ui/gl_viewport.rs`, `src/render.rs`; still remaining in `P2.U`: interactive ViewCube alongside axis triad)*
+  - **Context:** `render::rasterize` (`src/render.rs`) drew flat-shaded quads on the CPU, dropped to `0.6×` scale during drag/animation, had no MSAA or perspective toggle, disabled deformation whenever a section cut was active, and lacked translucent body rendering.
+  - **Action (P2.A2 done):** Added `eframe::egui_glow` hardware 3D viewport (`QuadPicker` BVH, MSAA + 24-bit depth FBO), perspective camera toggle, translucent enclosure option, and deformed section cuts (`tests/viewport_p2_a2.rs`). Interactive **ViewCube** moves to `P2.U`.
 - [ ] **Render 3D load & boundary condition glyphs**
   - **Context:** Currently loads only tint whole faces (`render::load_color`, `src/render.rs:133-153, 216-225`). Users cannot visually verify force vector direction/sign, pressure direction, fluid inlet flow direction, or coil axis in 3D.
   - **Action:** Draw directional 3D arrows, constraint pins, flow streamlines/arrows, and heat/radiation glyphs on scoped faces/bodies.
@@ -111,9 +111,9 @@ Today SimCraft runs as a single-user local desktop binary where `docs/ROADMAP.md
   - **Action:** Group PCB components under their parent board node (collapsible), add Browser search/filter, and support multi-select for batch material assignment or deletion.
 
 #### Screen Ergonomics, Navigation & AI UX
-- [ ] **Replace overlapping floating `egui::Window` modals with dockable/bottom drawers**
-  - **Context:** `study_window`, `help_window` (`940×660`), `planner_window` (`620×640`), `pcb_window`, `chart_window`, `fatigue_window`, and `material_window` all float over the 3D viewport, crowding 13–14" laptop displays.
-  - **Action:** Make side panels collapsible and host charts, optimization tables, surrogate what-if sliders, and KiCad DC track tables in a resizable bottom drawer (with click-to-highlight in 3D, e.g., clicking a hot track or optimization row).
+- [x] **Replace overlapping floating `egui::Window` modals with dockable/bottom drawers** *(P2.A2: docked bottom **🗂 Workbench** drawer in `src/ui/charts.rs` hosting `Charts & Path`, `Studies`, `PCB DC`, `Planner`, and `Guide` with `↗ Pop out` / `⬇ Dock`; still remaining in `P2.U`: collapsible Browser/Properties side panels + click-to-highlight in 3D for hot tracks/optimization rows)*
+  - **Context:** `study_window`, `help_window`, `planner_window`, `pcb_window`, and `chart_window` previously floated over the 3D viewport on 13–14" laptop displays.
+  - **Action (P2.A2 done):** Moved those workflows into a resizable docked bottom Workbench drawer (`src/ui/charts.rs`), keeping `Material` and `Fatigue` dialogs focused and pop-out tabs optional.
 - [ ] **Improve laptop trackpad navigation & keyboard shortcuts**
   - **Context:** Viewport panning currently requires right-drag or middle-drag (`src/gui.rs:3856`), which is awkward on laptop trackpads without a middle button.
   - **Action:** Support `Space+drag` / `Shift+middle` / two-finger trackpad pan, pinch-to-zoom (`zoom_delta()`), keyboard shortcuts (`F` fit, `1–6` standard views, `Del` delete selected, `Esc` close active form/clear selection), a right-click viewport context menu, and a unit-system preference (`mm/N/MPa`, `m/N/Pa`, `in/lbf/psi`).
@@ -148,16 +148,16 @@ Compiling the current `eframe`/`egui` + CPU software renderer (`render.rs`) + `w
 If SimCraft remains a **dedicated native laptop/desktop application**, the current pure-Rust single-binary architecture (`rayon` + native RAM + hybrid iGPU/dGPU power management + `Core::call` + MCP) is a **strong foundation** — *provided* you address these four native bottlenecks:
 
 #### Checklist for Native Laptop Architecture
-- [ ] **Upgrade 1 — Hardware iGPU 3D Viewport (`src/gui.rs`, `src/render.rs`)**
-  - Replace the CPU-rasterized RGBA upload in `viewport()` with an `egui::PaintCallback` (`glow` or `wgpu` on the integrated GPU, preserving `prefer_integrated_gpu()` battery savings).
-  - Move deformation animation (`Scale * anim * disp`) into vertex shaders instead of rebuilding `Scene` allocations on CPU every frame (`src/gui.rs:3890-3899`).
-  - Retain `render::render_png` strictly for headless MCP `render_image` and `report.rs` HTML exports.
+- [x] **Upgrade 1 — Hardware iGPU 3D Viewport (`src/ui/gl_viewport.rs`, `src/ui/viewport.rs`, `src/render.rs`)**
+  - Replaced CPU-rasterized RGBA drag upload in `viewport()` with `eframe::egui_glow` `PaintCallback` (`GlViewport`, preserving `prefer_integrated_gpu()` battery savings) + `QuadPicker` BVH face picking.
+  - Moved deformation animation (`u_deform_k * a_disp`) into the vertex shader instead of rebuilding `Scene` on CPU every frame; added MSAA, perspective toggle, translucent enclosures, and deformed section cuts.
+  - Retained `render::render_png` for headless MCP `render_image` and `report.rs` HTML exports (and `render::rasterize` as automatic fallback).
 - [x] **Upgrade 2 — Non-Blocking Meshing & File Import (`src/gui.rs`, `src/session.rs`, `src/geometry.rs`)**
   - Move `s.ensure_mesh()` out of `viewport()` (`src/gui.rs:3796`) and `net_pads()` out of `open_pcb_dc()` (`src/gui.rs:2325`) onto background worker threads with progress + cancel support.
   - Add an STL triangle BVH in `geometry.rs` so boundary fitting and `x_crossings` don't stall on large CAD meshes.
 - [x] **Upgrade 3 — Cross-Platform Laptop GPU Adapter Selection (`src/gpu.rs`, `src/fdtd.rs`)**
   - Split `gpu::pick_adapter(require_f64: bool)`: use `wgpu::Backends::PRIMARY` (Vulkan + Metal + DX12) without `SHADER_F64` for `f32` `fdtd.rs`, unlocking Apple Silicon and Windows/integrated laptop GPUs; keep `SHADER_F64` strictly for double-precision `gpu.rs` PCG (or add a mixed-precision fallback).
-- [ ] **Upgrade 4 — Core & UI Maintainability Refactors (`src/gui.rs`, `src/session.rs`)**
-  - [ ] **Modularize `gui.rs`:** Split the 4,421-line file into `ui/{header,ribbon,browser,properties,viewport,charts,dialogs}.rs` and adopt `egui_dock` + `egui_plot` (or evaluate **Tauri + Web UI + Rust Core** if you eventually want commercial-grade multi-monitor docking, native trackpad/accessibility, *and* a shared codebase for a future web app).
+- [x] **Upgrade 4 — Core & UI Maintainability Refactors (`src/ui/`, `src/session.rs`)**
+  - [x] **Modularize `gui.rs`:** Split the monolith into `src/ui/{mod,header,ribbon,browser,properties,viewport,gl_viewport,charts,dialogs,theme}.rs` (with `src/gui.rs` facade) and replaced overlapping popups with a docked/pop-out bottom Workbench drawer (`Charts & Path`, `Studies`, `PCB DC`, `Planner`, `Guide`).
   - [x] **Remove double JSON serialization for undo (`src/session.rs:517-523`):** Track dirty mutations or command deltas instead of serializing the entire `Model` twice on every tool call (important before `P2.3` STEP B-reps land).
   - [x] **Replace panic-unwinding cancellation (`src/session.rs:1761-1765`):** Migrate `check_cancel()` from `std::panic::resume_unwind(Box::new(Cancelled))` to cooperative `&AtomicBool` checks returning `Result` so parallel `rayon` loops (`P2.5` octree, `P2.8` transient CFD) and GPU poll loops can cancel cleanly without unwinding hazards.
