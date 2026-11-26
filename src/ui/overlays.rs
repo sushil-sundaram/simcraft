@@ -71,13 +71,11 @@ fn patch_anchors(mesh: &Mesh, names: &[String], hidden_bodies: &HashSet<String>)
 }
 
 fn body_center_and_radius(model: &Model, mesh: &Mesh, body_name: Option<&str>) -> (V3, f64) {
-    if let Some(bn) = body_name {
-        if let Some(b) = model.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(bn)) {
-            if let Some((lo, hi)) = shape_bbox(&b.shape) {
+    if let Some(bn) = body_name
+        && let Some(b) = model.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(bn))
+            && let Some((lo, hi)) = shape_bbox(&b.shape) {
                 return (scale(add(lo, hi), 0.5), norm(sub(hi, lo)) * 0.5);
             }
-        }
-    }
     (scale(add(mesh.bbox.0, mesh.bbox.1), 0.5), norm(sub(mesh.bbox.1, mesh.bbox.0)) * 0.4)
 }
 
@@ -98,11 +96,10 @@ pub(super) fn draw_load_glyphs(
             col = Color32::from_rgb(255, 220, 40);
         }
         let tag = is_sel.then(|| format!("#{}", item.id));
-        if let Some(b) = item.load.body() {
-            if hidden_bodies.contains(b) {
+        if let Some(b) = item.load.body()
+            && hidden_bodies.contains(b) {
                 continue;
             }
-        }
         let anchors = patch_anchors(mesh, item.load.faces(), hidden_bodies);
         let visible_anchor = |pt: V3| -> bool {
             let sp = world_to_screen(cam, rect, pt);
@@ -138,13 +135,12 @@ pub(super) fn draw_load_glyphs(
             }
             Load::Symmetry { .. } => {
                 for (c, n) in anchors {
-                    if let Some((p0, sd)) = world_dir_screen(cam, rect, c, n) {
-                        if rect.contains(p0) {
+                    if let Some((p0, sd)) = world_dir_screen(cam, rect, c, n)
+                        && rect.contains(p0) {
                             let perp = vec2(-sd.y, sd.x);
                             painter.line_segment([p0 - perp * 10.0, p0 + perp * 10.0], Stroke::new(2.2, col));
                             painter.line_segment([p0, p0 + sd * 10.0], Stroke::new(1.5, col));
                         }
-                    }
                 }
             }
             Load::Force { vector, .. } => {
@@ -266,12 +262,11 @@ pub(super) fn draw_load_glyphs(
                 if let Some(a) = axis {
                     ax = [0.0; 3];
                     ax[a.idx()] = 1.0;
-                } else if let Some(b) = model.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(body)) {
-                    if let crate::geometry::Shape::Cylinder { axis: ca, .. } = b.shape {
+                } else if let Some(b) = model.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(body))
+                    && let crate::geometry::Shape::Cylinder { axis: ca, .. } = b.shape {
                         ax = [0.0; 3];
                         ax[ca.idx()] = 1.0;
                     }
-                }
                 if let Some(cm) = cut_mm {
                     let ai = ax.iter().position(|v| *v > 0.5).unwrap_or(2);
                     c[ai] = *cm;
@@ -527,14 +522,13 @@ pub(super) fn draw_ghost_and_gizmo(
                 }
                 if app.xform.0 == "move" || app.xform.0 == "copy" {
                     let s = app.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some(orig_b) = s.model.bodies.iter().find(|b| b.name == bd.orig_name) {
-                        if let Some((lo, hi)) = shape_bbox(&orig_b.shape) {
+                    if let Some(orig_b) = s.model.bodies.iter().find(|b| b.name == bd.orig_name)
+                        && let Some((lo, hi)) = shape_bbox(&orig_b.shape) {
                             let d = app.xform.1;
                             if norm(d) > 1e-6 {
                                 draw_wire_box(cam, rect, painter, add(lo, d), add(hi, d), Stroke::new(1.5, Color32::from_rgb(245, 190, 60)), None);
                             }
                         }
-                    }
                 }
             }
         }
@@ -664,8 +658,17 @@ pub(super) fn draw_view_cube(app: &mut SimApp, ui: &egui::Ui, rect: Rect, painte
         } else {
             Color32::from_rgb(230, 234, 240)
         };
+        // label shrunk to fit the face as projected (adjacent faces' labels used to overlap in
+        // the isometric view); faces seen too edge-on get none
+        let (x0, x1) = pts.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), q| (a.min(q.x), b.max(q.x)));
         painter.add(egui::Shape::convex_polygon(pts, shade, Stroke::new(1.0, p.border)));
-        painter.text(fc, Align2::CENTER_CENTER, cf.label, FontId::proportional(8.0), if hit.hovered() { p.accent } else { text_col });
+        let col = if hit.hovered() { p.accent } else { text_col };
+        let w = painter.layout_no_wrap(cf.label.to_string(), FontId::proportional(8.0), col).size().x;
+        let avail = 0.8 * (x1 - x0);
+        let size = if w > avail { 8.0 * avail / w } else { 8.0 };
+        if size >= 5.0 {
+            painter.text(fc, Align2::CENTER_CENTER, cf.label, FontId::proportional(size), col);
+        }
         if hit.clicked() {
             app.cam.set_view(cf.view);
             app.need_fit = true;
@@ -703,8 +706,8 @@ pub(super) fn draw_context_menu(app: &mut SimApp, ui: &egui::Ui, mesh: &Mesh, mo
                 let mut seen_patches = HashSet::new();
                 let mut unique_faces = Vec::new();
                 for &(fid, t, _) in &hits {
-                    if let Some(f) = mesh.faces.get(fid as usize) {
-                        if seen_patches.insert(f.patch) {
+                    if let Some(f) = mesh.faces.get(fid as usize)
+                        && seen_patches.insert(f.patch) {
                             let body_idx = mesh.elem_body.get(f.elem as usize).copied().unwrap_or(0) as usize;
                             let bname = mesh.body_names.get(body_idx).cloned().unwrap_or_default();
                             let pname = mesh.patches.get(f.patch as usize).map(|x| x.name.clone()).unwrap_or_default();
@@ -713,7 +716,6 @@ pub(super) fn draw_context_menu(app: &mut SimApp, ui: &egui::Ui, mesh: &Mesh, mo
                                 break;
                             }
                         }
-                    }
                 }
                 if !unique_faces.is_empty() {
                     ui.label(egui::RichText::new("Select Behind (Depth Peel)").small().strong().color(p.weak));

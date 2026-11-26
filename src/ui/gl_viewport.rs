@@ -459,11 +459,10 @@ impl Inner {
     }
 
     unsafe fn ensure_targets(&mut self, w: i32, h: i32) -> bool {
-        if let Some(t) = &self.targets {
-            if t.w == w && t.h == h {
+        if let Some(t) = &self.targets
+            && t.w == w && t.h == h {
                 return true;
             }
-        }
         unsafe { self.drop_targets(); }
         let gl = &self.gl;
         unsafe {
@@ -483,8 +482,8 @@ impl Inner {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_resolve));
             gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex_resolve), 0);
 
-            if self.max_samples >= 2 {
-                if let (Ok(fbo_msaa), Ok(rbo_c), Ok(rbo_d)) = (gl.create_framebuffer(), gl.create_renderbuffer(), gl.create_renderbuffer()) {
+            if self.max_samples >= 2
+                && let (Ok(fbo_msaa), Ok(rbo_c), Ok(rbo_d)) = (gl.create_framebuffer(), gl.create_renderbuffer(), gl.create_renderbuffer()) {
                     gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rbo_c));
                     gl.renderbuffer_storage_multisample(glow::RENDERBUFFER, self.max_samples, glow::RGBA8, w, h);
                     gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rbo_d));
@@ -514,7 +513,6 @@ impl Inner {
                     gl.delete_renderbuffer(rbo_c);
                     gl.delete_renderbuffer(rbo_d);
                 }
-            }
 
             let Ok(rbo_d) = gl.create_renderbuffer() else {
                 gl.delete_framebuffer(fbo_resolve);

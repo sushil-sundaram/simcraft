@@ -17,7 +17,7 @@ use crate::results::*;
 use crate::sparse::*;
 use anyhow::{Result, bail};
 
-pub const EPS0: f64 = 8.854_187_8128e-12;
+pub const EPS0: f64 = 8.854_187_812_8e-12;
 pub const MU0: f64 = 1.256_637_062_12e-6;
 
 /// Average element values onto nodes.

@@ -30,6 +30,10 @@ impl SimApp {
             let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (s.model.analysis.kind, s.model.has_enclosure(), s.display.show_mesh, s.display.perspective, s.display.translucent_enclosure)
         };
+        // Never wrap ribbon text: when the window is too narrow the tool row scrolls sideways
+        // instead (wrapped labels used to grow the ribbon to most of the window height).
+        egui::ScrollArea::horizontal().id_salt("ribbon-tools").auto_shrink([false, true]).show(ui, |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         ui.horizontal(|ui| match self.tab {
             Tab::Geometry => {
                 group(ui, &p, "CREATE", |ui| {
@@ -84,8 +88,8 @@ impl SimApp {
                         if ui.add(primary(&p, "Assign to all bodies")).clicked() {
                             self.run("set_material", json!({"material": self.f.material}));
                         }
-                        if ui.button("✏ New / edit material…").on_hover_text("Create a custom material from the selected one, or change a custom material").clicked() {
-                            if let Some(m) = lib.iter().find(|m| m.name == self.f.material) {
+                        if ui.button("✏ New / edit material…").on_hover_text("Create a custom material from the selected one, or change a custom material").clicked()
+                            && let Some(m) = lib.iter().find(|m| m.name == self.f.material) {
                                 let full = serde_json::to_value(m).unwrap_or(json!({}));
                                 let mut v = json!({"name": if crate::material::library().iter().any(|x| x.name == m.name) { format!("{} (custom)", m.name) } else { m.name.clone() }});
                                 for k in MAT_KEYS {
@@ -97,7 +101,6 @@ impl SimApp {
                                 }
                                 self.mat_edit = Some((m.name.clone(), v));
                             }
-                        }
                     });
                 });
                 if let Some(m) = lib.iter().find(|m| m.name == self.f.material) {
@@ -152,11 +155,10 @@ impl SimApp {
                                 self.form = Form::Load(lk);
                             }
                         }
-                        if name == "STRUCTURAL" && matches!(kind, AnalysisType::StaticStructural | AnalysisType::ThermalStress | AnalysisType::Modal | AnalysisType::TransientStructural | AnalysisType::LinearBuckling | AnalysisType::NonlinearStructural) {
-                            if tool(ui, &p, "🤝", "Contact Pair", Some(Color32::from_rgb(55, 175, 225)), true) {
+                        if name == "STRUCTURAL" && matches!(kind, AnalysisType::StaticStructural | AnalysisType::ThermalStress | AnalysisType::Modal | AnalysisType::TransientStructural | AnalysisType::LinearBuckling | AnalysisType::NonlinearStructural)
+                            && tool(ui, &p, "🤝", "Contact Pair", Some(Color32::from_rgb(55, 175, 225)), true) {
                                 self.form = Form::Contact;
                             }
-                        }
                     });
                 }
                 if kind.requires_enclosure() && !has_enc {
@@ -492,6 +494,7 @@ impl SimApp {
                 });
             }
         });
+        });
     }
 
     fn preflight_group(&mut self, ui: &mut egui::Ui) {
@@ -639,11 +642,10 @@ impl SimApp {
             }
         });
         group(ui, &p, "EXPORT", |ui| {
-            if tool(ui, &p, "📄", "Report", None, true) {
-                if let Some(path) = rfd::FileDialog::new().add_filter("HTML report", &["html"]).set_file_name("simcraft-report.html").save_file() {
+            if tool(ui, &p, "📄", "Report", None, true)
+                && let Some(path) = rfd::FileDialog::new().add_filter("HTML report", &["html"]).set_file_name("simcraft-report.html").save_file() {
                     self.run("make_report", json!({"path": path.to_string_lossy()}));
                 }
-            }
         });
         group(ui, &p, "VIEW", |ui| {
             ui.vertical(|ui| {
@@ -687,8 +689,8 @@ impl SimApp {
                 if r.deformation(disp.mode).is_some() {
                     let cur = match disp.deformation_scale {
                         None => "Auto scale".to_string(),
-                        Some(x) if x == 0.0 => "Undeformed".into(),
-                        Some(x) if x == 1.0 => "True scale".into(),
+                        Some(0.0) => "Undeformed".into(),
+                        Some(1.0) => "True scale".into(),
                         Some(x) => format!("{}×", render::fmt_val(x)),
                     };
                     egui::ComboBox::from_id_salt("dscale").width(160.0).selected_text(cur).show_ui(ui, |ui| {
@@ -765,12 +767,11 @@ impl SimApp {
                 if let Some(i) = remove {
                     self.opt.params.remove(i);
                 }
-                if ui.button("＋ Add parameter").clicked() {
-                    if let Some((t, cur)) = targets.iter().find(|(t, _)| !self.opt.params.iter().any(|q| &q.0 == t)) {
+                if ui.button("＋ Add parameter").clicked()
+                    && let Some((t, cur)) = targets.iter().find(|(t, _)| !self.opt.params.iter().any(|q| &q.0 == t)) {
                         let (lo, hi) = if *cur > 0.0 { (cur * 0.5, cur * 1.5) } else if *cur < 0.0 { (cur * 1.5, cur * 0.5) } else { (-1.0, 1.0) };
                         self.opt.params.push((t.clone(), lo, hi, 4));
                     }
-                }
             });
             ui.add_space(6.0);
         }

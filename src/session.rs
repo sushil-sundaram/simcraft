@@ -252,11 +252,10 @@ impl Session {
             let m = self.ensure_mesh()?;
             m.resolve_faces(load.faces())?;
         }
-        if let Some(b) = load.body() {
-            if !self.model.bodies.iter().any(|x| x.name.eq_ignore_ascii_case(b) && x.role == Role::Solid) {
+        if let Some(b) = load.body()
+            && !self.model.bodies.iter().any(|x| x.name.eq_ignore_ascii_case(b) && x.role == Role::Solid) {
                 bail!("no solid body named '{b}' (bodies: {:?})", self.model.bodies.iter().map(|x| x.name.clone()).collect::<Vec<_>>());
             }
-        }
         let id = self.model.next_id.max(1);
         self.model.next_id = id + 1;
         let label = load.label();
@@ -366,13 +365,12 @@ impl Session {
             }
         }
         self.model = model;
-        if let Some(d) = v.get("display") {
-            if let Ok(d) = serde_json::from_value::<Display>(d.clone()) {
+        if let Some(d) = v.get("display")
+            && let Ok(d) = serde_json::from_value::<Display>(d.clone()) {
                 let dark = self.display.dark;
                 self.display = d;
                 self.display.dark = dark; // keep the user's theme, not the one saved with the file
             }
-        }
         self.plan = v.get("plan").and_then(|p| serde_json::from_value(p.clone()).ok());
         self.mesh = None;
         self.touch_geometry();
@@ -431,14 +429,13 @@ pub fn resolve_io_path(raw: &str, workspace: Option<&std::path::Path>, write: bo
         }
         return Ok(canon);
     }
-    if let Ok(meta) = std::fs::symlink_metadata(&joined) {
-        if meta.file_type().is_symlink() {
+    if let Ok(meta) = std::fs::symlink_metadata(&joined)
+        && meta.file_type().is_symlink() {
             let target = std::fs::canonicalize(&joined).with_context(|| format!("resolving {raw}"))?;
             if !target.starts_with(&canon_root) {
                 bail!("path '{raw}' points outside workspace {}", canon_root.display());
             }
         }
-    }
     // Walk up to the deepest existing ancestor so we can canonicalize it and validate relative tail.
     let mut existing = joined.as_path();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
@@ -718,8 +715,8 @@ impl Core {
         let r = self.call_inner(tool, args);
         {
             let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let (Ok(_), Some((rev_before, model_before))) = (&r, before) {
-                if s.model_rev != rev_before {
+            if let (Ok(_), Some((rev_before, model_before))) = (&r, before)
+                && s.model_rev != rev_before {
                     if tool == "open_project" {
                         s.undo.clear();
                         s.undo_revs.clear();
@@ -734,7 +731,6 @@ impl Core {
                     s.redo.clear();
                     s.redo_revs.clear();
                 }
-            }
             match &r {
                 Ok(_) => s.last_error = None,
                 Err(e) => {
@@ -991,11 +987,10 @@ impl Core {
                     Ok(Some(rows))
                 };
                 if let Some(t) = table("conductivity_table")? {
-                    if let Some(first) = t.first() {
-                        if !t.iter().any(|r| r[1] == m.thermal_conductivity) {
+                    if let Some(first) = t.first()
+                        && !t.iter().any(|r| r[1] == m.thermal_conductivity) {
                             m.thermal_conductivity = first[1];
                         }
-                    }
                     m.conductivity_table = t;
                 }
                 if let Some(t) = table("specific_heat_table")? {
@@ -1584,11 +1579,10 @@ impl Core {
                     let m = s.ensure_mesh()?;
                     m.resolve_faces(load.faces())?;
                 }
-                if let Some(b) = load.body() {
-                    if !s.model.bodies.iter().any(|x| x.name.eq_ignore_ascii_case(b)) {
+                if let Some(b) = load.body()
+                    && !s.model.bodies.iter().any(|x| x.name.eq_ignore_ascii_case(b)) {
                         bail!("no body named '{b}'");
                     }
-                }
                 let was_bolt = matches!(s.model.loads[li].load, Load::BoltPretension { .. });
                 let is_bolt = matches!(load, Load::BoltPretension { .. });
                 s.model.loads[li].load = load.clone();
@@ -1680,11 +1674,10 @@ impl Core {
             }
             "set_mesh" => {
                 let es = opt_num(a, "element_size_mm");
-                if let Some(e) = es {
-                    if e <= 0.0 {
+                if let Some(e) = es
+                    && e <= 0.0 {
                         bail!("element_size_mm must be positive");
                     }
-                }
                 if s.model.element_size != es {
                     s.model.element_size = es;
                     s.touch_geometry();
@@ -1829,8 +1822,7 @@ impl Core {
                 let res = s.results.clone();
                 let hl: HashSet<u32> = HashSet::new();
                 let scene = render::build_scene(&mesh, &s.model, res.as_deref(), &d, &hl, 1.0);
-                let mut cam = Camera::default();
-                cam.perspective = d.perspective;
+                let mut cam = Camera { perspective: d.perspective, ..Camera::default() };
                 if !cam.set_view(view) {
                     bail!("unknown view '{view}', use {:?}", render::VIEWS);
                 }

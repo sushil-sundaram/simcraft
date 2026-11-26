@@ -378,11 +378,10 @@ impl Results {
         if !self.modes.is_empty() {
             return self.modes.get(step.min(self.modes.len() - 1)).map(|m| m.shape.as_slice());
         }
-        if !self.frames.is_empty() {
-            if let Some(d) = &self.frames[step.min(self.frames.len() - 1)].disp {
+        if !self.frames.is_empty()
+            && let Some(d) = &self.frames[step.min(self.frames.len() - 1)].disp {
                 return Some(d.as_slice());
             }
-        }
         self.disp.as_deref()
     }
     pub fn scalar(&self, f: Field, step: usize) -> Option<Vec<f64>> {
@@ -400,11 +399,10 @@ impl Results {
             MinPrincipal => self.s3.clone(),
             SafetyFactor => self.safety.clone(),
             Temperature => {
-                if !self.frames.is_empty() {
-                    if let Some(t) = &self.frames[step.min(self.frames.len() - 1)].temp {
+                if !self.frames.is_empty()
+                    && let Some(t) = &self.frames[step.min(self.frames.len() - 1)].temp {
                         return Some(t.clone());
                     }
-                }
                 self.temp.clone()
             }
             HeatFlux => self.flux.as_ref().map(|d| d.iter().map(mag).collect()),
@@ -529,14 +527,13 @@ impl Results {
         let (mut mn, mut mx, mut sum, mut cnt) = (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0usize);
         for (i, (&pt, val)) in pts.iter().zip(sampled).enumerate() {
             let s = len * i as f64 / (n - 1) as f64;
-            if let Some(v) = val {
-                if v.is_finite() {
+            if let Some(v) = val
+                && v.is_finite() {
                     mn = mn.min(v);
                     mx = mx.max(v);
                     sum += v;
                     cnt += 1;
                 }
-            }
             points.push(PathPoint {
                 distance_mm: float(s),
                 point_mm: pt.map(float),

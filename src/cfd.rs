@@ -794,11 +794,10 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
                             let c = nu_wall[i] * af / (h / 2.0);
                             for comp in 0..3 {
                                 extra[i][comp] += c;
-                                if let Bc::Moving(v) = nb[i][d] {
-                                    if comp != ax {
+                                if let Bc::Moving(v) = nb[i][d]
+                                    && comp != ax {
                                         src[i][comp] += c * v[comp];
                                     }
-                                }
                             }
                         }
                         Bc::Slip => extra[i][ax] += nu_eff[i] * af / (h / 2.0),
@@ -1084,7 +1083,7 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
             _ => unreachable!(),
         };
         t_pressure += tp.elapsed().as_secs_f64();
-        let snapshot = if profile && iters % 200 == 0 { Some(uc.clone()) } else { None };
+        let snapshot = if profile && iters.is_multiple_of(200) { Some(uc.clone()) } else { None };
         // 4. correct faces, recompute cell velocities
         let k = dt / rho;
         let pr = &p;
@@ -1131,10 +1130,10 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
             let c = mesh.elem_cell[fluid_elems[bi]];
             eprintln!("[cfd]   max change {bv:.3e} m/s at cell {:?} of {:?}, u = {:?}, ν_eff/ν = {:.1}, bc {:?}", c, mesh.dims, uc[bi], nu_eff[bi] / nu, nb[bi]);
         }
-        if profile && iters % 200 == 0 {
+        if profile && iters.is_multiple_of(200) {
             eprintln!("[cfd] it {iters}: {:.1} ms/it ({:.1} ms pressure), dt {dt:.2e}, change {change:.2e}, cg {cg_total}", 1e3 * t_loop.elapsed().as_secs_f64() / iters as f64, 1e3 * t_pressure / iters as f64);
         }
-        if iters % 20 == 0 {
+        if iters.is_multiple_of(20) {
             let conv = (1.0f64.ln() - change.max(1e-12).ln()).max(0.0) / (1.0f64.ln() - TOL.ln()) * 10.0;
             let frac = (iters as f64 / max_it as f64).max(1.0 - conv / 10.0).min(0.97);
             let tmsg = if buoyant { format!(", ΔT {:.1e}", t_change) } else { String::new() };

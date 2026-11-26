@@ -216,3 +216,6 @@ src/mcp.rs       MCP stdio server
 
 ## License
 MIT — see [LICENSE](LICENSE).
+
+The app bundles the **Adwaita Sans** (GNOME's build of Inter) and **Adwaita Mono** typefaces from
+`assets/fonts`, used under the SIL Open Font License 1.1 (`assets/fonts/OFL-*.txt`).

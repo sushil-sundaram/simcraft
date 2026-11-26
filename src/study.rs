@@ -523,11 +523,10 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
         prog.report(i as f64 / budget as f64, &format!("design {}/{budget}", i + 1))?;
         let mut run = eval_run(model, &params, denorm(&params, &u), &responses, phase, prog.cancel)?;
         run.feasible = run.error.is_none() && run.responses[0].is_some_and(|v| v.is_finite()) && violation(&constraints, &run.responses, 1).is_some_and(|v| v <= 1e-9);
-        if scale.is_none() {
-            if let Some(o) = run.responses[0] {
+        if scale.is_none()
+            && let Some(o) = run.responses[0] {
                 *scale = Some(o.abs().max(1e-12));
             }
-        }
         let f = merit(&run, scale.unwrap_or(1.0));
         runs.push(run);
         cache.push((u, f));
@@ -899,11 +898,10 @@ pub fn richardson_extrapolate(hs: [f64; 3], fs: [f64; 3], target_err_pct: f64, r
 
 /// Solve at `h`, `h / 1.4` and `h / 2.0`, Richardson-extrapolate responses and estimate accuracy.
 pub fn mesh_convergence(model: &Model, responses: Vec<String>, base_h: Option<f64>, target_error_pct: f64, prog: StudyProg) -> Result<Study> {
-    if let Some(h) = base_h {
-        if !h.is_finite() || h <= 0.0 {
+    if let Some(h) = base_h
+        && (!h.is_finite() || h <= 0.0) {
             bail!("base_element_size_mm must be finite and positive");
         }
-    }
     if !target_error_pct.is_finite() || target_error_pct <= 0.0 || target_error_pct > 50.0 {
         bail!("target_error_pct must be between 0 and 50");
     }

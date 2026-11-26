@@ -42,12 +42,8 @@ impl SimApp {
 
         let (mesh, model, results, display, rev, view_req, stale) = {
             let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if s.model.bodies.is_empty() {
-                if let Some(old) = self.mesh_job.take() {
-                    old.cancel.store(true, Ordering::Relaxed);
-                }
-                self.mesh_err = None;
-            } else if s.mesh_valid() {
+            // nothing to mesh, or the mesh is current: no background job needed
+            if s.model.bodies.is_empty() || s.mesh_valid() {
                 if let Some(old) = self.mesh_job.take() {
                     old.cancel.store(true, Ordering::Relaxed);
                 }
@@ -92,12 +88,11 @@ impl SimApp {
                 painter.text(rect.center() - vec2(0.0, 22.0), Align2::CENTER_CENTER, "⚙  Meshing geometry…", FontId::proportional(20.0), p.text);
                 painter.text(rect.center() + vec2(0.0, 4.0), Align2::CENTER_CENTER, "Window stays responsive while building the mesh", FontId::proportional(13.0), p.weak);
                 let btn = Rect::from_center_size(rect.center() + vec2(0.0, 34.0), vec2(110.0, 26.0));
-                if ui.put(btn, egui::Button::new("Cancel meshing")).clicked() {
-                    if let Some(j) = self.mesh_job.take() {
+                if ui.put(btn, egui::Button::new("Cancel meshing")).clicked()
+                    && let Some(j) = self.mesh_job.take() {
                         j.cancel.store(true, Ordering::Relaxed);
                         self.mesh_err = Some((j.key, "Meshing cancelled.".into()));
                     }
-                }
             } else if ghost_form {
                 if resp.dragged_by(egui::PointerButton::Primary) && !ui.input(|i| i.key_down(egui::Key::Space)) {
                     let d = resp.drag_delta();
@@ -185,9 +180,10 @@ impl SimApp {
                 zoom_around(&mut self.cam, zoom_pinch as f64);
             }
             if scroll.x != 0.0 || scroll.y != 0.0 {
-                if self.trackpad_pan && !(mods.ctrl || mods.command) {
-                    self.cam.pan(scroll.x as f64, scroll.y as f64);
-                } else if !self.trackpad_pan && mods.shift {
+                // trackpad mode: two-finger scroll pans (Ctrl / Cmd + scroll zooms);
+                // mouse mode: Shift + scroll pans, plain scroll zooms
+                let pan = if self.trackpad_pan { !(mods.ctrl || mods.command) } else { mods.shift };
+                if pan {
                     self.cam.pan(scroll.x as f64, scroll.y as f64);
                 } else if scroll.y != 0.0 {
                     zoom_around(&mut self.cam, (scroll.y as f64 * 0.003).exp());
@@ -299,13 +295,11 @@ impl SimApp {
         let legend = self.legend;
         let node_screen = |n: usize| -> Pos2 {
             let mut q = mesh.nodes[n];
-            if let (Some(r), Some((_, sc))) = (&results, legend) {
-                if let Some(d) = r.deformation(display.mode) {
-                    if d.len() == mesh.nodes.len() && sc > 0.0 {
+            if let (Some(r), Some((_, sc))) = (&results, legend)
+                && let Some(d) = r.deformation(display.mode)
+                    && d.len() == mesh.nodes.len() && sc > 0.0 {
                         q = add(q, scale(d[n], sc * anim));
                     }
-                }
-            }
             let (x, y, _) = cam.project(q, rect.width() as f64, rect.height() as f64);
             rect.min + vec2(x as f32, y as f32)
         };
@@ -397,8 +391,8 @@ impl SimApp {
         draw_ghost_and_gizmo(self, ui, &cam_copy, rect, &painter, Some(&mesh));
         let text_col = if self.dark { Color32::from_gray(235) } else { Color32::from_gray(25) };
         let card_fill = p.card.gamma_multiply(0.92);
-        if let (Some(hp), Some(fid)) = (hover_pos, hover_fid) {
-            if let Some(pi) = mesh.patches.get(mesh.faces[fid as usize].patch as usize) {
+        if let (Some(hp), Some(fid)) = (hover_pos, hover_fid)
+            && let Some(pi) = mesh.patches.get(mesh.faces[fid as usize].patch as usize) {
                 let bi = mesh.elem_body.get(mesh.faces[fid as usize].elem as usize).copied().unwrap_or(0) as usize;
                 let tip = if self.select_mode == SelectMode::Body {
                     format!("Body: {}  ({})", mesh.body_names.get(bi).map(String::as_str).unwrap_or(""), pi.name)
@@ -410,11 +404,10 @@ impl SimApp {
                 painter.rect(r, 5.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
                 painter.galley(r.min + vec2(6.0, 3.0), galley, text_col);
             }
-        }
 
         // ---- probe markers & path line
-        if display.show_results {
-            if let Some(r) = &results {
+        if display.show_results
+            && let Some(r) = &results {
                 let f = if r.has(display.field) { display.field } else { r.available_fields()[0] };
                 if let Some(vals) = r.scalar_at(&mesh, f, display.mode, display.cylindrical) {
                     for (n, rid) in &self.probes {
@@ -443,7 +436,6 @@ impl SimApp {
                     }
                 }
             }
-        }
 
         // ---- title + legend card
         let o = rect.left_top() + vec2(14.0, 14.0);
@@ -519,10 +511,27 @@ impl SimApp {
         let has_enc = mesh.with_enclosure;
         let views = [("⛶", "fit", "Fit all (F)"), ("◩", "iso", "Isometric (1)"), ("▣", "front", "Front (2)"), ("⬒", "top", "Top (4)"), ("◨", "right", "Right (5)"), ("◧", "left", "Left (6)")];
         let extra_pills = 2 + if has_enc { 1 } else { 0 } + 1; // Face/Body, Persp, Glyphs, (Glass)
-        let tbw = views.len() as f32 * 30.0 + extra_pills as f32 * 52.0 + 12.0;
-        let tby = if rect.width() < 760.0 { rect.bottom() - 48.0 } else { rect.top() + 14.0 };
-        let tb = Rect::from_min_size(pos2(rect.right() - 14.0 - tbw, tby), vec2(tbw, 34.0));
-        painter.rect(tb, 10.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+        // Layout by available width: one row top-right (wide), one row bottom-right beside the
+        // triad and ViewCube (medium), or two stacked rows above them (narrow) — never over them.
+        let views_w = views.len() as f32 * 30.0 + 8.0;
+        let pills_w = extra_pills as f32 * 50.0 + 8.0;
+        let corner = 200.0; // triad + ViewCube band at the bottom left
+        let (tb, pb) = if rect.width() >= 760.0 || rect.width() >= views_w + pills_w + corner + 28.0 {
+            let y = if rect.width() >= 760.0 { rect.top() + 14.0 } else { rect.bottom() - 48.0 };
+            let tb = Rect::from_min_size(pos2(rect.right() - 14.0 - views_w - pills_w, y), vec2(views_w, 34.0));
+            (tb, Rect::from_min_size(pos2(tb.right(), y), vec2(pills_w, 34.0)))
+        } else {
+            let x = |w: f32| (rect.right() - 14.0 - w).max(rect.left() + 8.0);
+            let y0 = rect.bottom() - 104.0 - 2.0 * 40.0;
+            (Rect::from_min_size(pos2(x(views_w), y0), vec2(views_w, 34.0)), Rect::from_min_size(pos2(x(pills_w), y0 + 40.0), vec2(pills_w, 34.0)))
+        };
+        if (tb.right() - pb.left()).abs() < 0.5 && (tb.top() - pb.top()).abs() < 0.5 {
+            painter.rect(tb.union(pb), 10.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+        } else {
+            for r in [tb, pb] {
+                painter.rect(r, 10.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            }
+        }
         for (i, (icon, view, tip)) in views.iter().enumerate() {
             let br = Rect::from_min_size(tb.min + vec2(4.0 + i as f32 * 30.0, 4.0), vec2(28.0, 26.0));
             let r = ui.interact(br, ui.scope_id().with(("view", i)), Sense::click()).on_hover_text(*tip);
@@ -538,9 +547,9 @@ impl SimApp {
                 ui.ctx().request_repaint();
             }
         }
-        let mut ex = tb.min.x + 6.0 + views.len() as f32 * 30.0;
+        let mut ex = pb.min.x + 4.0;
         let pill = |ex: &mut f32, id: &str, lbl: &str, active: bool, tip: &str| -> bool {
-            let pr = Rect::from_min_size(pos2(*ex, tb.min.y + 4.0), vec2(48.0, 26.0));
+            let pr = Rect::from_min_size(pos2(*ex, pb.min.y + 4.0), vec2(48.0, 26.0));
             let r = ui.interact(pr, ui.scope_id().with(id), Sense::click()).on_hover_text(tip);
             if active {
                 painter.rect_filled(pr, 6.0, p.accent.gamma_multiply(0.22));
@@ -573,12 +582,11 @@ impl SimApp {
             painter.rect(pill, 8.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
             painter.text(pill.left_center() + vec2(12.0, 0.0), Align2::LEFT_CENTER, "⚙  Updating mesh…", FontId::proportional(12.5), text_col);
             let cbtn = Rect::from_min_size(pos2(pill.right() - 62.0, pill.top() + 4.0), vec2(54.0, 20.0));
-            if ui.put(cbtn, egui::Button::new(RichText::new("Cancel").small())).clicked() {
-                if let Some(j) = self.mesh_job.take() {
+            if ui.put(cbtn, egui::Button::new(RichText::new("Cancel").small())).clicked()
+                && let Some(j) = self.mesh_job.take() {
                     j.cancel.store(true, Ordering::Relaxed);
                     self.mesh_err = Some((j.key, "Meshing cancelled.".into()));
                 }
-            }
         }
     }
 }

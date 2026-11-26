@@ -284,10 +284,12 @@ impl GpuSystem {
                 }
             }
         }
-        let mut limits = wgpu::Limits::default();
-        limits.max_storage_buffers_per_shader_stage = 11;
-        limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
-        limits.max_buffer_size = al.max_buffer_size;
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 11,
+            max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
+            max_buffer_size: al.max_buffer_size,
+            ..wgpu::Limits::default()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("simcraft-compute"),
             required_features: wgpu::Features::SHADER_F64,

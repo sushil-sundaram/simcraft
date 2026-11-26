@@ -31,3 +31,12 @@ step-p21 = "0.1"
 
 [dev-dependencies]
 monstertruck-modeling = "0.4.3"
+
+# Deliberate patterns in the numerical kernels: loops index several arrays in lock-step,
+# `!(x > 0.0)` rejects NaN on purpose, solver entry points take many arguments and some return
+# tuples of vectors. Everything else clippy reports is fixed.
+[lints.clippy]
+needless_range_loop = "allow"
+neg_cmp_op_on_partial_ord = "allow"
+type_complexity = "allow"
+too_many_arguments = "allow"

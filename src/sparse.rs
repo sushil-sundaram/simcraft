@@ -606,22 +606,20 @@ impl Solver {
                 }
             }
         };
-        if mode == ComputeMode::Gpu {
-            if let Some(s) = try_gpu("GPU compute was requested") {
+        if mode == ComputeMode::Gpu
+            && let Some(s) = try_gpu("GPU compute was requested") {
                 return Ok(s);
             }
-        }
         if std::env::var("SIMCRAFT_ITERATIVE").is_ok() {
             return Ok(Solver::Iterative);
         }
         match Factor::new(a, DIRECT_MAX) {
             Some(f) => Ok(Solver::Direct(f?)),
             None => {
-                if mode == ComputeMode::Auto && a.n() >= GPU_AUTO_MIN {
-                    if let Some(s) = try_gpu("this large model was sent to the GPU") {
+                if mode == ComputeMode::Auto && a.n() >= GPU_AUTO_MIN
+                    && let Some(s) = try_gpu("this large model was sent to the GPU") {
                         return Ok(s);
                     }
-                }
                 Ok(Solver::Iterative)
             }
         }

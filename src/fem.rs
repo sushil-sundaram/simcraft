@@ -1267,7 +1267,7 @@ fn structural_bcs_len(model: &Model, mesh: &Mesh, total_nodes: usize) -> Result<
                 for &fi in &fs {
                     let face = &mesh.faces[fi as usize];
                     let a = (face.dir / 2) as usize;
-                    let sign = if face.dir % 2 == 0 { -1.0 } else { 1.0 };
+                    let sign = if face.dir.is_multiple_of(2) { -1.0 } else { 1.0 };
                     for &n in &face.nodes {
                         let dof = n as usize * 3 + a;
                         if fixed[dof].is_none() {
@@ -1634,16 +1634,14 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
             Some(Load::BoltPretension { force_n, adjustment_mm, .. }) => (*force_n, *adjustment_mm),
             _ => (None, None),
         };
-        if let Some(fn_) = force_n {
-            if !fn_.is_finite() {
+        if let Some(fn_) = force_n
+            && !fn_.is_finite() {
                 bail!("bolt pretension #{}: force_n must be finite", ps.load_id);
             }
-        }
-        if let Some(a) = adj_mm {
-            if !a.is_finite() {
+        if let Some(a) = adj_mm
+            && !a.is_finite() {
                 bail!("bolt pretension #{}: adjustment_mm must be finite", ps.load_id);
             }
-        }
         let eb = node_e[ps.pairs.first().map(|p| p.minus as usize).unwrap_or(0)];
         let area_tot: f64 = ps.pairs.iter().map(|p| p.area_m2).sum::<f64>().max(h_m * h_m);
         let kc: Vec<f64> = ps.pairs.iter().map(|p| 40.0 * eb * (p.area_m2 / h_m)).collect();
@@ -2200,8 +2198,8 @@ pub fn heat_source(model: &Model, mesh: &Mesh, load: &Load) -> Result<(Vec<usize
         return Ok((els, p / vox));
     }
     let mut q = *value;
-    if let Some(name) = body {
-        if let Some(b) = model.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(name)) {
+    if let Some(name) = body
+        && let Some(b) = model.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(name)) {
             let (lo, hi) = b.shape.bounds();
             let cut = model.bodies.iter().any(|o| {
                 o.op == crate::geometry::Op::Subtract && {
@@ -2213,7 +2211,6 @@ pub fn heat_source(model: &Model, mesh: &Mesh, load: &Load) -> Result<(Vec<usize
                 q *= v * 1e-9 / vox;
             }
         }
-    }
     Ok((els, q))
 }
 

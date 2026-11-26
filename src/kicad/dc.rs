@@ -109,29 +109,26 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
         None => pads[ia].1.clone().filter(|n| !n.is_empty()).ok_or_else(|| anyhow!("pad {from} has no net: give 'net'"))?,
     };
     for (i, spec) in [(ia, from), (ib, to)] {
-        if let Some(n) = &pads[i].1 {
-            if !n.is_empty() && n != &net {
+        if let Some(n) = &pads[i].1
+            && !n.is_empty() && n != &net {
                 bail!("pad {spec} is on net '{n}', not '{net}'");
             }
-        }
     }
     // ---- copper of the net
     let mut tracks: Vec<(String, P2, P2, f64)> = Vec::new();
     for s in root.all("segment") {
-        if net_name(s, &table).as_deref() == Some(net.as_str()) {
-            if let (Some((x0, y0, _)), Some((x1, y1, _)), Some(w)) = (s.xy("start"), s.xy("end"), s.get("width").and_then(|w| w.num(1))) {
+        if net_name(s, &table).as_deref() == Some(net.as_str())
+            && let (Some((x0, y0, _)), Some((x1, y1, _)), Some(w)) = (s.xy("start"), s.xy("end"), s.get("width").and_then(|w| w.num(1))) {
                 tracks.push((s.str_of("layer").unwrap_or("F.Cu").to_string(), [x0, y0], [x1, y1], w));
             }
-        }
     }
     for s in root.all("arc") {
-        if net_name(s, &table).as_deref() == Some(net.as_str()) {
-            if let (Some((a0, a1, _)), Some((m0, m1, _)), Some((b0, b1, _)), Some(w)) = (s.xy("start"), s.xy("mid"), s.xy("end"), s.get("width").and_then(|w| w.num(1))) {
+        if net_name(s, &table).as_deref() == Some(net.as_str())
+            && let (Some((a0, a1, _)), Some((m0, m1, _)), Some((b0, b1, _)), Some(w)) = (s.xy("start"), s.xy("mid"), s.xy("end"), s.get("width").and_then(|w| w.num(1))) {
                 for p in arc_points([a0, a1], [m0, m1], [b0, b1]).windows(2) {
                     tracks.push((s.str_of("layer").unwrap_or("F.Cu").to_string(), p[0], p[1], w));
                 }
             }
-        }
     }
     let mut vias: Vec<(P2, f64, f64, usize, usize)> = Vec::new();
     for v in root.all("via") {
@@ -346,7 +343,7 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
             }
         }
     }
-    if !fixed.iter().any(|f| *f == Some(1.0)) || !fixed.iter().any(|f| *f == Some(0.0)) {
+    if !fixed.contains(&Some(1.0)) || !fixed.contains(&Some(0.0)) {
         bail!("pads {from} and {to} have no copper of net '{net}' on their layers");
     }
     let mut nbr: Vec<Vec<(u32, f64)>> = vec![Vec::new(); n];
@@ -584,7 +581,7 @@ pub fn net_pads_text(text: &str) -> Result<Vec<(String, Vec<String>)>> {
     }
     let mut out: Vec<(String, Vec<String>)> = nets.into_iter().filter(|(_, p)| p.len() >= 2).collect();
     for (_, p) in out.iter_mut() {
-        p.sort_by(|a, b| natural(a).cmp(&natural(b)));
+        p.sort_by_key(|a| natural(a));
         p.dedup();
     }
     Ok(out)

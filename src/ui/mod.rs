@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use theme::{Pal, UnitSystem, install_style, load_prefs, pal, save_dark_pref, save_prefs};
+use theme::{Pal, UnitSystem, install_fonts, install_style, load_prefs, pal, save_dark_pref, save_prefs};
 
 #[derive(PartialEq, Clone, Copy)]
 pub(super) enum Tab {
@@ -518,7 +518,7 @@ pub(super) struct LoadDraft {
 #[derive(Clone, Debug)]
 pub(super) enum EditTarget {
     Body(BodyDraft),
-    Load(LoadDraft),
+    Load(Box<LoadDraft>),
 }
 
 pub(super) type ModelsJobSlot = Arc<std::sync::Mutex<Option<Result<Vec<String>, String>>>>;
@@ -603,6 +603,7 @@ pub struct SimApp {
 
 impl SimApp {
     pub fn new(cc: &eframe::CreationContext<'_>, core: Shared, bridge: String) -> Self {
+        install_fonts(&cc.egui_ctx);
         install_style(&cc.egui_ctx);
         let prefs = load_prefs();
         let dark = prefs.dark_mode.unwrap_or_else(|| cc.egui_ctx.system_theme() == Some(egui::Theme::Dark));
@@ -852,14 +853,12 @@ impl SimApp {
     }
 
     fn open_checked(&mut self, path: &str) {
-        if std::path::Path::new(path) != crate::session::autosave_path() {
-            if let Ok(ext) = crate::session::external_assets(path) {
-                if !ext.is_empty() {
+        if std::path::Path::new(path) != crate::session::autosave_path()
+            && let Ok(ext) = crate::session::external_assets(path)
+                && !ext.is_empty() {
                     self.confirm_external = Some((path.to_string(), ext));
                     return;
                 }
-            }
-        }
         self.run("open_project", json!({"path": path}));
     }
 
@@ -1222,11 +1221,10 @@ impl eframe::App for SimApp {
             }
             if key_show_all {
                 self.show_all_bodies();
-            } else if key_hide {
-                if let Some(b) = self.sel_body.clone() {
+            } else if key_hide
+                && let Some(b) = self.sel_body.clone() {
                     self.set_body_vis(&b, 2);
                 }
-            }
             if key_del {
                 if let Some(id) = self.sel_load.take() {
                     self.edit_target = None;
