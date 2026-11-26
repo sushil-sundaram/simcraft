@@ -160,6 +160,7 @@ impl SimApp {
                         }
                     });
                 }
+                self.preflight_group(ui);
             }
             Tab::Mesh => {
                 group(ui, &p, "ELEMENT SIZE", |ui| {
@@ -218,6 +219,7 @@ impl SimApp {
                         }
                     });
                 }
+                self.preflight_group(ui);
                 group(ui, &p, "SETTINGS", |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(4.0);
@@ -482,6 +484,48 @@ impl SimApp {
                 });
             }
         });
+    }
+
+    fn preflight_group(&mut self, ui: &mut egui::Ui) {
+        let p = self.p;
+        let items = {
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let m = if s.mesh_valid() { s.mesh.as_deref() } else { None };
+            crate::model::preflight_check(&s.model, m, s.element_size())
+        };
+        let mut jump: Option<(String, String)> = None;
+        group(ui, &p, "READINESS", |ui| {
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.set_max_width(270.0);
+                    for it in &items {
+                        let (icon, col) = match it.status {
+                            crate::model::PreflightStatus::Pass => ("✓", p.ok),
+                            crate::model::PreflightStatus::Warn => ("⚠", p.warn),
+                            crate::model::PreflightStatus::Fail => ("✗", p.err),
+                        };
+                        let resp = ui.add(egui::Button::new(RichText::new(format!("{icon} {}", it.label)).small().color(col)).frame_when_inactive(true))
+                            .on_hover_text(format!("{}\n(click to jump)", it.message));
+                        if resp.clicked() {
+                            jump = Some((it.code.clone(), it.target_tab.clone()));
+                        }
+                    }
+                });
+            });
+        });
+        if let Some((code, target_tab)) = jump {
+            self.tab = match target_tab.as_str() {
+                "geometry" => Tab::Geometry,
+                "material" => Tab::Material,
+                "mesh" => Tab::Mesh,
+                _ => Tab::Setup,
+            };
+            if code == "enclosure" {
+                self.form = Form::Enclosure;
+                self.props_open = true;
+            }
+        }
     }
 
     fn results_ribbon(&mut self, ui: &mut egui::Ui) {

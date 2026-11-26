@@ -44,6 +44,20 @@ impl SimApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
         }
+        if let Some(job) = &self.planner.models_job {
+            let done = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            if let Some(r) = done {
+                self.planner.models_job = None;
+                if let Ok(m) = &r {
+                    if self.planner.model.is_empty() {
+                        self.planner.model = crate::assistant::default_model(m).unwrap_or_default();
+                    }
+                }
+                self.planner.models = Some(r);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            }
+        }
 
         if let Some((_cancel, slot)) = &self.pcb.nets_job {
             let done = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
@@ -686,28 +700,60 @@ impl SimApp {
             ui.add_space(4.0);
             ui.label(RichText::new(format!("⚠ {e}")).color(p.err));
         }
+        let mut pin: Option<([f64; 3], String)> = None;
         if let Some(r) = &f.result {
+            let (board_off, board_t) = self
+                .core
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .model
+                .bodies
+                .iter()
+                .find_map(|b| match &b.shape {
+                    crate::geometry::Shape::Pcb { offset, data, .. } => Some((*offset, data.as_ref().map(|d| d.thickness).unwrap_or(1.6))),
+                    _ => None,
+                })
+                .unwrap_or(([0.0; 3], 1.6));
             ui.add_space(6.0);
             ui.separator();
             let num = |k: &str| r[k].as_f64().unwrap_or(f64::NAN);
             let at = |k: &str| r[k].as_array().map(|a| format!("({:.2}, {:.2}) mm", a[0].as_f64().unwrap_or(0.0), a[1].as_f64().unwrap_or(0.0))).unwrap_or_default();
             egui::Grid::new("pcbdc-out").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                for (label, value) in [
-                    ("Resistance", format!("{:.3} mΩ", num("resistance_mohm"))),
-                    ("Voltage drop", format!("{:.2} mV at {} A", num("voltage_drop_mv"), crate::results::float(num("current_a")))),
-                    ("Power in the copper", format!("{:.4} W", num("power_w"))),
-                    ("Peak current density", format!("{:.1} A/mm²  on {} at {}", num("max_current_density_a_per_mm2"), r["max_current_density_layer"].as_str().unwrap_or(""), at("max_current_density_at_mm"))),
-                    ("Largest via current", if num("vias_and_holes") > 0.0 { format!("{:.3} A at {}", num("max_via_current_a"), at("max_via_at_mm")) } else { "no vias in the path".into() }),
+                for (label, value, pt_opt) in [
+                    ("Resistance", format!("{:.3} mΩ", num("resistance_mohm")), None),
+                    ("Voltage drop", format!("{:.2} mV at {} A", num("voltage_drop_mv"), crate::results::float(num("current_a"))), None),
+                    ("Power in the copper", format!("{:.4} W", num("power_w")), None),
+                    (
+                        "Peak current density",
+                        format!("{:.1} A/mm²  on {} at {}", num("max_current_density_a_per_mm2"), r["max_current_density_layer"].as_str().unwrap_or(""), at("max_current_density_at_mm")),
+                        r["max_current_density_at_mm"].as_array().and_then(|a| Some(([board_off[0] + a.first()?.as_f64()?, board_off[1] + a.get(1)?.as_f64()?, board_off[2] + board_t], format!("Peak J {:.1} A/mm²", num("max_current_density_a_per_mm2"))))),
+                    ),
+                    (
+                        "Largest via current",
+                        if num("vias_and_holes") > 0.0 { format!("{:.3} A at {}", num("max_via_current_a"), at("max_via_at_mm")) } else { "no vias in the path".into() },
+                        r["max_via_at_mm"].as_array().and_then(|a| Some(([board_off[0] + a.first()?.as_f64()?, board_off[1] + a.get(1)?.as_f64()?, board_off[2] + board_t * 0.5], format!("Via {:.3} A", num("max_via_current_a"))))),
+                    ),
                 ] {
                     ui.label(RichText::new(label).color(p.weak));
-                    ui.label(RichText::new(value).strong());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(value).strong());
+                        if let Some(pt) = pt_opt {
+                            if ui.small_button("📍 Locate").clicked() {
+                                pin = Some(pt);
+                            }
+                        }
+                    });
                     ui.end_row();
                 }
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Tracks carrying the most current").strong());
-            egui::Grid::new("pcbdc-tracks").striped(true).num_columns(7).spacing([12.0, 3.0]).show(ui, |ui| {
-                for h in ["Layer", "Width", "Length", "Current", "J", "IPC ΔT", "Width for 10 °C"] {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Tracks carrying the most current").strong());
+                ui.label(RichText::new("(click 📍 to pinpoint in 3D)").small().color(p.weak));
+            });
+            egui::Grid::new("pcbdc-tracks").striped(true).num_columns(8).spacing([10.0, 3.0]).show(ui, |ui| {
+                for h in ["", "Layer", "Width", "Length", "Current", "J", "IPC ΔT", "Width for 10 °C"] {
                     ui.label(RichText::new(h).small().strong());
                 }
                 ui.end_row();
@@ -716,6 +762,20 @@ impl SimApp {
                     let rise = g("ipc2221_temperature_rise_c");
                     let short = g("length_mm") < crate::kicad::dc::SHORT_MM;
                     let col = if short { p.weak } else if rise > 20.0 { p.err } else if rise > 10.0 { p.warn } else { p.text };
+                    let mid = (|| -> Option<[f64; 3]> {
+                        let a = t["from_mm"].as_array()?;
+                        let b = t["to_mm"].as_array()?;
+                        let x = 0.5 * (a.first()?.as_f64()? + b.first()?.as_f64()?);
+                        let y = 0.5 * (a.get(1)?.as_f64()? + b.get(1)?.as_f64()?);
+                        Some([board_off[0] + x, board_off[1] + y, board_off[2] + board_t * 0.5])
+                    })();
+                    if let Some(pt) = mid {
+                        if ui.small_button("📍").on_hover_text("Pinpoint track midpoint in 3D viewport").clicked() {
+                            pin = Some((pt, format!("{:.2} A ({:.1} °C)", g("current_a"), rise)));
+                        }
+                    } else {
+                        ui.label("");
+                    }
                     ui.label(t["layer"].as_str().unwrap_or(""));
                     ui.label(format!("{:.3} mm", g("width_mm")));
                     ui.label(format!("{:.1} mm", g("length_mm")));
@@ -736,6 +796,11 @@ impl SimApp {
                 }
             });
         }
+        if let Some((pt, lbl)) = pin {
+            self.cam.target = pt;
+            self.highlight_point = Some((pt, lbl));
+            ctx.request_repaint();
+        }
         if help {
             self.open_help("DC current in a net");
         }
@@ -749,41 +814,99 @@ impl SimApp {
 
     fn draw_planner(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let p = self.p;
-        if self.planner.models.is_none() {
-            self.planner.models = Some(crate::assistant::list_models().map_err(|e| format!("{e:#}")));
-            if let Some(Ok(m)) = &self.planner.models {
-                self.planner.model = crate::assistant::default_model(m).unwrap_or_default();
-            }
-        }
-        let busy = self.planner.job.is_some();
-        let plan = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).plan.clone();
-        let now = ctx.input(|i| i.time);
-        let mut actions: Vec<(String, Value)> = Vec::new();
-        ui.label(RichText::new("Describe what you want to simulate. A local AI model (running on this computer through Ollama) drafts a to-do list and flags anything SimCraft cannot do yet.").color(p.weak));
-        ui.add_space(6.0);
-        ui.add(egui::TextEdit::multiline(&mut self.planner.goal).hint_text("e.g. simulate EMI on my PCB · how hot does food get in a microwave · will this bracket bend under 2 kN").desired_rows(2).desired_width(f32::INFINITY));
-        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            match &self.planner.models {
-                Some(Ok(models)) if !models.is_empty() => {
-                    ui.label("Model");
-                    egui::ComboBox::from_id_salt("planner-model").width(220.0).selected_text(&self.planner.model).show_ui(ui, |ui| {
-                        for m in models {
-                            ui.selectable_value(&mut self.planner.model, m.clone(), m);
-                        }
+            ui.selectable_value(&mut self.planner.mode, 0, "🤖 Copilot & Quick-Fix");
+            ui.selectable_value(&mut self.planner.mode, 1, "🔌 Connect External AI (MCP)");
+        });
+        ui.separator();
+        if self.planner.mode == 1 {
+            super::dialogs::mcp_connect_panel(self, ctx, ui);
+            return;
+        }
+
+        if self.planner.models.is_none() && self.planner.models_job.is_none() {
+            let slot: super::ModelsJobSlot = Arc::new(std::sync::Mutex::new(None));
+            let s2 = slot.clone();
+            let c2 = ctx.clone();
+            std::thread::spawn(move || {
+                let r = crate::assistant::list_models().map_err(|e| format!("{e:#}"));
+                *s2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
+                c2.request_repaint();
+            });
+            self.planner.models_job = Some(slot);
+        }
+
+        let (plan, last_err, fixes) = {
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let m = if s.mesh_valid() { s.mesh.as_deref() } else { None };
+            let fixes = crate::assistant::quick_fixes(&s.model, m, &s.selection, s.element_size());
+            (s.plan.clone(), s.last_error.clone(), fixes)
+        };
+        let mut actions: Vec<(Option<usize>, String, Value)> = Vec::new();
+
+        if let Some(err) = &last_err {
+            card(ui, &p, |ui| {
+                ui.label(RichText::new("🩺 Last Solver Error Diagnosis").strong().color(p.err));
+                ui.label(RichText::new(err).small().color(p.weak));
+                ui.label(RichText::new(crate::assistant::explain_issue(err)).small());
+            });
+            ui.add_space(6.0);
+        }
+
+        if !fixes.is_empty() {
+            card(ui, &p, |ui| {
+                ui.label(RichText::new("⚡ Instant Setup Quick-Fixes (offline, undoable)").strong());
+                for fx in &fixes {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("• {}:", fx.tool)).small().strong().color(p.accent));
+                        ui.label(RichText::new(&fx.reason).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("▶ Apply").clicked() {
+                                actions.push((None, fx.tool.clone(), fx.args.clone()));
+                            }
+                        });
                     });
                 }
-                Some(Ok(_)) => {
-                    ui.label(RichText::new("No local models installed — run: ollama pull qwen2.5:7b").color(p.warn));
+            });
+            ui.add_space(6.0);
+        }
+
+        let busy = self.planner.job.is_some();
+        let now = ctx.input(|i| i.time);
+        ui.label(RichText::new("Describe your simulation goal, question, or change — local Ollama sees your live bodies, selection, and pre-flight status and can propose undoable tool calls.").color(p.weak));
+        ui.add_space(6.0);
+        ui.add(egui::TextEdit::multiline(&mut self.planner.goal).hint_text("e.g. set up static structural on my bracket · fix rigid body error · simulate EMI on my PCB").desired_rows(2).desired_width(f32::INFINITY));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if self.planner.models_job.is_some() {
+                ui.add(egui::Spinner::new());
+                ui.label(RichText::new("Checking local Ollama…").small().color(p.weak));
+            } else {
+                match &self.planner.models {
+                    Some(Ok(models)) if !models.is_empty() => {
+                        ui.label("Model");
+                        egui::ComboBox::from_id_salt("planner-model").width(210.0).selected_text(&self.planner.model).show_ui(ui, |ui| {
+                            for m in models {
+                                ui.selectable_value(&mut self.planner.model, m.clone(), m);
+                            }
+                        });
+                    }
+                    Some(Ok(_)) => {
+                        ui.label(RichText::new("No local models — run: ollama pull qwen2.5:7b").small().color(p.warn));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(format!("Ollama offline ({e})")).small().color(p.weak));
+                        if ui.small_button("Retry").clicked() {
+                            self.planner.models = None;
+                        }
+                    }
+                    None => {}
                 }
-                Some(Err(e)) => {
-                    ui.label(RichText::new(format!("⚠ {e}")).small().color(p.warn));
-                }
-                None => {}
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ready = !busy && !self.planner.goal.trim().is_empty() && !self.planner.model.is_empty();
-                if ui.add_enabled(ready, primary(&p, "Draft to-do list")).clicked() {
+                if ui.add_enabled(ready, primary(&p, "Draft plan & actions")).clicked() {
+                    self.planner.executed_actions.clear();
                     let slot = Arc::new(std::sync::Mutex::new(None));
                     let (core, goal, model, out) = (self.core.clone(), self.planner.goal.clone(), self.planner.model.clone(), slot.clone());
                     std::thread::spawn(move || {
@@ -822,9 +945,42 @@ impl SimApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Start with: {}", a.label())).strong());
                     if ui.small_button("Set up this analysis").clicked() {
-                        actions.push(("set_analysis".into(), json!({"type": a.key()})));
+                        actions.push((None, "set_analysis".into(), json!({"type": a.key()})));
                     }
                 });
+            }
+            if !plan.actions.is_empty() {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("PROPOSED ACTIONS ({})", plan.actions.len())).size(11.0).strong().color(p.weak));
+                    if ui.small_button("▶▶ Run all remaining").clicked() {
+                        for (idx, act) in plan.actions.iter().enumerate() {
+                            if !self.planner.executed_actions.contains(&idx) {
+                                actions.push((Some(idx), act.tool.clone(), act.args.clone()));
+                            }
+                        }
+                    }
+                    if ui.small_button("↶ Undo last").clicked() {
+                        actions.push((None, "undo".into(), json!({})));
+                    }
+                });
+                for (idx, act) in plan.actions.iter().enumerate() {
+                    let done = self.planner.executed_actions.contains(&idx);
+                    card(ui, &p, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(if done { "✔" } else { "•" }).color(if done { p.ok } else { p.accent }).strong());
+                            ui.label(RichText::new(&act.tool).monospace().strong());
+                            ui.label(RichText::new(&act.reason).small().color(p.weak));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add_enabled(!done, egui::Button::new(if done { "Ran" } else { "▶ Run" }).small()).clicked() {
+                                    actions.push((Some(idx), act.tool.clone(), act.args.clone()));
+                                }
+                            });
+                        });
+                        ui.label(RichText::new(serde_json::to_string(&act.args).unwrap_or_default()).monospace().size(11.0).color(p.weak));
+                    });
+                    ui.add_space(3.0);
+                }
             }
             ui.add_space(6.0);
             let done = plan.steps.iter().filter(|s| s.done).count();
@@ -834,7 +990,7 @@ impl SimApp {
                     ui.horizontal(|ui| {
                         let mut d = st.done;
                         if ui.checkbox(&mut d, "").changed() {
-                            actions.push(("set_plan_step".into(), json!({"index": i + 1, "done": d})));
+                            actions.push((None, "set_plan_step".into(), json!({"index": i + 1, "done": d})));
                         }
                         let mut t = RichText::new(format!("{}. {}", i + 1, st.task)).strong();
                         if st.done {
@@ -877,11 +1033,15 @@ impl SimApp {
                     ctx.copy_text(crate::assistant::to_markdown(&plan));
                     self.planner.copied_at = now;
                 }
-                ui.label(RichText::new(format!("Drafted by {} — check the steps; small local models can be wrong.", plan.model)).small().italics().color(p.weak));
+                ui.label(RichText::new(format!("Drafted by {} — review proposed actions before running.", plan.model)).small().italics().color(p.weak));
             });
         }
-        for (t, a) in actions {
-            self.run(&t, a);
+        for (idx_opt, t, a) in actions {
+            if self.run(&t, a) {
+                if let Some(i) = idx_opt {
+                    self.planner.executed_actions.insert(i);
+                }
+            }
         }
     }
 

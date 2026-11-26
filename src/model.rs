@@ -535,3 +535,212 @@ impl Model {
         self.analysis.kind.uses_enclosure() && self.has_enclosure()
     }
 }
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightStatus {
+    Pass,
+    Warn,
+    Fail,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreflightItem {
+    pub code: String,
+    pub label: String,
+    pub message: String,
+    pub status: PreflightStatus,
+    /// Suggested UI tab: "geometry" | "material" | "setup" | "mesh" | "solve".
+    pub target_tab: String,
+}
+
+/// Live pre-solve readiness checklist checked against solver requirements.
+pub fn preflight_check(model: &Model, mesh: Option<&crate::mesh::Mesh>, elem_size_mm: f64) -> Vec<PreflightItem> {
+    use crate::geometry::{Op, Role};
+    use AnalysisType::*;
+    let mut out = Vec::new();
+    let item = |code: &str, label: &str, message: String, status: PreflightStatus, target_tab: &str| PreflightItem {
+        code: code.into(),
+        label: label.into(),
+        message,
+        status,
+        target_tab: target_tab.into(),
+    };
+
+    let solids: Vec<&crate::geometry::Body> = model.bodies.iter().filter(|b| b.role == Role::Solid && b.op == Op::Add).collect();
+    if solids.is_empty() {
+        out.push(item("geometry", "Needs Geometry", "Add at least one solid body (Box, Cylinder, Sphere, or STL).".into(), PreflightStatus::Fail, "geometry"));
+    } else {
+        out.push(item("geometry", "Geometry", format!("{} additive solid body(s) defined.", solids.len()), PreflightStatus::Pass, "geometry"));
+    }
+
+    let mats = model.materials();
+    let resolved_mats: Vec<&Material> = solids.iter().filter_map(|b| mats.iter().find(|m| m.name == b.material)).collect();
+    if solids.is_empty() {
+        out.push(item("material", "Material", "Waiting for solid geometry.".into(), PreflightStatus::Warn, "material"));
+    } else if resolved_mats.len() < solids.len() {
+        out.push(item("material", "Unknown Material", "One or more bodies reference a missing material.".into(), PreflightStatus::Fail, "material"));
+    } else {
+        out.push(item("material", "Material", solids.iter().map(|b| b.material.as_str()).collect::<std::collections::HashSet<_>>().into_iter().collect::<Vec<_>>().join(", "), PreflightStatus::Pass, "material"));
+    }
+
+    let kind = model.analysis.kind;
+    let enc = model.bodies.iter().find(|b| b.role == Role::Enclosure);
+    if kind.requires_enclosure() {
+        match enc {
+            None => out.push(item("enclosure", "Needs Enclosure", format!("{} requires an Air/Fluid enclosure around the parts.", kind.label()), PreflightStatus::Fail, "geometry")),
+            Some(eb) => {
+                if matches!(kind, Fluid | ConjugateHeatTransfer) {
+                    let is_fluid = mats.iter().find(|m| m.name == eb.material).is_some_and(|m| m.is_fluid && m.dynamic_viscosity > 0.0);
+                    if !is_fluid {
+                        out.push(item("enclosure", "Enclosure Fluid", format!("Enclosure '{}' uses '{}', which is not a fluid (use Air, Water, or Engine Oil).", eb.name, eb.material), PreflightStatus::Fail, "material"));
+                    } else {
+                        out.push(item("enclosure", "Fluid Enclosure", format!("{} ({})", eb.name, eb.material), PreflightStatus::Pass, "geometry"));
+                    }
+                } else {
+                    out.push(item("enclosure", "Enclosure", format!("{} ({})", eb.name, eb.material), PreflightStatus::Pass, "geometry"));
+                }
+            }
+        }
+    }
+
+    let has = |pred: &dyn Fn(&Load) -> bool| model.loads.iter().any(|l| pred(&l.load));
+    let has_support = has(&|l| matches!(l, Load::FixedSupport { .. } | Load::Displacement { .. } | Load::CompressionOnly { .. } | Load::Symmetry { .. }));
+    let has_struct_load = has(&|l| {
+        matches!(l, Load::Force { .. } | Load::Pressure { .. } | Load::Gravity { .. })
+            || matches!(l, Load::Displacement { x, y, z, .. } if [x, y, z].iter().any(|c| c.is_some_and(|v| v != 0.0)))
+    });
+    let has_thermal_bc = has(&|l| matches!(l, Load::Temperature { .. } | Load::Convection { .. } | Load::Radiation { .. }));
+    let has_thermal_src = has(&|l| matches!(l, Load::HeatFlux { .. } | Load::HeatGeneration { .. } | Load::Temperature { .. }));
+
+    match kind {
+        StaticStructural | NonlinearStructural | LinearBuckling | TransientStructural => {
+            if !has_support {
+                out.push(item("support", "Needs Support", "Add a Fixed Support, Displacement, or Symmetry restraint.".into(), PreflightStatus::Fail, "setup"));
+            } else {
+                out.push(item("support", "Support", "Structural restraint defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+            if !has_struct_load {
+                out.push(item("excitation", "Needs Load", "Add a Force, Pressure, Gravity, or non-zero Displacement.".into(), PreflightStatus::Warn, "setup"));
+            }
+        }
+        Modal => {
+            if !has_support {
+                out.push(item("support", "Needs Support", "Add a Fixed Support or Displacement to remove rigid-body modes.".into(), PreflightStatus::Fail, "setup"));
+            } else {
+                out.push(item("support", "Support", "Modal restraint defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        HarmonicResponse => {
+            if !has_support {
+                out.push(item("support", "Needs Support", "Add a Fixed Support or Displacement restraint.".into(), PreflightStatus::Fail, "setup"));
+            }
+            if !has(&|l| matches!(l, Load::Force { .. } | Load::Pressure { .. })) {
+                out.push(item("excitation", "Needs Force / Pressure", "Harmonic response needs at least one Force or Pressure amplitude.".into(), PreflightStatus::Fail, "setup"));
+            } else if has_support {
+                out.push(item("excitation", "Harmonic Load", "Support and harmonic excitation defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        ResponseSpectrum | RandomVibration => {
+            if !has_support {
+                out.push(item("support", "Needs Support", "Add a Fixed Support or Displacement restraint.".into(), PreflightStatus::Fail, "setup"));
+            }
+            if model.analysis.table.is_empty() {
+                out.push(item("excitation", "Needs Table", "Define the excitation table (Hz vs g or g²/Hz) in Setup/Solve.".into(), PreflightStatus::Fail, "setup"));
+            } else if has_support {
+                out.push(item("excitation", "Excitation Table", format!("{} table point(s).", model.analysis.table.len()), PreflightStatus::Pass, "setup"));
+            }
+        }
+        SteadyThermal | TransientThermal => {
+            if !has_thermal_bc {
+                out.push(item("thermal_bc", "Needs Thermal BC", "Add a Temperature, Convection, or Radiation boundary condition.".into(), PreflightStatus::Fail, "setup"));
+            } else if !has_thermal_src {
+                out.push(item("thermal_bc", "Thermal Load", "Thermal boundary present; add Heat Flux / Heat Generation if needed.".into(), PreflightStatus::Warn, "setup"));
+            } else {
+                out.push(item("thermal_bc", "Thermal BCs", "Thermal source and sink defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        ThermalStress => {
+            if !has_support {
+                out.push(item("support", "Needs Support", "Add a Fixed Support or Displacement restraint.".into(), PreflightStatus::Fail, "setup"));
+            }
+            if !has_thermal_bc {
+                out.push(item("thermal_bc", "Needs Thermal BC", "Add a Temperature, Convection, or Radiation boundary condition.".into(), PreflightStatus::Fail, "setup"));
+            } else if has_support {
+                out.push(item("thermal_bc", "Thermal + Support", "Structural and thermal BCs defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        Electrostatic => {
+            if !has(&|l| matches!(l, Load::Voltage { .. })) {
+                out.push(item("excitation", "Needs Voltage", "Add at least two Voltage boundaries (e.g. +V and 0 V ground).".into(), PreflightStatus::Fail, "setup"));
+            } else {
+                out.push(item("excitation", "Voltage BCs", "Voltage boundary defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        CurrentFlow | ThermalElectric => {
+            let has_v = has(&|l| matches!(l, Load::Voltage { .. }));
+            let has_i = has(&|l| matches!(l, Load::Current { .. }));
+            if !has_v {
+                out.push(item("excitation", "Needs Voltage Ref", "Ground at least one face with a 0 V Voltage boundary.".into(), PreflightStatus::Fail, "setup"));
+            } else if !has_i && model.loads.iter().filter(|l| matches!(l.load, Load::Voltage { .. })).count() < 2 {
+                out.push(item("excitation", "Needs Current / 2nd V", "Add a Current load or second Voltage boundary.".into(), PreflightStatus::Warn, "setup"));
+            } else {
+                out.push(item("excitation", "Electric BCs", "Current path defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        Magnetostatic => {
+            if !has(&|l| matches!(l, Load::Coil { .. } | Load::Magnet { .. })) {
+                out.push(item("excitation", "Needs Coil / Magnet", "Add a Coil or Permanent Magnet excitation.".into(), PreflightStatus::Fail, "setup"));
+            } else {
+                out.push(item("excitation", "Magnetic Source", "Coil or Magnet defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        Fluid | ConjugateHeatTransfer => {
+            let has_in = has(&|l| matches!(l, Load::Inlet { .. }));
+            let has_out = has(&|l| matches!(l, Load::Outlet { .. }));
+            let has_wall = has(&|l| matches!(l, Load::MovingWall { .. }));
+            let has_grav = kind == ConjugateHeatTransfer && has(&|l| matches!(l, Load::Gravity { .. }));
+            if !has_in && !has_wall && !has_grav {
+                out.push(item("flow_bc", "Needs Flow Drive", "Add a Velocity Inlet (+ Pressure Outlet), Moving Wall, or Gravity (natural convection).".into(), PreflightStatus::Fail, "setup"));
+            } else if has_in && !has_out {
+                out.push(item("flow_bc", "Needs Outlet", "A Velocity Inlet requires a Pressure Outlet (e.g. 0 Pa).".into(), PreflightStatus::Fail, "setup"));
+            } else if kind == ConjugateHeatTransfer && !has_in && !has_out && !has_thermal_bc {
+                out.push(item("flow_bc", "Needs Heat Sink", "CHT needs an Inlet/Outlet, Temperature, or Convection boundary for heat to leave.".into(), PreflightStatus::Fail, "setup"));
+            } else {
+                out.push(item("flow_bc", "Flow BCs", "Inflow / boundary conditions defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        FullWaveEm | MicrowaveHeating => {
+            if !has(&|l| matches!(l, Load::Port { .. })) {
+                out.push(item("excitation", "Needs RF Port", "Add an RF Port where electromagnetic power enters.".into(), PreflightStatus::Fail, "setup"));
+            } else {
+                out.push(item("excitation", "RF Port", "RF excitation port defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+            if model.analysis.frequency_hz > 0.0 && elem_size_mm > 0.0 {
+                let max_er = resolved_mats.iter().map(|m| m.relative_permittivity).fold(1.0f64, f64::max).max(1.0);
+                let lambda_mm = (299_792_458.0 / model.analysis.frequency_hz) * 1000.0 / max_er.sqrt();
+                let limit_mm = lambda_mm / 10.0;
+                if elem_size_mm > limit_mm {
+                    out.push(item(
+                        "mesh_wavelength",
+                        "Mesh > λ/10",
+                        format!("Element size {elem_size_mm:.2} mm exceeds λ/10 ({limit_mm:.2} mm at {:.2} GHz, εr={max_er:.1}).", model.analysis.frequency_hz / 1e9),
+                        PreflightStatus::Warn,
+                        "mesh",
+                    ));
+                } else {
+                    out.push(item("mesh_wavelength", "Mesh ≤ λ/10", format!("{elem_size_mm:.2} mm ≤ {limit_mm:.2} mm"), PreflightStatus::Pass, "mesh"));
+                }
+            }
+        }
+    }
+
+    if let Some(m) = mesh {
+        if !m.warnings.is_empty() {
+            out.push(item("mesh", "Mesh Warning", m.warnings[0].clone(), PreflightStatus::Warn, "mesh"));
+        } else {
+            out.push(item("mesh", "Mesh Ready", format!("{} elements ({} mm)", m.elems.len(), m.h), PreflightStatus::Pass, "mesh"));
+        }
+    }
+    out
+}

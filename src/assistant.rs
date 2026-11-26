@@ -39,6 +39,15 @@ fn validated_base_url() -> Result<String> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolAction {
+    pub tool: String,
+    #[serde(default)]
+    pub args: Value,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Step {
     pub task: String,
     #[serde(default)]
@@ -68,6 +77,8 @@ pub struct Plan {
     pub analysis: String,
     #[serde(default)]
     pub steps: Vec<Step>,
+    #[serde(default)]
+    pub actions: Vec<ToolAction>,
     #[serde(default)]
     pub inputs_needed: Vec<String>,
     #[serde(default)]
@@ -217,6 +228,11 @@ fn schema() -> Value {
                 "detail": {"type": "string"},
                 "status": {"type": "string", "enum": ["ready", "workaround", "missing"]}
             }, "required": ["task", "detail", "status"]}},
+            "actions": {"type": "array", "items": {"type": "object", "properties": {
+                "tool": {"type": "string"},
+                "args": {"type": "object"},
+                "reason": {"type": "string"}
+            }, "required": ["tool", "args", "reason"]}},
             "inputs_needed": {"type": "array", "items": {"type": "string"}},
             "missing_capabilities": {"type": "array", "items": {"type": "string"}}
         },
@@ -224,14 +240,109 @@ fn schema() -> Value {
     })
 }
 
-const INSTRUCTIONS: &str = "You are SimCraft's simulation planning assistant. The user describes something they want to simulate. \
-Produce a practical, ordered to-do list (6 to 10 steps) for doing it IN SIMCRAFT, from gathering inputs and building geometry to checking results. \
+/// Compact snapshot of the active SimCraft session for local AI Copilot grounding.
+pub fn model_context_json(
+    model: &crate::model::Model,
+    mesh: Option<&crate::mesh::Mesh>,
+    selection: &[String],
+    elem_size_mm: f64,
+    last_error: Option<&str>,
+) -> Value {
+    let preflight = crate::model::preflight_check(model, mesh, elem_size_mm);
+    let bodies: Vec<Value> = model.bodies.iter().map(|b| json!({"name": b.name, "material": b.material, "op": b.op, "role": b.role})).collect();
+    let loads: Vec<Value> = model.loads.iter().map(|l| json!({"id": l.id, "label": l.load.label(), "summary": l.load.summary()})).collect();
+    let faces: Vec<&str> = mesh.map(|m| m.patches.iter().take(48).map(|p| p.name.as_str()).collect()).unwrap_or_default();
+    json!({
+        "analysis": model.analysis.kind.key(),
+        "element_size_mm": elem_size_mm,
+        "bodies": bodies,
+        "loads": loads,
+        "selected_faces": selection,
+        "faces_sample": faces,
+        "preflight": preflight,
+        "last_error": last_error,
+    })
+}
+
+/// Rule-based executable quick-fix tool suggestions derived from preflight & current selection.
+pub fn quick_fixes(
+    model: &crate::model::Model,
+    mesh: Option<&crate::mesh::Mesh>,
+    selection: &[String],
+    elem_size_mm: f64,
+) -> Vec<ToolAction> {
+    let items = crate::model::preflight_check(model, mesh, elem_size_mm);
+    let mut actions = Vec::new();
+    for it in items {
+        if it.status == crate::model::PreflightStatus::Pass {
+            continue;
+        }
+        match it.code.as_str() {
+            "geometry" => actions.push(ToolAction {
+                tool: "add_box".into(),
+                args: json!({"name": "Part", "min": [0, 0, 0], "size": [100, 40, 10]}),
+                reason: "Create a starter 100×40×10 mm box".into(),
+            }),
+            "enclosure" => actions.push(ToolAction {
+                tool: "add_enclosure".into(),
+                args: json!({"material": "Air", "padding": 0.5}),
+                reason: "Add an Air enclosure around existing bodies".into(),
+            }),
+            "support" if !selection.is_empty() => actions.push(ToolAction {
+                tool: "add_fixed_support".into(),
+                args: json!({"faces": selection}),
+                reason: format!("Fix the {} currently selected face(s)", selection.len()),
+            }),
+            "thermal_bc" if !selection.is_empty() => actions.push(ToolAction {
+                tool: "add_convection".into(),
+                args: json!({"faces": selection, "coefficient": 20.0, "ambient": 22.0}),
+                reason: "Add natural convection (20 W/m²K) on selected face(s)".into(),
+            }),
+            "mesh_wavelength" if model.analysis.frequency_hz > 0.0 => {
+                let max_er = model.materials().iter()
+                    .filter(|m| model.bodies.iter().any(|b| b.material == m.name))
+                    .map(|m| m.relative_permittivity)
+                    .fold(1.0f64, f64::max)
+                    .max(1.0);
+                let rec = ((299_792_458.0 / model.analysis.frequency_hz) * 1000.0 / max_er.sqrt() / 12.0 * 100.0).round() / 100.0;
+                actions.push(ToolAction {
+                    tool: "set_mesh".into(),
+                    args: json!({"element_size_mm": rec.max(0.1)}),
+                    reason: format!("Refine element size to {rec:.2} mm (≤ λ/12 for FDTD stability)"),
+                });
+            }
+            _ => {}
+        }
+    }
+    actions
+}
+
+/// Actionable diagnosis hint for common solver errors or preflight warnings.
+pub fn explain_issue(error_or_msg: &str) -> String {
+    let e = error_or_msg.to_lowercase();
+    if e.contains("no supports") || e.contains("rigid-body") {
+        "The structure can translate or rotate freely in 3D. Select a mounting face and apply Fixed Support (or constrain X/Y/Z with Displacement).".into()
+    } else if e.contains("enclosure") {
+        "Fluid, electrostatic, magnetostatic, and FDTD analyses solve in the surrounding space. Add an Enclosure (Air/Water) from GEOMETRY ▸ Enclosure.".into()
+    } else if e.contains("outlet") {
+        "Incompressible CFD needs a fixed-pressure exit paired with a Velocity Inlet. Apply Outlet (0 Pa) on the downstream enclosure face.".into()
+    } else if e.contains("rf port") || e.contains("no power") {
+        "FDTD needs an RF Port placed on a dielectric/air face (not entirely covered by metal) plus either a lossy body or open boundary.".into()
+    } else if e.contains("thermal model needs") {
+        "Steady thermal solves need at least one Temperature, Convection, or Radiation path so heat can equilibrate.".into()
+    } else {
+        format!("Check the SETUP pre-flight checklist and Mesh size: {error_or_msg}")
+    }
+}
+
+const INSTRUCTIONS: &str = "You are SimCraft's simulation copilot & planning assistant. The user describes a goal, asks about their active model, or troubleshoots an error. \
+Produce a practical, ordered to-do list (6 to 10 steps) for doing it IN SIMCRAFT, AND optionally `actions`: concrete MCP tool calls `{tool, args, reason}` when the user asks to set up, modify, or fix the live model (use real body/face names from `LIVE CONTEXT` when available). \
 Rules: use only the capabilities listed; mark a step `ready` if SimCraft can do it now, `workaround` if an approximation inside SimCraft is used (say what is approximated), \
 `missing` if it needs a capability SimCraft does not have. Never pretend a missing capability exists. \
 `analysis` must be one of the analysis keys listed (the first analysis to set up) or `none`. \
 Put concrete numbers and units in `detail` when sensible (element sizes, typical material values, load magnitudes). \
 Each `task` is a short imperative phrase naming the action (e.g. \"Model the PCB stack-up\", \"Apply the estimated absorbed power as heat generation\"), never a bare tab name like \"setup\". \
-SUPPORTED physics that must never be marked missing: heat conduction, convection boundaries, transient heating/cooling, internal heat generation, linear and plastic stress, vibration (modal, harmonic, shock response spectrum, random PSD), high-cycle fatigue, buckling, \
+SUPPORTed physics that must never be marked missing: heat conduction, convection boundaries, transient heating/cooling, internal heat generation, linear and plastic stress, vibration (modal, harmonic, shock response spectrum, random PSD), high-cycle fatigue, buckling, \
 electrostatics, DC current and Joule heating, magnetostatics, laminar flow, full-wave EM at one frequency (FDTD) and microwave/dielectric heating. \
 Pick physically sensible materials from the library (food or water-rich items ≈ Water; PCBs: import the KiCad board with import_kicad when available, otherwise FR-4 with Copper). Use realistic element sizes (a few mm for parts of tens of mm). \
 Do not add steps for settings SimCraft handles automatically (solver tolerances, convergence settings). \
@@ -243,13 +354,21 @@ current heating → thermal_electric; microwave ovens, RF/dielectric heating →
 `inputs_needed` lists what the user must provide (dimensions, CAD/STL, material data, operating conditions). \
 `missing_capabilities` lists features SimCraft would need to do the job properly. Be concise and specific.";
 
-/// Ask the local model for a plan.
+/// Ask the local model for a plan (without live context).
 pub fn plan(goal: &str, model: &str) -> Result<Plan> {
+    plan_with_context(goal, model, None)
+}
+
+/// Ask the local model for a plan and optional executable tool actions grounded with live model context.
+pub fn plan_with_context(goal: &str, model: &str, context: Option<&Value>) -> Result<Plan> {
     if goal.trim().is_empty() {
         bail!("describe what you want to simulate");
     }
     let gaps = known_gaps(goal);
     let mut system = format!("{INSTRUCTIONS}\n\nSIMCRAFT CAPABILITIES\n{}", capabilities());
+    if let Some(ctx) = context {
+        system += &format!("\n\nLIVE SESSION CONTEXT\n{}", serde_json::to_string_pretty(ctx).unwrap_or_default());
+    }
     if !gaps.is_empty() {
         system += &format!("\n\nCAPABILITY CHECK for this request — these are NOT available in SimCraft and the plan must mark the related steps `missing` or `workaround`:\n- {}", gaps.join("\n- "));
     }

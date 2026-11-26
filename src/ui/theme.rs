@@ -83,21 +83,144 @@ pub fn install_style(ctx: &egui::Context) {
     });
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UnitSystem {
+    #[default]
+    MmNMpa,
+    MNPa,
+    InLbfPsi,
+}
+
+impl UnitSystem {
+    pub const ALL: [UnitSystem; 3] = [UnitSystem::MmNMpa, UnitSystem::MNPa, UnitSystem::InLbfPsi];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            UnitSystem::MmNMpa => "mm",
+            UnitSystem::MNPa => "m",
+            UnitSystem::InLbfPsi => "in",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Self {
+        match k {
+            "m" => UnitSystem::MNPa,
+            "in" => UnitSystem::InLbfPsi,
+            _ => UnitSystem::MmNMpa,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UnitSystem::MmNMpa => "mm · N · MPa",
+            UnitSystem::MNPa => "m · N · Pa",
+            UnitSystem::InLbfPsi => "in · lbf · psi",
+        }
+    }
+
+    /// Display = internal_mm * len_scale().
+    pub fn len_scale(self) -> f64 {
+        match self {
+            UnitSystem::MmNMpa => 1.0,
+            UnitSystem::MNPa => 0.001,
+            UnitSystem::InLbfPsi => 1.0 / 25.4,
+        }
+    }
+
+    pub fn len_suffix(self) -> &'static str {
+        match self {
+            UnitSystem::MmNMpa => " mm",
+            UnitSystem::MNPa => " m",
+            UnitSystem::InLbfPsi => " in",
+        }
+    }
+
+    pub fn area_scale(self) -> f64 {
+        let s = self.len_scale();
+        s * s
+    }
+
+    pub fn area_suffix(self) -> &'static str {
+        match self {
+            UnitSystem::MmNMpa => "mm²",
+            UnitSystem::MNPa => "m²",
+            UnitSystem::InLbfPsi => "in²",
+        }
+    }
+
+    /// Display = internal_N * force_scale().
+    pub fn force_scale(self) -> f64 {
+        match self {
+            UnitSystem::MmNMpa | UnitSystem::MNPa => 1.0,
+            UnitSystem::InLbfPsi => 0.224_808_943_1,
+        }
+    }
+
+    pub fn force_suffix(self) -> &'static str {
+        match self {
+            UnitSystem::MmNMpa | UnitSystem::MNPa => " N",
+            UnitSystem::InLbfPsi => " lbf",
+        }
+    }
+
+    /// Display = internal_MPa * stress_scale().
+    pub fn stress_scale(self) -> f64 {
+        match self {
+            UnitSystem::MmNMpa => 1.0,
+            UnitSystem::MNPa => 1.0e6,
+            UnitSystem::InLbfPsi => 145.037_737_7,
+        }
+    }
+
+    pub fn stress_suffix(self) -> &'static str {
+        match self {
+            UnitSystem::MmNMpa => " MPa",
+            UnitSystem::MNPa => " Pa",
+            UnitSystem::InLbfPsi => " psi",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UiPrefs {
+    pub dark_mode: Option<bool>,
+    pub unit_system: UnitSystem,
+    pub trackpad_pan: bool,
+}
+
 fn settings_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
     Some(base.join("simcraft").join("settings.json"))
 }
 
-pub fn load_dark_pref() -> Option<bool> {
-    let t = std::fs::read_to_string(settings_path()?).ok()?;
-    serde_json::from_str::<Value>(&t).ok()?.get("dark_mode")?.as_bool()
+pub fn load_prefs() -> UiPrefs {
+    let Some(p) = settings_path() else { return UiPrefs::default() };
+    let Ok(t) = std::fs::read_to_string(p) else { return UiPrefs::default() };
+    let Ok(v) = serde_json::from_str::<Value>(&t) else { return UiPrefs::default() };
+    UiPrefs {
+        dark_mode: v.get("dark_mode").and_then(|x| x.as_bool()),
+        unit_system: v.get("unit_system").and_then(|x| x.as_str()).map(UnitSystem::from_key).unwrap_or_default(),
+        trackpad_pan: v.get("trackpad_pan").and_then(|x| x.as_bool()).unwrap_or(false),
+    }
+}
+
+pub fn save_prefs(prefs: &UiPrefs) {
+    if let Some(p) = settings_path() {
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        let mut v = std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).unwrap_or_else(|| json!({}));
+        if let Some(d) = prefs.dark_mode {
+            v["dark_mode"] = json!(d);
+        }
+        v["unit_system"] = json!(prefs.unit_system.key());
+        v["trackpad_pan"] = json!(prefs.trackpad_pan);
+        let _ = std::fs::write(p, v.to_string());
+    }
 }
 
 pub fn save_dark_pref(dark: bool) {
-    if let Some(p) = settings_path() {
-        let _ = std::fs::create_dir_all(p.parent().unwrap());
-        let _ = std::fs::write(p, json!({"dark_mode": dark}).to_string());
-    }
+    let mut prefs = load_prefs();
+    prefs.dark_mode = Some(dark);
+    save_prefs(&prefs);
 }
 
 /// Material fields editable in the app (the ones define_material accepts).
@@ -543,6 +666,47 @@ pub fn xyz(ui: &mut egui::Ui, id: &str, v: &mut [f64; 3], suffix: &str, speed: f
     });
 }
 
+pub fn drag_scaled(ui: &mut egui::Ui, v_internal: &mut f64, scale_to_display: f64, suffix: &str, speed_internal: f64, range_internal: Option<(f64, f64)>) -> bool {
+    let mut disp = *v_internal * scale_to_display;
+    let mut dv = egui::DragValue::new(&mut disp).speed((speed_internal * scale_to_display).max(1e-6)).suffix(suffix);
+    if let Some((lo, hi)) = range_internal {
+        dv = dv.range((lo * scale_to_display)..=(hi * scale_to_display));
+    }
+    if ui.add(dv).changed() {
+        *v_internal = disp / scale_to_display;
+        true
+    } else {
+        false
+    }
+}
+
+pub fn xyz_scaled(ui: &mut egui::Ui, id: &str, v_internal: &mut [f64; 3], scale_to_display: f64, suffix: &str, speed_internal: f64) -> bool {
+    let mut changed = false;
+    egui::Grid::new(id).num_columns(6).spacing([4.0, 4.0]).show(ui, |ui| {
+        for (i, c) in ["X", "Y", "Z"].iter().enumerate() {
+            ui.label(RichText::new(*c).small());
+            changed |= drag_scaled(ui, &mut v_internal[i], scale_to_display, suffix, speed_internal, None);
+        }
+        ui.end_row();
+    });
+    changed
+}
+
 pub fn primary(p: &Pal, text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_string()).color(Color32::WHITE).strong()).fill(p.accent).min_size(vec2(110.0, 30.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_system_conversions_roundtrip() {
+        let u_in = UnitSystem::InLbfPsi;
+        let mm = 25.4;
+        assert!((mm * u_in.len_scale() - 1.0).abs() < 1e-12);
+        let u_m = UnitSystem::MNPa;
+        assert!((1000.0 * u_m.len_scale() - 1.0).abs() < 1e-12);
+        assert!((1.0 * u_m.stress_scale() - 1e6).abs() < 1e-6);
+    }
 }
