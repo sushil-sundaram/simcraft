@@ -435,7 +435,7 @@ fn build_matrix(rows: Vec<Vec<u32>>) -> NodeSparse {
         ptr.push(adj.len());
     }
     let vals = vec![0.0; adj.len() * 9];
-    NodeSparse { bs: 3, ptr, adj, vals }
+    NodeSparse { bs: 3, ptr, adj, vals, hang: None }
 }
 
 /// Put 1 on the diagonal of dofs that no fine dof reaches (all-constrained coarse nodes).
@@ -819,7 +819,7 @@ impl<'a> ElasticMg<'a> {
                     }
                 }
             }
-            let mut ac = NodeSparse { bs: 3, ptr, adj, vals };
+            let mut ac = NodeSparse { bs: 3, ptr, adj, vals, hang: None };
             fix_empty_rows(&mut ac);
             ps.push(p);
             levels.push(make_level(ac, lat));

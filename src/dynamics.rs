@@ -804,6 +804,13 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
             let outs = evaluate(&u, &committed, true);
             let fint = gather(&outs, &u);
             let mut r: Vec<f64> = (0..n).map(|i| if fixed[i].is_some() { 0.0 } else { lam * f_ext[i] - fint[i] }).collect();
+            // only the independent dofs carry a residual (hanging-node forces belong to their parents)
+            mesh.condense_rhs(&mut r, 3);
+            for (ri, g) in r.iter_mut().zip(&fixed) {
+                if g.is_some() {
+                    *ri = 0.0;
+                }
+            }
             let rn = r.iter().map(|v| v * v).sum::<f64>().sqrt();
             let react = fint.iter().zip(&fixed).filter(|(_, g)| g.is_some()).map(|(f, _)| f * f).sum::<f64>().sqrt();
             let scale = (lam * fnorm).max(react).max(1e-12);

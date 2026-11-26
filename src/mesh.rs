@@ -107,6 +107,17 @@ pub struct Mesh {
     pub contacts: Vec<ContactConstraint>,
     /// Bolt pretension cut sections built from `Load::BoltPretension`.
     pub pretensions: Vec<PretensionSection>,
+    /// True when the mesh was constructed by the 2:1-balanced octree builder.
+    pub octree: bool,
+    pub max_level: u8,
+    /// Per-element octree subdivision level (empty for uniform meshes).
+    pub elem_level: Vec<u8>,
+    /// Per-element base cell side length [mm] before boundary fitting (empty for uniform meshes).
+    pub elem_size_mm: Vec<f64>,
+    /// Affine constraints on hanging nodes along 2:1 octree transitions (empty for uniform meshes).
+    pub hanging: Vec<crate::octree::HangingNode>,
+    /// Per-node integer lattice coordinates at `h / 2^max_level` (empty for uniform meshes).
+    pub node_lat: Vec<[u32; 3]>,
 }
 
 /// Local hex node index for corner offset (dx,dy,dz).
@@ -1065,6 +1076,12 @@ pub fn build_mesh_ex_model_cancellable(
         fitted: snapped_elems,
         contacts: Vec::new(),
         pretensions,
+        octree: false,
+        max_level: 0,
+        elem_level: Vec::new(),
+        elem_size_mm: Vec::new(),
+        hanging: Vec::new(),
+        node_lat: Vec::new(),
     };
     if !conservative {
         if let Some(mdl) = model {
@@ -1074,14 +1091,39 @@ pub fn build_mesh_ex_model_cancellable(
     Ok(mesh)
 }
 
-/// Mesh for a model: voxel mesh, boundary-fitted when the analysis asks for it.
+/// Mesh for a model: uniform or 2:1-balanced octree mesh, boundary-fitted when the analysis asks for it.
 pub fn build_for(model: &crate::model::Model, h: f64, max_cells: usize) -> Result<Mesh> {
     build_for_cancellable(model, h, max_cells, &NEVER_CANCEL)
 }
 
 pub fn build_for_cancellable(model: &crate::model::Model, h: f64, max_cells: usize, cancel: &AtomicBool) -> Result<Mesh> {
+    build_for_octree_adaptive_cancellable(model, h, max_cells, None, cancel)
+}
+
+pub fn build_for_octree_adaptive_cancellable(
+    model: &crate::model::Model,
+    h: f64,
+    max_cells: usize,
+    hint: Option<&crate::octree::AdaptiveHint>,
+    cancel: &AtomicBool,
+) -> Result<Mesh> {
     let fit = model.mesh_fitted();
-    let mut m = build_mesh_ex_model_cancellable(&model.bodies, h, &model.materials(), model.mesh_with_enclosure(), max_cells, fit, Some(model), cancel)?;
+    let use_octree = (model.uses_octree() || hint.is_some()) && model.analysis.kind.supports_octree();
+    let mut m = if use_octree {
+        crate::octree::build_octree_ex_model_cancellable(
+            &model.bodies,
+            h,
+            &model.materials(),
+            model.mesh_with_enclosure(),
+            max_cells,
+            fit,
+            Some(model),
+            hint,
+            cancel,
+        )?
+    } else {
+        build_mesh_ex_model_cancellable(&model.bodies, h, &model.materials(), model.mesh_with_enclosure(), max_cells, fit, Some(model), cancel)?
+    };
     if fit {
         m.fit_boundary_cancellable(&model.bodies, cancel)?;
         m.build_contact_pairs(model)?;
@@ -1118,16 +1160,34 @@ pub fn hex_det_j(x: &[V3; 8], xi: V3) -> f64 {
 }
 
 impl Mesh {
+    #[inline]
+    pub fn elem_h_mm(&self, e: usize) -> f64 {
+        self.elem_size_mm.get(e).copied().unwrap_or(self.h)
+    }
+    #[inline]
+    pub fn elem_h_m(&self, e: usize) -> f64 {
+        self.elem_h_mm(e) * 1e-3
+    }
+    pub fn min_h_mm(&self) -> f64 {
+        if self.elem_size_mm.is_empty() {
+            self.h
+        } else {
+            self.elem_size_mm.iter().copied().fold(self.h, f64::min)
+        }
+    }
+    pub fn hanging_map(&self) -> crate::octree::HangingMap {
+        crate::octree::HangingMap::build(self.nodes.len(), &self.hanging)
+    }
     pub fn is_fitted(&self, e: usize) -> bool {
         self.fitted.get(e).copied().unwrap_or(false)
     }
     pub fn elem_nodes(&self, e: usize) -> [V3; 8] {
         self.elems[e].map(|n| self.nodes[n as usize])
     }
-    /// Element volume [mm³] (h³ for cubes).
+    /// Element volume [mm³] (local h_e³ for unfitted octree/uniform cubes).
     pub fn elem_volume(&self, e: usize) -> f64 {
         if !self.is_fitted(e) {
-            return self.h.powi(3);
+            return self.elem_h_mm(e).powi(3);
         }
         let x = self.elem_nodes(e);
         let g = 0.577_350_269_189_625_8;
@@ -1150,7 +1210,21 @@ impl Mesh {
     }
 
     pub fn fit_boundary_cancellable(&mut self, bodies: &[Body], cancel: &AtomicBool) -> Result<FitReport> {
-        let h = self.h;
+        let mut node_h_old = vec![self.h; self.nodes.len()];
+        if !self.elem_size_mm.is_empty() {
+            node_h_old.fill(f64::INFINITY);
+            for (e, en) in self.elems.iter().enumerate() {
+                let he = self.elem_h_mm(e);
+                for &n in en {
+                    node_h_old[n as usize] = node_h_old[n as usize].min(he);
+                }
+            }
+            for v in &mut node_h_old {
+                if !v.is_finite() {
+                    *v = self.h;
+                }
+            }
+        }
         // elements already general (on snapped grid lines) stay general
         let pre_fitted = std::mem::take(&mut self.fitted);
         // ---- which faces need fitting: those with a node off their true surface (curved surfaces,
@@ -1166,11 +1240,12 @@ impl Mesh {
                 if f.outer {
                     return false;
                 }
+                let hf = self.elem_h_mm(f.elem as usize);
                 let (bi, lp) = self.patch_src[f.patch as usize];
                 let Some(b) = bodies.get(bi as usize) else { return false };
                 f.nodes.iter().any(|&n| {
                     let p0 = self.nodes[n as usize];
-                    b.shape.project(lp as usize, p0).is_some_and(|q| norm(sub(q, p0)) > 1e-6 * h)
+                    b.shape.project(lp as usize, p0).is_some_and(|q| norm(sub(q, p0)) > 1e-6 * hf)
                 })
             })
             .collect();
@@ -1189,6 +1264,7 @@ impl Mesh {
                 }
             }
         }
+        let mut node_h = node_h_old.clone();
         for &fi in &solid_faces {
             let f = self.faces[fi].clone();
             let nrm = dir_normal(f.dir);
@@ -1197,6 +1273,24 @@ impl Mesh {
                 if let std::collections::hash_map::Entry::Vacant(v) = prime.entry(n) {
                     v.insert(self.nodes.len() as u32);
                     self.nodes.push(self.nodes[n as usize]);
+                    if !self.node_lat.is_empty() {
+                        self.node_lat.push(self.node_lat[n as usize]);
+                    }
+                    node_h.push(node_h_old[n as usize]);
+                }
+            }
+        }
+        // Duplicate hanging constraints onto extruded `prime` surface nodes so fitted boundaries stay conforming.
+        if !self.hanging.is_empty() && !prime.is_empty() {
+            let orig_h = self.hanging.clone();
+            for hnode in orig_h {
+                if let Some(&pr_n) = prime.get(&hnode.node) {
+                    let parents = hnode
+                        .parents
+                        .iter()
+                        .map(|&(p, w)| (prime.get(&p).copied().unwrap_or(p), w))
+                        .collect();
+                    self.hanging.push(crate::octree::HangingNode { node: pr_n, parents });
                 }
             }
         }
@@ -1230,6 +1324,10 @@ impl Mesh {
             self.elem_region.push(self.elem_region[e]);
             self.elem_body.push(self.elem_body[e]);
             self.elem_cell.push(self.elem_cell[e]);
+            if !self.elem_size_mm.is_empty() {
+                self.elem_size_mm.push(self.elem_size_mm[e]);
+                self.elem_level.push(self.elem_level[e]);
+            }
             let pe = (self.elems.len() - 1) as u32;
             // exposed side faces where the pillow meets an unfitted (grid-aligned) patch
             for k in 0..4 {
@@ -1297,7 +1395,7 @@ impl Mesh {
                 }
             }
             let mv = sub(q, base[n]);
-            if ok && norm(mv) <= 1.5 * h {
+            if ok && norm(mv) <= 1.5 * node_h[n] {
                 d[n] = mv;
             }
         }
@@ -1332,7 +1430,7 @@ impl Mesh {
                     let (bi, lp) = self.patch_src[ps[0] as usize];
                     if let Some(q) = bodies.get(bi as usize).and_then(|b| b.shape.project(lp as usize, target)) {
                         let mv = sub(q, base[n]);
-                        if norm(mv) <= 1.5 * h {
+                        if norm(mv) <= 1.5 * node_h[n] {
                             d[n] = mv;
                         }
                     }
@@ -1356,7 +1454,8 @@ impl Mesh {
                     let u = scale(sd, 1.0 / l);
                     // pillow thickness the surface move already gives along this direction
                     let gap = dot(d[pr as usize], u).max(0.0);
-                    let t = (0.4 * h - gap).max(0.1 * h);
+                    let nh = node_h[o];
+                    let t = (0.4 * nh - gap).max(0.1 * nh);
                     d[o] = scale(u, -t);
                 }
             }
@@ -1392,13 +1491,26 @@ impl Mesh {
                 }
             }
         }
+        let sync_hanging = |d: &mut [V3], hanging: &[crate::octree::HangingNode]| {
+            for hn in hanging {
+                let mut p_new = [0.0; 3];
+                for &(p, w) in &hn.parents {
+                    let pos_p = add(base[p as usize], d[p as usize]);
+                    p_new = add(p_new, scale(pos_p, w));
+                }
+                d[hn.node as usize] = sub(p_new, base[hn.node as usize]);
+            }
+        };
+        if !self.hanging.is_empty() {
+            sync_hanging(&mut d, &self.hanging);
+        }
         // keep every element valid: min corner det J ≥ MIN_QUALITY × the cube's
         let ne = self.elems.len();
-        let cube = (h / 2.0).powi(3);
+        let elem_cubes: Vec<f64> = (0..ne).map(|e| (self.elem_h_mm(e) / 2.0).powi(3)).collect();
         let corners: Vec<V3> = CORNER.iter().map(|c| c.map(|v| 2.0 * v as f64 - 1.0)).collect();
         let quality = |e: usize, d: &[V3]| -> f64 {
             let x = self.elems[e].map(|n| add(base[n as usize], d[n as usize]));
-            corners.iter().map(|xi| hex_det_j(&x, *xi)).fold(f64::INFINITY, f64::min) / cube
+            corners.iter().map(|xi| hex_det_j(&x, *xi)).fold(f64::INFINITY, f64::min) / elem_cubes[e]
         };
         let touched = |e: usize, d: &[V3]| self.elems[e].iter().any(|&n| norm(d[n as usize]) > 0.0);
         let mut relaxed = vec![false; ne];
@@ -1414,14 +1526,18 @@ impl Mesh {
                     let n = n as usize;
                     if prime.contains_key(&(n as u32)) {
                         // voxel-surface node: keep ≥ 0.1 h of the inward step so the pillow has thickness
+                        let nh = node_h[n];
                         let l = norm(d[n]);
-                        if l > 0.1 * h {
-                            d[n] = scale(d[n], (0.5f64).max(0.1 * h / l));
+                        if l > 0.1 * nh {
+                            d[n] = scale(d[n], (0.5f64).max(0.1 * nh / l));
                         }
                     } else {
                         d[n] = if round >= 6 { [0.0; 3] } else { scale(d[n], 0.5) };
                     }
                 }
+            }
+            if !self.hanging.is_empty() {
+                sync_hanging(&mut d, &self.hanging);
             }
         }
         let mut rep = FitReport::default();
@@ -1470,7 +1586,7 @@ impl Mesh {
                 let solid = |f: &&BFace| !f.outer && f.dir as usize == d;
                 let ext = self.faces.iter().filter(solid).map(|f| f.center[a]).fold(if d % 2 == 0 { f64::INFINITY } else { f64::NEG_INFINITY }, |acc, v| if d % 2 == 0 { acc.min(v) } else { acc.max(v) });
                 for (i, f) in self.faces.iter().enumerate() {
-                    if !f.outer && f.dir as usize == d && (f.center[a] - ext).abs() < self.h * 0.25 {
+                    if !f.outer && f.dir as usize == d && (f.center[a] - ext).abs() < self.elem_h_mm(f.elem as usize) * 0.25 {
                         out.push(i as u32);
                     }
                 }
@@ -1528,12 +1644,29 @@ impl Mesh {
     }
 
     pub fn volume_mm3(&self) -> f64 {
-        self.elem_region.iter().filter(|r| **r == REGION_SOLID).count() as f64 * self.h.powi(3)
+        if !self.octree && self.fitted.is_empty() {
+            return self.elem_region.iter().filter(|r| **r == REGION_SOLID).count() as f64 * self.h.powi(3);
+        }
+        (0..self.elems.len())
+            .filter(|&e| self.elem_region[e] == REGION_SOLID)
+            .map(|e| self.elem_volume(e))
+            .sum()
     }
 
     pub fn elem_center(&self, e: usize) -> V3 {
-        let c = self.elem_cell[e];
-        [self.origin[0] + (c[0] as f64 + 0.5) * self.h, self.origin[1] + (c[1] as f64 + 0.5) * self.h, self.origin[2] + (c[2] as f64 + 0.5) * self.h]
+        if !self.octree && self.fitted.is_empty() {
+            let c = self.elem_cell[e];
+            return [
+                self.origin[0] + (c[0] as f64 + 0.5) * self.h,
+                self.origin[1] + (c[1] as f64 + 0.5) * self.h,
+                self.origin[2] + (c[2] as f64 + 0.5) * self.h,
+            ];
+        }
+        let mut s = [0.0; 3];
+        for &n in &self.elems[e] {
+            s = add(s, self.nodes[n as usize]);
+        }
+        scale(s, 0.125)
     }
 
     /// Trilinear shape-function weights for the 8 nodes of a hexahedron at reference `xi in [-1, 1]^3`.
@@ -1551,8 +1684,9 @@ impl Mesh {
         let en = self.elems[e];
         let x: [V3; 8] = en.map(|n| self.nodes[n as usize]);
         let mut xi = [0.0f64; 3];
-        let h2 = (self.h * 1e-8).powi(2);
-        let det_min = (self.h.max(1e-6) * 1e-4).powi(3);
+        let he = self.elem_h_mm(e);
+        let h2 = (he * 1e-8).powi(2);
+        let det_min = (he.max(1e-6) * 1e-4).powi(3);
         for _ in 0..8 {
             let w = Self::trilin_weights(xi);
             let mut pos = [0.0; 3];
@@ -1641,12 +1775,13 @@ impl Mesh {
             })
             .collect();
 
-        let eps_in = 1e-4 * self.h;
+        let eps_in = 1e-4 * self.min_h_mm();
         pts.iter()
             .map(|&p| {
                 let mut near: Option<(f64, usize, [f64; 8])> = None;
                 for &(e, lo, hi) in &cands {
-                    if (0..3).any(|k| p[k] < lo[k] - pad || p[k] > hi[k] + pad) {
+                    let e_pad = 0.08 * self.elem_h_mm(e);
+                    if (0..3).any(|k| p[k] < lo[k] - e_pad || p[k] > hi[k] + e_pad) {
                         continue;
                     }
                     let strict_box = (0..3).all(|k| p[k] >= lo[k] - eps_in && p[k] <= hi[k] + eps_in);

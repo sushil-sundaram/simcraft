@@ -11,6 +11,140 @@ pub struct NodeSparse {
     pub ptr: Vec<usize>,
     pub adj: Vec<u32>,
     pub vals: Vec<f64>,
+    /// Hanging-node constraints of an octree mesh (`u = C q`): [`Solver`] condenses the system
+    /// to the independent dofs and expands the solution. `None` for conforming meshes.
+    pub hang: Option<std::sync::Arc<Hanging>>,
+}
+
+/// Affine hanging-node constraints `u[node] = Σ w·u[parent]` with every parent independent.
+pub struct Hanging {
+    pub nodes: Vec<(u32, Vec<(u32, f64)>)>,
+    index: std::collections::HashMap<u32, usize>,
+}
+
+impl Hanging {
+    pub fn new(nodes: Vec<(u32, Vec<(u32, f64)>)>) -> Self {
+        let index = nodes.iter().enumerate().map(|(i, t)| (t.0, i)).collect();
+        Hanging { nodes, index }
+    }
+
+    pub fn is_hanging(&self, n: u32) -> bool {
+        self.index.contains_key(&n)
+    }
+
+    fn terms(&self, n: u32) -> std::borrow::Cow<'_, [(u32, f64)]> {
+        match self.index.get(&n) {
+            Some(&i) => std::borrow::Cow::Borrowed(&self.nodes[i].1),
+            None => std::borrow::Cow::Owned(vec![(n, 1.0)]),
+        }
+    }
+
+    /// `Cᵀ K C` in the full numbering: hanging rows/columns are decoupled, with a typical
+    /// diagonal so the system stays well scaled.
+    pub fn condense(&self, k: &NodeSparse) -> NodeSparse {
+        let bs = k.bs;
+        let nrow = k.ptr.len() - 1;
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); nrow];
+        for a in 0..nrow {
+            let ta = self.terms(a as u32);
+            for &b in &k.adj[k.ptr[a]..k.ptr[a + 1]] {
+                let tb = self.terms(b);
+                for &(i, _) in ta.iter() {
+                    for &(j, _) in tb.iter() {
+                        lists[i as usize].push(j);
+                    }
+                }
+            }
+        }
+        let mut ptr = Vec::with_capacity(nrow + 1);
+        let mut adj = Vec::new();
+        ptr.push(0);
+        for (i, l) in lists.iter_mut().enumerate() {
+            if self.is_hanging(i as u32) {
+                l.clear();
+            }
+            l.push(i as u32);
+            l.sort_unstable();
+            l.dedup();
+            adj.extend_from_slice(l);
+            ptr.push(adj.len());
+        }
+        let vals = vec![0.0; adj.len() * bs * bs];
+        let mut out = NodeSparse { bs, ptr, adj, vals, hang: None };
+        let mut blk = vec![0.0; bs * bs];
+        let mut tmp = vec![0.0; bs * bs];
+        for a in 0..nrow {
+            let ta = self.terms(a as u32);
+            let deg = k.ptr[a + 1] - k.ptr[a];
+            for (pos, &b) in k.adj[k.ptr[a]..k.ptr[a + 1]].iter().enumerate() {
+                for c in 0..bs {
+                    let rs = k.ptr[a] * bs * bs + c * deg * bs + pos * bs;
+                    blk[c * bs..(c + 1) * bs].copy_from_slice(&k.vals[rs..rs + bs]);
+                }
+                if blk.iter().all(|v| *v == 0.0) {
+                    continue;
+                }
+                let tb = self.terms(b);
+                for &(i, wi) in ta.iter() {
+                    for &(j, wj) in tb.iter() {
+                        let s = wi * wj;
+                        for (t, v) in tmp.iter_mut().zip(&blk) {
+                            *t = v * s;
+                        }
+                        out.add_block(i as usize, j as usize, &tmp);
+                    }
+                }
+            }
+        }
+        let d = out.diag();
+        let mut avg = vec![0.0; bs];
+        let mut cnt = vec![0usize; bs];
+        for (dof, v) in d.iter().enumerate() {
+            if *v != 0.0 && !self.is_hanging((dof / bs) as u32) {
+                avg[dof % bs] += v.abs();
+                cnt[dof % bs] += 1;
+            }
+        }
+        for c in 0..bs {
+            avg[c] = if cnt[c] > 0 { avg[c] / cnt[c] as f64 } else { 1.0 };
+        }
+        for (h, _) in &self.nodes {
+            for (c, a) in avg.iter().enumerate() {
+                out.add_diag(*h as usize * bs + c, *a);
+            }
+        }
+        out
+    }
+
+    /// `f ← Cᵀ f` in the full numbering (hanging entries moved onto their parents, then zeroed).
+    pub fn condense_rhs(&self, f: &mut [f64], bs: usize) {
+        for (h, terms) in &self.nodes {
+            for c in 0..bs {
+                let i = *h as usize * bs + c;
+                if i >= f.len() {
+                    continue;
+                }
+                let v = std::mem::take(&mut f[i]);
+                if v != 0.0 {
+                    for &(p, w) in terms {
+                        f[p as usize * bs + c] += w * v;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `u ← C u`: every hanging dof interpolated from its parents.
+    pub fn expand(&self, u: &mut [f64], bs: usize) {
+        for (h, terms) in &self.nodes {
+            for c in 0..bs {
+                let i = *h as usize * bs + c;
+                if i < u.len() {
+                    u[i] = terms.iter().map(|&(p, w)| w * u[p as usize * bs + c]).sum();
+                }
+            }
+        }
+    }
 }
 
 impl NodeSparse {
@@ -46,12 +180,12 @@ impl NodeSparse {
             ptr.push(adj.len());
         }
         let vals = vec![0.0; adj.len() * bs * bs];
-        NodeSparse { bs, ptr, adj, vals }
+        NodeSparse { bs, ptr, adj, vals, hang: None }
     }
 
     /// Copy sparsity pattern with all values reset to zero.
     pub fn empty_like(&self) -> Self {
-        NodeSparse { bs: self.bs, ptr: self.ptr.clone(), adj: self.adj.clone(), vals: vec![0.0; self.vals.len()] }
+        NodeSparse { bs: self.bs, ptr: self.ptr.clone(), adj: self.adj.clone(), vals: vec![0.0; self.vals.len()], hang: self.hang.clone() }
     }
 
     /// Add a bs × bs row-major block into entry `(row_node, col_node)`.
@@ -160,6 +294,23 @@ impl NodeSparse {
     /// puts 1 on the diagonal.
     pub fn apply_dirichlet(&mut self, fixed: &[Option<f64>], f: &mut [f64]) {
         let bs = self.bs;
+        // hanging dofs follow their parents: never prescribe them directly
+        let released: Vec<Option<f64>>;
+        let fixed = match &self.hang {
+            Some(h) if h.nodes.iter().any(|(n, _)| (0..bs).any(|c| fixed.get(*n as usize * bs + c).is_some_and(|g| g.is_some()))) => {
+                let mut v = fixed.to_vec();
+                for (n, _) in &h.nodes {
+                    for c in 0..bs {
+                        if let Some(g) = v.get_mut(*n as usize * bs + c) {
+                            *g = None;
+                        }
+                    }
+                }
+                released = v;
+                &released[..]
+            }
+            _ => fixed,
+        };
         // RHS correction using the original matrix (symmetric => use row r).
         for (r, g) in fixed.iter().enumerate() {
             let Some(g) = g else { continue };
@@ -585,6 +736,8 @@ pub enum Solver {
     Direct(Factor),
     Iterative,
     Gpu(crate::gpu::GpuSystem),
+    /// Octree system with hanging nodes: solves `CᵀAC q = Cᵀb` and returns `x = C q`.
+    Condensed(Box<Solver>, Box<NodeSparse>, std::sync::Arc<Hanging>),
 }
 
 /// Smallest system (unknowns) sent to the GPU in Auto mode; below this the CPU is faster.
@@ -592,6 +745,11 @@ pub const GPU_AUTO_MIN: usize = 50_000;
 
 impl Solver {
     pub fn new(a: &NodeSparse) -> Result<Solver> {
+        if let Some(h) = &a.hang {
+            let ac = h.condense(a);
+            let inner = Solver::new(&ac)?;
+            return Ok(Solver::Condensed(Box::new(inner), Box::new(ac), h.clone()));
+        }
         use crate::gpu::{ComputeMode, GpuSystem};
         let mode = crate::gpu::mode();
         if std::env::var("SIMCRAFT_ITERATIVE").is_ok() && mode == ComputeMode::Cpu {
@@ -629,10 +787,14 @@ impl Solver {
             Solver::Direct(_) => "direct sparse Cholesky (CPU)".into(),
             Solver::Iterative => "Jacobi-PCG iterative (CPU)".into(),
             Solver::Gpu(g) => format!("Jacobi-PCG iterative (GPU: {})", g.device_name),
+            Solver::Condensed(s, ..) => s.name(),
         }
     }
     pub fn on_gpu(&self) -> bool {
-        matches!(self, Solver::Gpu(_))
+        match self {
+            Solver::Condensed(s, ..) => s.on_gpu(),
+            s => matches!(s, Solver::Gpu(_)),
+        }
     }
     /// Solve a x = b; `x` holds the initial guess for the iterative path.
     pub fn solve(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, progress: &(dyn Fn(f64) -> Result<()> + Sync)) -> Result<usize> {
@@ -643,6 +805,13 @@ impl Solver {
     }
     fn solve_inner(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, progress: &(dyn Fn(f64) -> Result<()> + Sync)) -> Result<usize> {
         match self {
+            Solver::Condensed(inner, ac, h) => {
+                let mut bc = b.to_vec();
+                h.condense_rhs(&mut bc, ac.bs);
+                let n = inner.solve_inner(ac, &bc, x, tol, progress)?;
+                h.expand(x, ac.bs);
+                Ok(n)
+            }
             Solver::Direct(f) => {
                 progress(0.0)?;
                 let r = f.solve(b);
