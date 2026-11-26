@@ -457,7 +457,7 @@ pub fn optimize(model: &Model, params: Vec<Parameter>, objective: Objective, con
         let i = runs.len();
         prog(i as f64 / budget as f64, &format!("design {}/{budget}", i + 1));
         let mut run = eval_run(model, &params, denorm(&params, &u), &responses, phase);
-        run.feasible = run.error.is_none() && violation(&constraints, &run.responses, 1).is_some_and(|v| v <= 1e-9);
+        run.feasible = run.error.is_none() && run.responses[0].is_some_and(|v| v.is_finite()) && violation(&constraints, &run.responses, 1).is_some_and(|v| v <= 1e-9);
         if scale.is_none() {
             if let Some(o) = run.responses[0] {
                 *scale = Some(o.abs().max(1e-12));

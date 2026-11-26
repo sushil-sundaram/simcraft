@@ -53,6 +53,8 @@ Sizes: **S** ≈ one session, **M** ≈ 2–3, **L** ≈ 4–6, **XL** > 6.
 | P2.10 | Eddy currents and induction heating | L | needs edge elements | planned |
 | P2.11 | Shell elements for sheet bodies | L | depends on P2.3 (STEP sheet bodies) | planned |
 
+See also the **Platform, Security, UX & Architecture track** below (`P2.S`, `P2.A1`, `P2.A2`, `P2.U`, `P2.W`; checklist in `todo.md`) — `P2.S` and `P2.A1` are prerequisites before `P2.3` (STEP) and `P2.5` (octree).
+
 ### P2.0 Benchmark suite (S–M) — done
 
 `src/bench.rs`, `simcraft bench`: 24 cases (structural incl. NAFEMS LE1, thermal incl. NAFEMS T4,
@@ -217,6 +219,115 @@ surface-to-surface radiation across the CHT fluid, spectral / specular surfaces.
 - MITC4 shells for sheet bodies from STEP (P2.3) or a plate primitive, connected to solids by
   bonded edges; thickness as a property.
 - **Validate**: Scordelis–Lo roof, pinched cylinder, plate bending vs Kirchhoff theory.
+
+## Platform, Security, UX & Architecture (audit, 2026-11-26)
+
+Full line-by-line checklists live in `todo.md`. Two deployment targets were audited:
+- **Native laptop/desktop app (current target):** Pure-Rust native RAM/CPU + hybrid iGPU/dGPU
+  power design (`main.rs::prefer_integrated_gpu`, on-demand Vulkan dGPU in `gpu.rs`) + `Core::call`
+  are strong foundations, needing a hardware iGPU viewport (`P2.A2`), background meshing (`P2.A1`),
+  and cross-platform `f32`/`f64` GPU adapter splitting.
+- **Browser web app (laptop/desktop):** Compiling `eframe`/`egui` + CPU `render.rs` + `SHADER_F64`
+  `gpu.rs` directly to WASM is **not** viable long-term (browser WebGPU lacks `f64`, WASM hits 4 GB
+  before 2M–12M cells, CPU rasterization drains battery). `Core::call` instead enables a clean
+  split (`P2.W`): Web DOM + Three.js/WebGL2 frontend over a Rust compute backend (or Tauri).
+
+| # | Item | Size | Why / depends on | State |
+|---|---|---|---|---|
+| P2.S | Security, path sandboxing & parser DoS hardening | S–M | blocks untrusted `.simcraft`/`.stl`/`.kicad_pcb`/MCP risk; prerequisite for web/STEP | done |
+| P2.A1 | Non-blocking meshing, STL BVH, `f32`/`f64` GPU split, undo & cancel cleanup | M | prevents UI freezes and panic-unwind hazards before `P2.3` (STEP) and `P2.5` (octree) | planned |
+| P2.A2 | Hardware iGPU 3D viewport (`glow`/`wgpu`) + modular `gui.rs` / `egui_dock` | M–L | replaces 0.6× CPU `render.rs` drag rasterizer; unlocks smooth animations, transparency, gizmos | planned |
+| P2.U | CAE UX overhaul (3D glyphs, body pick/hide, unified edit forms, pre-flight, trackpad, Copilot) | M–L | best after `P2.A2` (hardware viewport + docked drawers) | planned |
+| P2.W | Web / Tauri split architecture (DOM + WebGL2/WebGPU UI + `axum` Rust backend / demo WASM) | L–XL | required for browser laptop/desktop delivery; depends on `P2.S` and `P2.A1` | planned |
+
+### P2.S Security, path sandboxing & parser hardening (S–M) — done
+
+- **Path trust boundaries (`session.rs`)**: Enforce an explicit workspace root (`--workspace` /
+  `SIMCRAFT_WORKSPACE`) for MCP/headless file tools (`open_project`, `save_project`, `import_stl`,
+  `import_kicad`, `pcb_nets`, `pcb_dc`, `export_vtk`, `make_report`, `topology_optimize`
+  `export_path`), restrict extensions, and prompt before `Session::open` loads external
+  `Shape::Stl` / `Shape::Pcb` paths embedded inside untrusted `.simcraft` files.
+- **IPC & temp-file hardening (`bridge.rs`, `mcp.rs`, `pysimcraft`)**: Replace `/dev/urandom` + FNV
+  fallback in `random_token()` with `getrandom`; enforce `0o600` on existing token files and drop
+  the shared `temp_dir()` token fallback; cap concurrent bridge threads, add auth/read timeouts and
+  client line-length limits (or migrate to `0o600` Unix domain sockets / named pipes); replace
+  predictable `simcraft-handoff-{pid}.simcraft` in `mcp::launch_gui` with `NamedTempFile`.
+- **Parser, mesh & study bounds (`geometry.rs`, `kicad.rs`, `mesh.rs`, `study.rs`)**:
+  - Reject `!is_finite()` (`NaN`/`Inf`) in `Shape::validate()`, `mesh::build_mesh_ex` (`h`), and all
+    tool inputs; use `checked_mul` for `dims[0] * dims[1] * dims[2]` and binary STL `n * 50`.
+  - Cap STL / `.kicad_pcb` file sizes; bound S-expression nesting depth + iterative `Drop` on `Sx`
+    to prevent stack overflow; clamp KiCad 5 arc subdivisions (`kicad.rs:236`) and enforce a
+    `MAX_PIXELS` cap on `PcbData::from_text` (`nx * ny`) for extreme aspect ratios.
+  - Require `run.responses[0].is_some()` in `study::optimize`'s `feasible` check (`study.rs:460`).
+- **Escaping, SSRF & shared-state safety (`bench.rs`, `assistant.rs`, `gpu.rs`, `elastic_mg.rs`)**:
+  - Escape `"` and `'` in `bench::esc` and escape all report metadata fields.
+  - Move `gpu::MODE`, `LAST_DEVICE`, `FALLBACK` from process-global statics to per-session/solve
+    context; allowlist/validate LLM URLs and cap `ureq` response bodies in `assistant.rs`; add
+    `debug_assert!` bounds/disjointness checks around `SyncPtr` in `elastic_mg.rs`.
+- **Validate**: Regression tests with malformed/extreme-aspect/deeply-nested `.kicad_pcb`, `NaN`/`Inf`
+  and huge-dim `.stl`/CSG inputs, path-traversal rejections, and `cargo test --release`.
+
+### P2.A1 Non-blocking engine, STL BVH, GPU adapter split & undo/cancel cleanup (M)
+
+- **Off-UI-thread meshing & KiCad inspection (`gui.rs`, `geometry.rs`)**: Move `ensure_mesh()` out
+  of `viewport()` (`gui.rs:3796`) and `net_pads()` out of `open_pcb_dc()` (`gui.rs:2325`) onto
+  cancellable background jobs so large meshes/CAD never freeze the window; build a triangle BVH in
+  `load_stl` so `Shape::Stl::{project, best_patch}` and `x_crossings` run in O(log T) instead of
+  O(T).
+- **Cross-platform laptop GPU selection (`gpu.rs`, `fdtd.rs`)**: Split `pick_adapter(require_f64)`
+  so `f32` `fdtd.rs` uses `wgpu::Backends::PRIMARY` without requiring `SHADER_F64` (unlocking Apple
+  Silicon Metal, Windows DX12, and integrated GPUs), reserving `SHADER_F64` for `gpu.rs` PCG (with
+  a future mixed-precision `f32` fallback).
+- **Undo & cancellation refactor (`session.rs`)**: Replace double `serde_json::to_string(&s.model)`
+  undo diffing (`session.rs:517-523`) with explicit mutation/command tracking before `P2.3` (STEP
+  B-reps) lands; migrate `check_cancel()` (`session.rs:1761-1765`) from `panic::resume_unwind` to
+  cooperative `&AtomicBool` checks returning `Result` so `P2.5` (octree) and `P2.8` (transient CFD)
+  can cancel cleanly inside parallel `rayon` loops.
+- **Validate**: Non-blocking UI responsiveness during >500k-cell mesh generation; GPU FDTD passes
+  on Metal/DX12/non-`f64` adapters; cancellation tests inside parallel loops leave no poisoned state.
+
+### P2.A2 Hardware iGPU 3D viewport & modular UI shell (M–L)
+
+- **Hardware 3D viewport (`gui.rs`, `render.rs`)**: Replace CPU RGBA texture uploads (`render::rasterize`
+  + `0.6×` drag downscaling) with an `egui::PaintCallback` (`glow` or `wgpu` on the integrated GPU,
+  keeping `prefer_integrated_gpu()` battery savings). Upload mesh vertex buffers, nodal scalars, and
+  deformations once so orbit, mode animation (currently rebuilding `Scene` every frame via `skey` at
+  `gui.rs:3890`), MSAA, perspective toggle, translucent enclosures, and section cuts run at 60+ FPS.
+  Keep `render::render_png` for headless MCP `render_image` and HTML reports.
+- **Modularize `gui.rs`**: Split the 4,421-line file into `ui/{header,ribbon,browser,properties,viewport,charts,dialogs}.rs`
+  and replace overlapping floating `egui::Window` popups (`Study`, `Help`, `Planner`, `PCB DC`,
+  `History`) with dockable/bottom drawers (`egui_dock` + `egui_plot`).
+
+### P2.U CAE UX overhaul (M–L)
+
+- **3D clarity & direct manipulation**: Instanced 3D load/BC glyphs (force vectors, pressure normals,
+  constraint pins, fluid inlet arrows, coil axes); hover face/body highlight + body selection mode +
+  right-click depth-peeling for hidden faces; per-body hide/ghost/isolate toggles in the Browser
+  (essential for enclosures and `P2.3` assemblies); live ghost previews + 3D transform gizmos before
+  `Create` on primitives/enclosures; ViewCube alongside axis triad.
+- **Unified forms & pre-flight diagnostics**: Replace the raw `json_editor` fallback in `item_editor`
+  (`gui.rs:390, 2934`) with the same unit-aware, face-picker forms used during creation; add a live
+  pre-solve readiness checklist (`✓ Solid · ✓ Material · ✗ Needs Support · ⚠ Mesh > λ/10`); group
+  KiCad component bodies under their board in a searchable Browser.
+- **Laptop trackpad ergonomics & unified AI Copilot**: Support `Space+drag` / two-finger pan,
+  pinch-to-zoom, view/tool shortcuts (`F`, `1–6`, `Del`, `Esc`), unit-system switcher, and unify
+  `✨ Planner` + `Connect AI` into an in-app Copilot drawer proposing undoable tool actions.
+
+### P2.W Web / Tauri split architecture (L–XL)
+
+- **Why not WASM-only `egui`**: Browser WebGPU WGSL lacks `f64` (`gpu.rs`), `wasm32` hits < 4 GB
+  RAM before 2M–12M cells, `rayon` requires COOP/COEP `SharedArrayBuffer`, and CPU `render.rs`
+  drains laptop battery in WASM.
+- **Target split**:
+  1. **Web Frontend (TypeScript + React/Svelte + Three.js/WebGL2 or WebGPU):** Uses `session::tool_defs()`
+     JSON schemas for UI parity, renders client-side binary mesh/field buffers (`Float32Array`) with
+     hardware picking, gizmos, and native DOM accessibility/charts.
+  2. **Rust Compute Backend (`axum` HTTP + WebSocket + binary frame streaming):** Reuses `Session` /
+     `Core::call` (after `P2.S` and `P2.A1`) for full 2M–12M cell solves and native Vulkan `f64` GPU
+     acceleration on a server or local companion daemon — or packaged with the exact same Web UI as a
+     **Tauri** native laptop app.
+  3. **Optional zero-server WASM worker:** Strip `egui`, `render.rs`, `gpu.rs`, `bridge.rs`, and `rfd`
+     behind cargo features so small-mesh demos (< ~100k cells) run offline in a WebWorker.
 
 ### Not planned (for now)
 

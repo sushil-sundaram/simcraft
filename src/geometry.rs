@@ -176,28 +176,35 @@ impl Shape {
     }
 
     pub fn validate(&self) -> Result<()> {
+        let finite = |a: &[f64]| a.iter().all(|v| v.is_finite());
         match self {
-            Shape::Box { size, .. } => {
-                if size.iter().any(|s| *s <= 0.0) {
-                    bail!("box size must be positive in every direction");
+            Shape::Box { min, size } => {
+                if !finite(min) || !finite(size) || size.iter().any(|s| *s <= 0.0) {
+                    bail!("box corner and size must be finite, and size must be positive in every direction");
                 }
             }
-            Shape::Cylinder { radius, height, .. } => {
-                if *radius <= 0.0 || *height <= 0.0 {
-                    bail!("cylinder radius and height must be positive");
+            Shape::Cylinder { base, radius, height, .. } => {
+                if !finite(base) || !radius.is_finite() || !height.is_finite() || *radius <= 0.0 || *height <= 0.0 {
+                    bail!("cylinder base, radius and height must be finite and positive");
                 }
             }
-            Shape::Sphere { radius, .. } => {
-                if *radius <= 0.0 {
-                    bail!("sphere radius must be positive");
+            Shape::Sphere { center, radius } => {
+                if !finite(center) || !radius.is_finite() || *radius <= 0.0 {
+                    bail!("sphere center and radius must be finite and positive");
                 }
             }
-            Shape::Stl { data, path, .. } => {
+            Shape::Stl { data, path, scale, offset } => {
+                if !scale.is_finite() || *scale <= 0.0 || !finite(offset) {
+                    bail!("STL '{path}' scale must be positive and offset finite");
+                }
                 if data.is_none() {
                     bail!("STL '{path}' is not loaded");
                 }
             }
-            Shape::Pcb { data, path, .. } => {
+            Shape::Pcb { data, path, offset } => {
+                if !finite(offset) {
+                    bail!("KiCad board '{path}' offset must be finite");
+                }
                 if data.is_none() {
                     bail!("KiCad board '{path}' is not loaded");
                 }
@@ -453,23 +460,39 @@ pub fn closest_point_triangle(p: V3, t: &[V3; 3]) -> V3 {
     add(a, add(scale(ab, v), scale(ac, w)))
 }
 
+const MAX_STL_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_STL_TRIS: usize = 5_000_000;
+
 /// Load an STL (binary or ASCII), apply scale + offset and segment it into smooth faces.
 pub fn load_stl(path: &str, scale_f: f64, offset: V3) -> Result<StlData> {
+    if !scale_f.is_finite() || scale_f <= 0.0 || !offset.iter().all(|v| v.is_finite()) {
+        bail!("STL scale must be finite and positive, and offset must be finite");
+    }
+    let meta = std::fs::metadata(path).with_context(|| format!("reading STL {path}"))?;
+    if meta.len() > MAX_STL_BYTES {
+        bail!("STL '{path}' is too large ({} MB; limit {} MB)", meta.len() / (1024 * 1024), MAX_STL_BYTES / (1024 * 1024));
+    }
     let bytes = std::fs::read(path).with_context(|| format!("reading STL {path}"))?;
     let mut tris: Vec<[V3; 3]> = Vec::new();
-    let is_binary = bytes.len() >= 84 && {
-        let n = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
-        84 + n * 50 == bytes.len()
-    };
+    let binary_count = (bytes.len() >= 84).then(|| u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize);
+    let is_binary = binary_count.is_some_and(|n| n.checked_mul(50).and_then(|b| b.checked_add(84)) == Some(bytes.len()));
     if is_binary {
-        let n = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
+        let n = binary_count.unwrap();
+        if n > MAX_STL_TRIS {
+            bail!("STL '{path}' has too many triangles ({n}; limit {MAX_STL_TRIS})");
+        }
+        tris.reserve(n);
         for i in 0..n {
             let o = 84 + i * 50 + 12;
             let mut t = [[0.0; 3]; 3];
             for (v, tv) in t.iter_mut().enumerate() {
                 for (k, tk) in tv.iter_mut().enumerate() {
                     let q = o + v * 12 + k * 4;
-                    *tk = f32::from_le_bytes([bytes[q], bytes[q + 1], bytes[q + 2], bytes[q + 3]]) as f64;
+                    let val = f32::from_le_bytes([bytes[q], bytes[q + 1], bytes[q + 2], bytes[q + 3]]) as f64;
+                    if !val.is_finite() {
+                        bail!("STL '{path}' contains non-finite vertex coordinates");
+                    }
+                    *tk = val;
                 }
             }
             tris.push(t);
@@ -480,11 +503,14 @@ pub fn load_stl(path: &str, scale_f: f64, offset: V3) -> Result<StlData> {
         for line in text.lines() {
             let mut it = line.split_whitespace();
             if it.next() == Some("vertex") {
-                let v: Vec<f64> = it.filter_map(|s| s.parse().ok()).collect();
+                let v: Vec<f64> = it.filter_map(|s| s.parse::<f64>().ok().filter(|x| x.is_finite())).collect();
                 if v.len() == 3 {
                     cur.push([v[0], v[1], v[2]]);
                 }
                 if cur.len() == 3 {
+                    if tris.len() >= MAX_STL_TRIS {
+                        bail!("STL '{path}' has too many triangles (limit {MAX_STL_TRIS})");
+                    }
                     tris.push([cur[0], cur[1], cur[2]]);
                     cur.clear();
                 }
@@ -497,6 +523,9 @@ pub fn load_stl(path: &str, scale_f: f64, offset: V3) -> Result<StlData> {
     for t in tris.iter_mut() {
         for v in t.iter_mut() {
             *v = add(scale(*v, scale_f), offset);
+            if !v.iter().all(|c| c.is_finite()) {
+                bail!("STL '{path}' coordinates overflow after scaling");
+            }
         }
     }
     let normals: Vec<V3> = tris

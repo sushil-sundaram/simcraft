@@ -34,6 +34,7 @@ __all__ = ["SimCraft", "Result", "SimCraftError", "connect", "find_binary"]
 __version__ = "0.1.0"
 
 DEFAULT_PORT = 47800
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 class SimCraftError(RuntimeError):
@@ -111,9 +112,11 @@ class SimCraft:
     def _roundtrip(self, obj: dict) -> dict:
         self._file.write((json.dumps(obj) + "\n").encode())
         self._file.flush()
-        line = self._file.readline()
+        line = self._file.readline(MAX_RESPONSE_BYTES + 1)
         if not line:
             raise SimCraftError("SimCraft closed the connection")
+        if len(line) > MAX_RESPONSE_BYTES or not line.endswith(b"\n"):
+            raise SimCraftError("SimCraft sent an oversized or truncated response")
         return json.loads(line)
 
     def call(self, tool: str, **args: Any) -> Result:

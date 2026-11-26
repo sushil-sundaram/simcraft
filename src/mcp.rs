@@ -125,16 +125,30 @@ fn launch_gui(local: &Shared) -> Value {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("gui");
     let has_model = !local.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).model.bodies.is_empty();
+    let mut handoff_path: Option<std::path::PathBuf> = None;
     if has_model {
-        let path = std::env::temp_dir().join(format!("simcraft-handoff-{}.simcraft", std::process::id()));
+        let tmp = match tempfile::Builder::new().prefix("simcraft-handoff-").suffix(".simcraft").tempfile() {
+            Ok(t) => t,
+            Err(e) => return content(false, format!("could not create handoff file: {e}"), None),
+        };
+        let (_, path) = match tmp.keep() {
+            Ok(p) => p,
+            Err(e) => return content(false, format!("could not keep handoff file: {e}"), None),
+        };
         let p = path.to_string_lossy().to_string();
         if let Err(e) = local.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).save(&p) {
+            let _ = std::fs::remove_file(&path);
             return content(false, format!("could not hand over model: {e}"), None);
         }
+        cmd.env("SIMCRAFT_HANDOFF_FILE", &path);
         cmd.arg(&p);
+        handoff_path = Some(path);
     }
     cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     if let Err(e) = cmd.spawn() {
+        if let Some(p) = handoff_path {
+            let _ = std::fs::remove_file(p);
+        }
         return content(false, format!("failed to start GUI: {e}"), None);
     }
     for _ in 0..60 {

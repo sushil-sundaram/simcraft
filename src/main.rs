@@ -3,29 +3,50 @@ use simcraft::{bench, bridge, gui, mcp, session};
 const HELP: &str = "SimCraft — FEA simulation
 
 USAGE:
-  simcraft [gui] [project.simcraft]   open the desktop app (default)
-  simcraft mcp                        run the MCP server on stdio (for Claude Code, Antigravity, …)
-  simcraft serve [--port N]           headless server for scripts (pysimcraft), no window
-  simcraft schema                     print every tool with its JSON schema
+  simcraft [gui] [project.simcraft]         open the desktop app (default)
+  simcraft mcp [--workspace DIR]            run the MCP server on stdio (for Claude Code, Antigravity, …)
+  simcraft serve [--port N] [--workspace DIR]
+                                            headless server for scripts (pysimcraft), no window
+  simcraft schema                           print every tool with its JSON schema
   simcraft bench [--quick] [--filter TEXT] [--out DIR] [--compare FILE] [--template]
-                                      run the benchmark suite (bench.json + bench.html in DIR,
-                                      default bench-out); --compare adds another solver's results
-                                      (JSON from --template); exits 1 if a case fails
+                                            run the benchmark suite (bench.json + bench.html in DIR,
+                                            default bench-out); --compare adds another solver's results
+                                            (JSON from --template); exits 1 if a case fails
   simcraft --help
 
 ENV:
   SIMCRAFT_PORT        local port of the GUI / headless server bridge (default 47800)
   SIMCRAFT_TOKEN_FILE  bridge token file (default ~/.config/simcraft/token)
+  SIMCRAFT_WORKSPACE   restrict MCP / headless file tools to this directory
 
 Claude Code setup:
   claude mcp add simcraft -- /path/to/simcraft mcp";
 
+fn apply_workspace_arg(args: &[String]) {
+    if let Some(i) = args.iter().position(|a| a == "--workspace") {
+        let Some(dir) = args.get(i + 1) else {
+            eprintln!("--workspace needs a directory path");
+            std::process::exit(2);
+        };
+        if !std::path::Path::new(dir).is_dir() {
+            eprintln!("--workspace '{dir}' is not an existing directory");
+            std::process::exit(2);
+        }
+        // SAFETY: start-up, single-threaded
+        unsafe { std::env::set_var("SIMCRAFT_WORKSPACE", dir) };
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(|s| s.as_str()) {
-        Some("mcp") => mcp::run(),
+        Some("mcp") => {
+            apply_workspace_arg(&args);
+            mcp::run();
+        }
         Some("schema") => println!("{}", serde_json::to_string_pretty(&session::tool_defs()).unwrap()),
         Some("serve") => {
+            apply_workspace_arg(&args);
             if let Some(i) = args.iter().position(|a| a == "--port") {
                 let Some(port) = args.get(i + 1).filter(|p| p.parse::<u16>().is_ok()) else {
                     eprintln!("--port needs a number");
