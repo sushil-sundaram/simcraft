@@ -26,6 +26,7 @@ pub mod radiation;
 pub mod results;
 pub mod session;
 pub mod sparse;
+pub mod step;
 pub mod study;
 pub mod surrogate;
 pub mod topo;

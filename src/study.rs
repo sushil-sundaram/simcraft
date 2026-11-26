@@ -125,7 +125,7 @@ fn shape_fields(shape: &Shape) -> Vec<String> {
         Shape::Box { .. } => [v3("min"), v3("size")].concat(),
         Shape::Cylinder { .. } => [v3("base"), vec!["radius".into(), "height".into()]].concat(),
         Shape::Sphere { .. } => [v3("center"), vec!["radius".into()]].concat(),
-        Shape::Stl { .. } => [vec!["scale".into()], v3("offset")].concat(),
+        Shape::Stl { .. } | Shape::Step { .. } => [vec!["scale".into()], v3("offset")].concat(),
         Shape::Pcb { .. } => v3("offset"),
     }
 }
@@ -238,10 +238,25 @@ pub fn apply(model: &Model, params: &[Parameter], values: &[f64]) -> Result<Mode
         *slot = json!(x);
     }
     let mut m: Model = serde_json::from_value(v).context("applying parameters")?;
-    // STL data is not serialized: carry it over, reloading when scale/offset changed
+    // STL / STEP data is not serialized: carry it over, reloading/translating when scale/offset changed
     for (nb, ob) in m.bodies.iter_mut().zip(&model.bodies) {
-        if let (Shape::Stl { path, scale, offset, data }, Shape::Stl { scale: os, offset: oo, data: od, .. }) = (&mut nb.shape, &ob.shape) {
-            *data = if scale == os && offset == oo { od.clone() } else { Some(Arc::new(load_stl(path, *scale, *offset)?)) };
+        match (&mut nb.shape, &ob.shape) {
+            (Shape::Stl { path, scale, offset, data }, Shape::Stl { scale: os, offset: oo, data: od, .. }) => {
+                *data = if scale == os && offset == oo { od.clone() } else { Some(Arc::new(load_stl(path, *scale, *offset)?)) };
+            }
+            (
+                Shape::Step { path, part_index, scale, offset, data, .. },
+                Shape::Step { scale: os, offset: oo, data: od, .. },
+            ) => {
+                *data = if scale == os && offset == oo {
+                    od.clone()
+                } else if scale == os {
+                    od.as_ref().map(|d| Arc::new(d.translated([offset[0] - oo[0], offset[1] - oo[1], offset[2] - oo[2]])))
+                } else {
+                    Some(Arc::new(crate::step::load_step_part(path, *part_index, *scale, *offset)?))
+                };
+            }
+            _ => {}
         }
     }
     Ok(m)

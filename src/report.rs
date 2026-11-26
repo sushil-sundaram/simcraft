@@ -70,6 +70,10 @@ fn shape_desc(s: &Shape) -> String {
         Shape::Cylinder { base, axis, radius, height } => format!("Cylinder — base ({}) mm, axis {:?}, r = {} mm, h = {} mm", v(base), axis, num(*radius), num(*height)),
         Shape::Sphere { center, radius } => format!("Sphere — centre ({}) mm, r = {} mm", v(center), num(*radius)),
         Shape::Stl { path, scale, .. } => format!("STL — {} (scale {})", esc(path), num(*scale)),
+        Shape::Step { path, part_name, scale, data, .. } => match data {
+            Some(d) => format!("STEP — {} · {} ({}, {} B-rep faces, scale {})", esc(path), esc(part_name), esc(&d.unit_name), d.faces.len(), num(*scale)),
+            None => format!("STEP — {} · {} (scale {})", esc(path), esc(part_name), num(*scale)),
+        },
         Shape::Pcb { path, data, .. } => match data {
             Some(d) => format!("KiCad board — {} ({} × {} × {} mm, {} copper layers)", esc(path), num(d.size[0]), num(d.size[1]), num(d.thickness), d.layers.len()),
             None => format!("KiCad board — {}", esc(path)),

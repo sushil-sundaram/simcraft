@@ -832,6 +832,21 @@ impl SimApp {
         }
     }
 
+    pub(super) fn import_step(&mut self) {
+        if self.core.is_busy() {
+            self.toast = Some(("Wait for the running job to finish first.".into(), true, 4.0));
+            return;
+        }
+        if let Some(p) = rfd::FileDialog::new().add_filter("STEP CAD", &["step", "stp", "STEP", "STP"]).pick_file() {
+            let core = self.core.clone();
+            let args = json!({"path": p.to_string_lossy()});
+            std::thread::spawn(move || {
+                let _ = core.call("import_step", &args);
+            });
+            self.need_fit = true;
+        }
+    }
+
     fn status(&mut self, ui: &mut egui::Ui) {
         let p = self.p;
         let pr = self.core.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();

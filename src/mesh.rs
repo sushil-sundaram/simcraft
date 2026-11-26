@@ -183,6 +183,17 @@ fn axis_planes(bodies: &[Body]) -> [Vec<f64>; 3] {
                     }
                 }
             }
+            Shape::Step { data: Some(d), .. } => {
+                for f in &d.faces {
+                    if let crate::step::StepSurfaceAnalytic::Plane { origin, normal } = f.analytic {
+                        for a in 0..3 {
+                            if normal[a].abs() > 0.999_999 {
+                                p[a].push(origin[a]);
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -203,7 +214,7 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
     let has_encl = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Enclosure);
     let with_enclosure = with_enclosure && has_encl;
     if !has_solid && !with_enclosure {
-        bail!("no geometry: add at least one body (box, cylinder, sphere or STL)");
+        bail!("no geometry: add at least one body (box, cylinder, sphere, STEP or STL)");
     }
     for b in bodies {
         b.shape.validate()?;
@@ -279,45 +290,52 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
     let center = |i: usize, j: usize, k: usize| [0.5 * (lines[0][i] + lines[0][i + 1]), 0.5 * (lines[1][j] + lines[1][j + 1]), 0.5 * (lines[2][k] + lines[2][k + 1])];
     let mat_index = |name: &str| -> i32 { materials.iter().position(|m| m.name == name).unwrap_or(0) as i32 };
 
+    fn mesh_data_of(shape: &Shape) -> Option<&StlData> {
+        match shape {
+            Shape::Stl { data: Some(d), .. } => Some(d.as_ref()),
+            Shape::Step { data: Some(d), .. } => Some(&d.mesh),
+            _ => None,
+        }
+    }
+
     // membership of each body on the grid
     let inside_of = |body: &Body| -> Result<Vec<bool>> {
         let mut v = vec![false; ncell];
-        match &body.shape {
-            Shape::Stl { data: Some(d), .. } => {
-                let cols: Vec<(usize, usize, Vec<f64>)> = (0..ny * nz)
-                    .into_par_iter()
-                    .map(|jk| -> Result<_> {
-                        if jk % 64 == 0 {
-                            check_cancel(cancel)?;
-                        }
-                        let (j, k) = (jk % ny, jk / ny);
-                        let c = center(0, j, k);
-                        Ok((j, k, d.x_crossings(c[1] + h * 1.1e-4, c[2] + h * 0.7e-4)))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                for (j, k, xs) in cols {
-                    if xs.len() < 2 {
-                        continue;
+        if let Some(d) = mesh_data_of(&body.shape) {
+            let cols: Vec<(usize, usize, Vec<f64>)> = (0..ny * nz)
+                .into_par_iter()
+                .map(|jk| -> Result<_> {
+                    if jk % 64 == 0 {
+                        check_cancel(cancel)?;
                     }
-                    for i in 0..nx {
-                        let x = center(i, j, k)[0];
-                        if xs.iter().filter(|&&q| q < x).count() % 2 == 1 {
-                            v[cid(i, j, k)] = true;
-                        }
+                    let (j, k) = (jk % ny, jk / ny);
+                    let c = center(0, j, k);
+                    Ok((j, k, d.x_crossings(c[1] + h * 1.1e-4, c[2] + h * 0.7e-4)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (j, k, xs) in cols {
+                if xs.len() < 2 {
+                    continue;
+                }
+                for i in 0..nx {
+                    let x = center(i, j, k)[0];
+                    if xs.iter().filter(|&&q| q < x).count() % 2 == 1 {
+                        v[cid(i, j, k)] = true;
                     }
                 }
             }
-            Shape::Stl { .. } => bail!("STL body '{}' is not loaded", body.name),
-            shape => {
-                v.par_iter_mut().enumerate().try_for_each(|(c, o)| -> Result<()> {
-                    if c & 4095 == 0 {
-                        check_cancel(cancel)?;
-                    }
-                    let (i, j, k) = (c % nx, (c / nx) % ny, c / (nx * ny));
-                    *o = shape.contains(center(i, j, k));
-                    Ok(())
-                })?;
-            }
+        } else if matches!(&body.shape, Shape::Stl { data: None, .. } | Shape::Step { data: None, .. }) {
+            bail!("CAD body '{}' is not loaded", body.name);
+        } else {
+            let shape = &body.shape;
+            v.par_iter_mut().enumerate().try_for_each(|(c, o)| -> Result<()> {
+                if c & 4095 == 0 {
+                    check_cancel(cancel)?;
+                }
+                let (i, j, k) = (c % nx, (c / nx) % ny, c / (nx * ny));
+                *o = shape.contains(center(i, j, k));
+                Ok(())
+            })?;
         }
         Ok(v)
     };
@@ -409,46 +427,44 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
         // membership of grid nodes (boundary counts as inside for added bodies, as outside for cuts)
         let node_in = |body: &Body, strict: bool| -> Vec<bool> {
             let mut v = vec![false; gx * gy * gz];
-            match &body.shape {
-                Shape::Stl { data: Some(d), .. } => {
-                    // a node on the surface counts as inside: rays just beside it on all four
-                    // sides in y/z (a single offset ray misses nodes on the top and y-max faces)
-                    let cols: Vec<(usize, usize, Vec<Vec<f64>>)> = (0..gy * gz)
-                        .into_par_iter()
-                        .map(|jk| {
-                            let (j, k) = (jk % gy, jk / gy);
-                            let p = node_pt(0, j, k);
-                            let (a, b) = (h * 1.1e-4, h * 0.7e-4);
-                            (j, k, [(a, b), (-a, -b), (a, -b), (-a, b)].iter().map(|(dy, dz)| d.x_crossings(p[1] + dy, p[2] + dz)).collect())
-                        })
-                        .collect();
-                    for (j, k, rays) in cols {
-                        for i in 0..gx {
-                            let x = node_pt(i, j, k)[0];
-                            let inside = rays.iter().any(|xs| {
-                                let odd = |t: f64| xs.iter().filter(|&&q| q < t).count() % 2 == 1;
-                                odd(x - eps) || odd(x + eps)
-                            });
-                            if inside {
-                                v[nid(i, j, k)] = true;
-                            }
+            if let Some(d) = mesh_data_of(&body.shape) {
+                // a node on the surface counts as inside: rays just beside it on all four
+                // sides in y/z (a single offset ray misses nodes on the top and y-max faces)
+                let cols: Vec<(usize, usize, Vec<Vec<f64>>)> = (0..gy * gz)
+                    .into_par_iter()
+                    .map(|jk| {
+                        let (j, k) = (jk % gy, jk / gy);
+                        let p = node_pt(0, j, k);
+                        let (a, b) = (h * 1.1e-4, h * 0.7e-4);
+                        (j, k, [(a, b), (-a, -b), (a, -b), (-a, b)].iter().map(|(dy, dz)| d.x_crossings(p[1] + dy, p[2] + dz)).collect())
+                    })
+                    .collect();
+                for (j, k, rays) in cols {
+                    for i in 0..gx {
+                        let x = node_pt(i, j, k)[0];
+                        let inside = rays.iter().any(|xs| {
+                            let odd = |t: f64| xs.iter().filter(|&&q| q < t).count() % 2 == 1;
+                            odd(x - eps) || odd(x + eps)
+                        });
+                        if inside {
+                            v[nid(i, j, k)] = true;
                         }
                     }
                 }
-                shape => {
-                    v.par_iter_mut().enumerate().for_each(|(g, o)| {
-                        let p = node_pt(g % gx, (g / gx) % gy, g / (gx * gy));
-                        *o = if strict {
-                            (0..6).all(|q| {
-                                let mut t = p;
-                                t[q / 2] += if q % 2 == 0 { -eps } else { eps };
-                                shape.contains(t)
-                            })
-                        } else {
-                            shape.contains(p)
-                        };
-                    });
-                }
+            } else {
+                let shape = &body.shape;
+                v.par_iter_mut().enumerate().for_each(|(g, o)| {
+                    let p = node_pt(g % gx, (g / gx) % gy, g / (gx * gy));
+                    *o = if strict {
+                        (0..6).all(|q| {
+                            let mut t = p;
+                            t[q / 2] += if q % 2 == 0 { -eps } else { eps };
+                            shape.contains(t)
+                        })
+                    } else {
+                        shape.contains(p)
+                    };
+                });
             }
             v
         };

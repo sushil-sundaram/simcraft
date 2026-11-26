@@ -187,7 +187,7 @@ How it connects: when the SimCraft window is open, every MCP tool call is forwar
 faces that the agent reads with `get_selection`. When no window is open the MCP runs headless;
 `launch_gui` opens the window and carries the current model over.
 
-Tools: `get_model`, `new_model`, `add_box`, `add_cylinder`, `add_sphere`, `import_stl`, `add_enclosure`,
+Tools: `get_model`, `new_model`, `add_box`, `add_cylinder`, `add_sphere`, `import_stl`, `import_step`, `add_enclosure`,
 `remove_body`, `list_materials`, `define_material`, `set_material`, `set_analysis`, `list_faces`,
 `add_fixed_support`, `add_displacement`, `add_compression_only_support`, `add_symmetry`, `add_force`,
 `add_pressure`, `add_gravity`, `add_temperature`, `add_heat_flux`, `add_convection`, `add_heat_generation`,
@@ -204,6 +204,7 @@ end, put 800 N down on the right end, solve, and show me the von Mises stress. I
 ## Layout
 ```
 src/geometry.rs  CSG primitives, STL loading + face segmentation
+src/step.rs      STEP AP203/AP214/AP242 B-rep importer, units & analytic faces
 src/mesh.rs      voxel hex mesher, named CAD faces
 src/fem.rs       element matrices, structural / thermal / modal solvers
 src/sparse.rs    sparse matrices, direct Cholesky, PCG, dense helpers

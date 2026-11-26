@@ -517,6 +517,20 @@ impl SimApp {
                             ui.label(RichText::new(format!("Offset ({})", lsf.trim())).small().color(p.weak));
                             xyz_scaled(ui, "eb-soff", offset, ls, "", 0.5);
                         }
+                        Shape::Step { path, part_name, scale, offset, data, .. } => {
+                            let fname = std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
+                            let unit_info = data
+                                .as_ref()
+                                .map(|d| format!(" ({}, {} B-rep faces)", d.unit_name, d.faces.len()))
+                                .unwrap_or_default();
+                            ui.label(RichText::new(format!("STEP: {fname} · {part_name}{unit_info}")).small().color(p.weak));
+                            ui.horizontal(|ui| {
+                                ui.label("Scale");
+                                ui.add(egui::DragValue::new(scale).speed(0.01).range(1e-4..=1e4));
+                            });
+                            ui.label(RichText::new(format!("Offset ({})", lsf.trim())).small().color(p.weak));
+                            xyz_scaled(ui, "eb-stepoff", offset, ls, "", 0.5);
+                        }
                         Shape::Pcb { path, offset, .. } => {
                             let fname = std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
                             ui.label(RichText::new(format!("KiCad PCB: {fname}")).small().color(p.weak));

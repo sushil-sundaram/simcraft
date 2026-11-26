@@ -160,6 +160,183 @@ pub fn cases() -> Vec<Case> {
         }),
     });
     v.push(Case {
+        id: "step_kirsch",
+        group: "Structural",
+        title: "STEP B-rep strip with circular hole in tension, d/W = 0.1: stress concentration",
+        source: "Heywood / Howland: Kt(net) = 2 + (1 − d/W)³, imported via AP214 STEP B-rep + cylindrical hole fitting",
+        sizes: vec![2.0, 1.5],
+        size_unit: "mm",
+        quick: true,
+        metrics: vec![m("step_kirsch.kt", "Kt (gross section)", (2.0 + 0.9f64.powi(3)) / 0.9, "", 0.03)],
+        run: Box::new(|hh| {
+            let step_txt = r#"ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('Quarter plate with hole'),'2;1');
+FILE_NAME('kirsch.step','2026-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));
+ENDSEC;
+DATA;
+#1 = APPLICATION_CONTEXT('automotive_design');
+#2 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#6)) GLOBAL_UNIT_ASSIGNED_CONTEXT((#3,#4,#5)) REPRESENTATION_CONTEXT('','') );
+#3 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) );
+#4 = ( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) );
+#5 = ( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() );
+#6 = UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.0E-6),#3,'','');
+#7 = APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#1);
+#8 = PRODUCT_CONTEXT('',#1,'mechanical');
+#9 = PRODUCT_DEFINITION_CONTEXT('part definition',#1,'design');
+#10 = PRODUCT('KirschPlate','KirschPlate','',(#8));
+#11 = PRODUCT_DEFINITION_FORMATION('','',#10);
+#12 = PRODUCT_DEFINITION('design','',#11,#9);
+#13 = PRODUCT_DEFINITION_SHAPE('','',#12);
+#14 = SHAPE_DEFINITION_REPRESENTATION(#13,#15);
+#15 = ADVANCED_BREP_SHAPE_REPRESENTATION('',(#16),#2);
+#16 = MANIFOLD_SOLID_BREP('KirschPlate',#17);
+#17 = CLOSED_SHELL('',(#300,#301,#302,#303,#304,#305,#306));
+#100 = CARTESIAN_POINT('',(0.,0.,0.));
+#101 = CARTESIAN_POINT('',(0.,0.,2.));
+#102 = CARTESIAN_POINT('',(10.,0.,0.));
+#103 = CARTESIAN_POINT('',(300.,0.,0.));
+#104 = CARTESIAN_POINT('',(300.,100.,0.));
+#105 = CARTESIAN_POINT('',(0.,100.,0.));
+#106 = CARTESIAN_POINT('',(0.,10.,0.));
+#107 = CARTESIAN_POINT('',(10.,0.,2.));
+#108 = CARTESIAN_POINT('',(300.,0.,2.));
+#109 = CARTESIAN_POINT('',(300.,100.,2.));
+#110 = CARTESIAN_POINT('',(0.,100.,2.));
+#111 = CARTESIAN_POINT('',(0.,10.,2.));
+#120 = DIRECTION('',(0.,0.,1.));
+#121 = DIRECTION('',(0.,0.,-1.));
+#122 = DIRECTION('',(1.,0.,0.));
+#123 = DIRECTION('',(0.,1.,0.));
+#124 = DIRECTION('',(-1.,0.,0.));
+#125 = DIRECTION('',(0.,-1.,0.));
+#130 = AXIS2_PLACEMENT_3D('',#100,#120,#122);
+#131 = AXIS2_PLACEMENT_3D('',#101,#120,#122);
+#132 = AXIS2_PLACEMENT_3D('',#100,#121,#122);
+#133 = AXIS2_PLACEMENT_3D('',#102,#125,#122);
+#134 = AXIS2_PLACEMENT_3D('',#103,#122,#123);
+#135 = AXIS2_PLACEMENT_3D('',#104,#123,#124);
+#136 = AXIS2_PLACEMENT_3D('',#105,#124,#125);
+#140 = VERTEX_POINT('',#102);
+#141 = VERTEX_POINT('',#103);
+#142 = VERTEX_POINT('',#104);
+#143 = VERTEX_POINT('',#105);
+#144 = VERTEX_POINT('',#106);
+#145 = VERTEX_POINT('',#107);
+#146 = VERTEX_POINT('',#108);
+#147 = VERTEX_POINT('',#109);
+#148 = VERTEX_POINT('',#110);
+#149 = VERTEX_POINT('',#111);
+#150 = VECTOR('',#122,1.);
+#151 = VECTOR('',#123,1.);
+#152 = VECTOR('',#124,1.);
+#153 = VECTOR('',#125,1.);
+#154 = VECTOR('',#120,1.);
+#160 = LINE('',#102,#150);
+#161 = LINE('',#103,#151);
+#162 = LINE('',#104,#152);
+#163 = LINE('',#105,#153);
+#164 = CIRCLE('',#130,10.);
+#170 = LINE('',#107,#150);
+#171 = LINE('',#108,#151);
+#172 = LINE('',#109,#152);
+#173 = LINE('',#110,#153);
+#174 = CIRCLE('',#131,10.);
+#180 = LINE('',#102,#154);
+#181 = LINE('',#103,#154);
+#182 = LINE('',#104,#154);
+#183 = LINE('',#105,#154);
+#184 = LINE('',#106,#154);
+#200 = EDGE_CURVE('',#140,#141,#160,.T.);
+#201 = EDGE_CURVE('',#141,#142,#161,.T.);
+#202 = EDGE_CURVE('',#142,#143,#162,.T.);
+#203 = EDGE_CURVE('',#143,#144,#163,.T.);
+#204 = EDGE_CURVE('',#140,#144,#164,.T.);
+#210 = EDGE_CURVE('',#145,#146,#170,.T.);
+#211 = EDGE_CURVE('',#146,#147,#171,.T.);
+#212 = EDGE_CURVE('',#147,#148,#172,.T.);
+#213 = EDGE_CURVE('',#148,#149,#173,.T.);
+#214 = EDGE_CURVE('',#145,#149,#174,.T.);
+#220 = EDGE_CURVE('',#140,#145,#180,.T.);
+#221 = EDGE_CURVE('',#141,#146,#181,.T.);
+#222 = EDGE_CURVE('',#142,#147,#182,.T.);
+#223 = EDGE_CURVE('',#143,#148,#183,.T.);
+#224 = EDGE_CURVE('',#144,#149,#184,.T.);
+#300 = ADVANCED_FACE('',(#310),#400,.T.);
+#310 = FACE_OUTER_BOUND('',#320,.T.);
+#320 = EDGE_LOOP('',(#330,#331,#332,#333,#334));
+#330 = ORIENTED_EDGE('',*,*,#200,.F.);
+#331 = ORIENTED_EDGE('',*,*,#204,.T.);
+#332 = ORIENTED_EDGE('',*,*,#203,.F.);
+#333 = ORIENTED_EDGE('',*,*,#202,.F.);
+#334 = ORIENTED_EDGE('',*,*,#201,.F.);
+#400 = PLANE('',#132);
+#301 = ADVANCED_FACE('',(#311),#401,.T.);
+#311 = FACE_OUTER_BOUND('',#321,.T.);
+#321 = EDGE_LOOP('',(#335,#336,#337,#338,#339));
+#335 = ORIENTED_EDGE('',*,*,#210,.T.);
+#336 = ORIENTED_EDGE('',*,*,#211,.T.);
+#337 = ORIENTED_EDGE('',*,*,#212,.T.);
+#338 = ORIENTED_EDGE('',*,*,#213,.T.);
+#339 = ORIENTED_EDGE('',*,*,#214,.F.);
+#401 = PLANE('',#131);
+#302 = ADVANCED_FACE('',(#312),#402,.T.);
+#312 = FACE_OUTER_BOUND('',#322,.T.);
+#322 = EDGE_LOOP('',(#340,#341,#342,#343));
+#340 = ORIENTED_EDGE('',*,*,#200,.T.);
+#341 = ORIENTED_EDGE('',*,*,#221,.T.);
+#342 = ORIENTED_EDGE('',*,*,#210,.F.);
+#343 = ORIENTED_EDGE('',*,*,#220,.F.);
+#402 = PLANE('',#133);
+#303 = ADVANCED_FACE('',(#313),#403,.T.);
+#313 = FACE_OUTER_BOUND('',#323,.T.);
+#323 = EDGE_LOOP('',(#344,#345,#346,#347));
+#344 = ORIENTED_EDGE('',*,*,#201,.T.);
+#345 = ORIENTED_EDGE('',*,*,#222,.T.);
+#346 = ORIENTED_EDGE('',*,*,#211,.F.);
+#347 = ORIENTED_EDGE('',*,*,#221,.F.);
+#403 = PLANE('',#134);
+#304 = ADVANCED_FACE('',(#314),#404,.T.);
+#314 = FACE_OUTER_BOUND('',#324,.T.);
+#324 = EDGE_LOOP('',(#348,#349,#350,#351));
+#348 = ORIENTED_EDGE('',*,*,#202,.T.);
+#349 = ORIENTED_EDGE('',*,*,#223,.T.);
+#350 = ORIENTED_EDGE('',*,*,#212,.F.);
+#351 = ORIENTED_EDGE('',*,*,#222,.F.);
+#404 = PLANE('',#135);
+#305 = ADVANCED_FACE('',(#315),#405,.T.);
+#315 = FACE_OUTER_BOUND('',#325,.T.);
+#325 = EDGE_LOOP('',(#352,#353,#354,#355));
+#352 = ORIENTED_EDGE('',*,*,#203,.T.);
+#353 = ORIENTED_EDGE('',*,*,#224,.T.);
+#354 = ORIENTED_EDGE('',*,*,#213,.F.);
+#355 = ORIENTED_EDGE('',*,*,#223,.F.);
+#405 = PLANE('',#136);
+#306 = ADVANCED_FACE('',(#316),#406,.F.);
+#316 = FACE_OUTER_BOUND('',#326,.T.);
+#326 = EDGE_LOOP('',(#356,#357,#358,#359));
+#356 = ORIENTED_EDGE('',*,*,#204,.F.);
+#357 = ORIENTED_EDGE('',*,*,#220,.T.);
+#358 = ORIENTED_EDGE('',*,*,#214,.T.);
+#359 = ORIENTED_EDGE('',*,*,#224,.F.);
+#406 = CYLINDRICAL_SURFACE('',#130,10.);
+ENDSEC;
+END-ISO-10303-21;
+"#;
+            let path = temp_file("kirsch_step.step", step_txt)?;
+            let c = new_core();
+            call(&c, "import_step", json!({"path": path, "name": "Plate"}))?;
+            call(&c, "set_material", json!({"material": "Structural Steel"}))?;
+            call(&c, "set_mesh", json!({"element_size_mm": hh}))?;
+            call(&c, "add_symmetry", json!({"faces": ["bbox.xmin", "bbox.ymin", "bbox.zmin"]}))?;
+            call(&c, "add_pressure", json!({"faces": ["bbox.xmax"], "value_mpa": -10}))?;
+            let r = call(&c, "solve", json!({}))?;
+            let _ = std::fs::remove_file(&path);
+            out(vec![field(&r, "max_principal", "max")? / 10.0], &r)
+        }),
+    });
+    v.push(Case {
         id: "lame",
         group: "Structural",
         title: "Thick cylinder under 10 MPa internal pressure: bore hoop stress",

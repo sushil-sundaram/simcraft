@@ -53,7 +53,7 @@ Command-line options:
 | `simcraft schema` | Print every tool with its JSON schema |
 | `SIMCRAFT_GPU=discrete simcraft` | Let the window itself render on the discrete GPU (normally it stays on the integrated GPU) |
 | `SIMCRAFT_PORT=…` | Change the local port used between the app and the MCP server (default 47800) |
-| `SIMCRAFT_WORKSPACE=…` | Confine MCP / headless file tools (`open_project`, `save_project`, `import_stl`, `import_kicad`, `export_vtk`, `make_report`) to this directory |
+| `SIMCRAFT_WORKSPACE=…` | Confine MCP / headless file tools (`open_project`, `save_project`, `import_stl`, `import_step`, `import_kicad`, `export_vtk`, `make_report`) to this directory |
 | `SIMCRAFT_LLM_URL=…` | Address of the local model server for the Planner (default `http://127.0.0.1:11434`) |
 | `SIMCRAFT_LOCAL_ONLY_LLM=1` | Restrict `SIMCRAFT_LLM_URL` to loopback hosts (`127.0.0.1`, `localhost`, `::1`) |
 
@@ -165,11 +165,14 @@ SimCraft builds parts from simple shapes combined in order (constructive solid g
 | **Cylinder** | cylinder along X, Y or Z from its base centre | `Name.side`, `Name.bottom`, `Name.top` |
 | **Sphere** | sphere | `Name.surface` |
 | **Hole / Pocket** | a cylinder / box that *subtracts* material | the cut surfaces, e.g. `Hole.side` |
+| **Import STEP** | a `.step` / `.stp` CAD solid or multi-part assembly (ISO 10303-21 AP203/AP214/AP242); auto-converts length units to mm and preserves exact B-rep surfaces | `Name.face0_plane`, `face1_cylinder`, … |
 | **Import STL** | a closed STL solid (e.g. exported from SolidCraft, Fusion 360, FreeCAD, KiCad 3D) | smooth regions become `Name.face0`, `face1`, … |
 | **Enclosure** | the air / water / oil box around your parts (see below) | `Enclosure.xmin` … `Enclosure.zmax` |
 
 Bodies are applied in the order listed in the Browser: later bodies add to or cut from earlier ones.
 Touching bodies merge into one connected part. Each body has its own material.
+
+**STEP CAD tips** — use **File ▸ Import STEP…** or **Geometry ▸ Import STEP** (MCP: `import_step`) for AP203/AP214/AP242 `.step`/`.stp` files. SimCraft automatically detects STEP length units (mm, m, cm, inch, etc.) into millimetres, preserves multi-part assembly placements and part names as separate bodies, and keeps exact B-rep surfaces (`plane`, `cylinder`, `sphere`, `cone`, `torus`, parametric) so **Boundary fitting** snaps mesh nodes directly onto CAD curves and holes. Use `scale` only if an additional scale factor beyond unit conversion is needed, and inspect face names with **list_faces**.
 
 **STL tips** — the mesh must be closed (watertight). Use the `scale` option if your file is in metres
 (scale 1000) or inches (25.4). Use **list_faces** (or hover in the viewport) to find the face names.
@@ -187,7 +190,7 @@ analysis settings — whether you made it or an AI agent did. MCP: `edit_body`, 
 
 - a face name: `Bracket.xmax`, `Hole.side`
 - a whole body: `TopPlate` (all of its outer faces)
-- the extreme flat faces of the whole model: `bbox.xmin` … `bbox.zmax` (handy for STL parts)
+- the extreme flat faces of the whole model: `bbox.xmin` … `bbox.zmax` (handy for STEP / STL parts)
 - `all` — every outer surface of the parts (e.g. convection everywhere)
 
 **Enclosure** — electrostatic, magnetostatic and fluid analyses need the space *around* the parts.
@@ -287,7 +290,7 @@ SimCraft fills the model with equal cubes ("voxels") of the **element size** you
   matrix-free multigrid, §11), 400 000 for the other analyses, 12 M for full-wave EM (no matrix
   solve). Budget roughly 4 GB of memory per million elements.
 - **Fit curved surfaces** (structural, thermal, modal and vibration, on by default — SOLVE ▸ settings, MCP
-  `set_analysis boundary_fit`): holes, fillets, spheres, STL surfaces and faces that do not line up
+  `set_analysis boundary_fit`): holes, fillets, spheres, STEP B-rep surfaces, STL surfaces and faces that do not line up
   with the grid are fitted exactly. Flat faces aligned with an axis are meshed exactly by moving the
   nearest grid plane onto them (those elements become slightly longer or shorter boxes), so a 4 mm
   plate meshes the same way at 1.25, 1.5 or 2 mm. For curved and oblique faces SimCraft keeps the
@@ -620,7 +623,7 @@ so nothing changes until you press **Apply**.
 | `Bracket.size.z`, `Bracket.min.x` | box size / corner position |
 | `Hole.radius`, `Hole.height`, `Hole.base.x` | cylinder dimensions / position |
 | `Ball.radius`, `Ball.center.y` | sphere |
-| `Part.scale`, `Part.offset.z` | imported STL |
+| `Part.scale`, `Part.offset.z` | imported STEP or STL |
 | `load2.vector.z`, `load3.value_mpa`, `load4.value` | load magnitudes (numbered as in the Browser) |
 | `element_size` | mesh size (for convergence studies) |
 
@@ -778,7 +781,7 @@ with `get_selection`, and use the planner (`plan_simulation`, `get_plan`, `set_p
 `~/.config/simcraft/token` (created automatically with mode `0600`, readable only by you), so other
 programs on the machine cannot drive SimCraft. To confine an AI agent or headless script to a
 single project directory, pass `--workspace DIR` (or set `SIMCRAFT_WORKSPACE=DIR`); in the desktop
-app, opening a `.simcraft` project that references `.stl` or `.kicad_pcb` files outside its folder
+app, opening a `.simcraft` project that references `.step`, `.stp`, `.stl` or `.kicad_pcb` files outside its folder
 prompts for confirmation first.
 
 Agents can read this guide with `get_help` (contents, a section by number or name, or a search),
