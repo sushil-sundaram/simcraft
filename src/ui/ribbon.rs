@@ -57,6 +57,9 @@ impl SimApp {
                     }
                 });
                 group(ui, &p, "INSERT", |ui| {
+                    if tool(ui, &p, "📐", "Import STEP", Some(p.weak), true) {
+                        self.import_step();
+                    }
                     if tool(ui, &p, "📂", "Import STL", Some(p.weak), true) {
                         self.import_stl();
                     }

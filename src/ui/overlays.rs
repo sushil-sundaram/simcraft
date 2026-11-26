@@ -337,6 +337,7 @@ fn shape_bbox(s: &Shape) -> Option<(V3, V3)> {
         }
         Shape::Sphere { center, radius } => Some((sub(*center, [*radius; 3]), add(*center, [*radius; 3]))),
         Shape::Stl { data, offset, .. } => data.as_ref().map(|d| (add(d.min, *offset), add(d.max, *offset))),
+        Shape::Step { data, .. } => data.as_ref().map(|d| d.bounds()),
         Shape::Pcb { data, offset, .. } => data.as_ref().map(|d| (*offset, add(*offset, [d.size[0], d.size[1], d.thickness]))),
     }
 }
@@ -457,7 +458,7 @@ pub(super) fn draw_ghost_and_gizmo(
                         draw_wire_sphere(cam, rect, painter, *center, *radius, ghost_stroke);
                         gizmo_anchor = Some(*center);
                     }
-                    Shape::Stl { .. } | Shape::Pcb { .. } => {
+                    Shape::Stl { .. } | Shape::Step { .. } | Shape::Pcb { .. } => {
                         if let Some((lo, hi)) = shape_bbox(&bd.shape) {
                             draw_wire_box(cam, rect, painter, lo, hi, ghost_stroke, None);
                             gizmo_anchor = Some(scale(add(lo, hi), 0.5));
@@ -540,7 +541,7 @@ pub(super) fn draw_ghost_and_gizmo(
                                     Shape::Box { min, .. } => min[k] += d_mm,
                                     Shape::Cylinder { base, .. } => base[k] += d_mm,
                                     Shape::Sphere { center, .. } => center[k] += d_mm,
-                                    Shape::Stl { offset, .. } | Shape::Pcb { offset, .. } => offset[k] += d_mm,
+                                    Shape::Stl { offset, .. } | Shape::Step { offset, .. } | Shape::Pcb { offset, .. } => offset[k] += d_mm,
                                 }
                             }
                         }

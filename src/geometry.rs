@@ -216,6 +216,19 @@ pub enum Shape {
         #[serde(skip)]
         data: Option<Arc<StlData>>,
     },
+    Step {
+        path: String,
+        #[serde(default)]
+        part_index: usize,
+        #[serde(default)]
+        part_name: String,
+        #[serde(default = "one")]
+        scale: f64,
+        #[serde(default)]
+        offset: V3,
+        #[serde(skip)]
+        data: Option<Arc<crate::step::StepData>>,
+    },
     /// Printed circuit board imported from KiCad: outline extruded over the board thickness, with
     /// homogenised copper (see `kicad.rs`). `offset` = position of the board's min corner.
     Pcb {
@@ -262,7 +275,8 @@ impl Shape {
             Shape::Box { size, .. } => Some(size[0] * size[1] * size[2]),
             Shape::Cylinder { radius, height, .. } => Some(std::f64::consts::PI * radius * radius * height),
             Shape::Sphere { radius, .. } => Some(4.0 / 3.0 * std::f64::consts::PI * radius.powi(3)),
-            Shape::Stl { .. } | Shape::Pcb { .. } => None,
+            Shape::Step { data: Some(d), .. } => Some(d.volume_mm3),
+            Shape::Step { .. } | Shape::Stl { .. } | Shape::Pcb { .. } => None,
         }
     }
     pub fn bounds(&self) -> (V3, V3) {
@@ -287,6 +301,10 @@ impl Shape {
             }
             Shape::Stl { data, .. } => match data {
                 Some(d) => (d.min, d.max),
+                None => ([0.0; 3], [0.0; 3]),
+            },
+            Shape::Step { data, .. } => match data {
+                Some(d) => d.bounds(),
                 None => ([0.0; 3], [0.0; 3]),
             },
             Shape::Pcb { data, offset, .. } => match data {
@@ -322,6 +340,14 @@ impl Shape {
                     bail!("STL '{path}' is not loaded");
                 }
             }
+            Shape::Step { data, path, scale, offset, .. } => {
+                if !scale.is_finite() || *scale <= 0.0 || !finite(offset) {
+                    bail!("STEP '{path}' scale must be positive and offset finite");
+                }
+                if data.is_none() {
+                    bail!("STEP '{path}' is not loaded");
+                }
+            }
             Shape::Pcb { data, path, offset } => {
                 if !finite(offset) {
                     bail!("KiCad board '{path}' offset must be finite");
@@ -352,7 +378,7 @@ impl Shape {
                 let d = sub(p, *center);
                 dot(d, d) <= radius * radius
             }
-            Shape::Stl { .. } => false,
+            Shape::Stl { .. } | Shape::Step { .. } => false,
             Shape::Pcb { data, offset, .. } => match data {
                 Some(d) => p[2] >= offset[2] && p[2] <= offset[2] + d.thickness && d.inside(p[0] - offset[0], p[1] - offset[1]),
                 None => false,
@@ -372,6 +398,7 @@ impl Shape {
                 let n = data.as_ref().map(|d| d.n_segments).unwrap_or(0);
                 (0..n).map(|i| format!("face{i}")).collect()
             }
+            Shape::Step { data, .. } => data.as_ref().map(|d| d.patch_names()).unwrap_or_default(),
             Shape::Pcb { .. } => ["edge", "bottom", "top"].iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -428,6 +455,7 @@ impl Shape {
                 });
                 best.map(|b| b.1)
             }
+            Shape::Step { data, .. } => data.as_ref()?.project(patch, p),
             Shape::Pcb { .. } => None,
         }
     }
@@ -536,6 +564,10 @@ impl Shape {
                 });
                 best
             }
+            Shape::Step { data, .. } => data
+                .as_ref()
+                .map(|d| d.best_patch(p, n, h, subtract))
+                .unwrap_or((0, f64::INFINITY)),
         }
     }
 }
@@ -719,6 +751,67 @@ pub fn load_stl(path: &str, scale_f: f64, offset: V3) -> Result<StlData> {
 }
 
 impl StlData {
+    /// Wrap pre-segmented triangle soup (e.g. tessellated CAD B-rep faces) with a BVH.
+    pub fn from_segmented(
+        tris: Vec<[V3; 3]>,
+        normals: Vec<V3>,
+        segment: Vec<u32>,
+        n_segments: usize,
+    ) -> Result<Self> {
+        if tris.is_empty() || tris.len() != normals.len() || tris.len() != segment.len() {
+            bail!("segmented mesh buffers must be non-empty and aligned");
+        }
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        for t in &tris {
+            for v in t {
+                for k in 0..3 {
+                    if !v[k].is_finite() {
+                        bail!("mesh contains non-finite coordinates");
+                    }
+                    min[k] = min[k].min(v[k]);
+                    max[k] = max[k].max(v[k]);
+                }
+            }
+        }
+        let bvh = StlBvh::build(&tris);
+        Ok(Self { tris, normals, segment, n_segments, min, max, bvh })
+    }
+
+    /// Translate triangles and cached BVH bounds in-place by `delta` [mm].
+    pub fn translated(&self, delta: V3) -> Self {
+        let tris = self
+            .tris
+            .iter()
+            .map(|t| [add(t[0], delta), add(t[1], delta), add(t[2], delta)])
+            .collect();
+        let nodes = self
+            .bvh
+            .nodes
+            .iter()
+            .map(|n| BvhNode {
+                lo: add(n.lo, delta),
+                hi: add(n.hi, delta),
+                left: n.left,
+                start: n.start,
+                count: n.count,
+            })
+            .collect();
+        Self {
+            tris,
+            normals: self.normals.clone(),
+            segment: self.segment.clone(),
+            n_segments: self.n_segments,
+            min: add(self.min, delta),
+            max: add(self.max, delta),
+            bvh: StlBvh { nodes, order: self.bvh.order.clone() },
+        }
+    }
+
+    pub fn visit_closest(&self, p: V3, leaf: impl FnMut(usize, &mut f64)) {
+        self.bvh.visit_closest(p, leaf);
+    }
+
     /// Inside test along a +X ray using crossing parity, filling a column of cells.
     /// Returns sorted x positions of surface crossings at (y, z).
     pub fn x_crossings(&self, y: f64, z: f64) -> Vec<f64> {

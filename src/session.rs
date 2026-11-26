@@ -328,10 +328,25 @@ impl Session {
         let txt = std::fs::read_to_string(&resolved).with_context(|| format!("reading {path}"))?;
         let v: Value = serde_json::from_str(&txt)?;
         let mut model: Model = serde_json::from_value(v.get("model").cloned().unwrap_or(v.clone()))?;
+        let mut step_cache: std::collections::HashMap<(String, u64), Vec<crate::step::StepData>> = Default::default();
         for b in model.bodies.iter_mut() {
             if let Shape::Stl { path: sp, scale, offset, data } = &mut b.shape {
                 let asset = resolve_io_path(sp, workspace, false, &["stl"])?;
                 *data = Some(Arc::new(load_stl(&asset.to_string_lossy(), *scale, *offset)?));
+            }
+            if let Shape::Step { path: sp, part_index, scale, offset, data, .. } = &mut b.shape {
+                let asset = resolve_io_path(sp, workspace, false, &["step", "stp"])?;
+                let key_path = asset.to_string_lossy().to_string();
+                let parts = match step_cache.entry((key_path.clone(), scale.to_bits())) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(crate::step::load_step_bodies(&key_path, *scale, [0.0; 3], None)?)
+                    }
+                };
+                let part = parts.get(*part_index).ok_or_else(|| {
+                    anyhow!("STEP '{sp}' only has {} part(s) (missing part_index {part_index})", parts.len())
+                })?;
+                *data = Some(Arc::new(part.translated(*offset)));
             }
             if let Shape::Pcb { path: pp, data, .. } = &mut b.shape {
                 let asset = resolve_io_path(pp, workspace, false, &["kicad_pcb"])?;
@@ -453,7 +468,7 @@ pub fn external_assets(project_path: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for b in &model.bodies {
         let asset = match &b.shape {
-            Shape::Stl { path, .. } | Shape::Pcb { path, .. } => Some(path.as_str()),
+            Shape::Stl { path, .. } | Shape::Step { path, .. } | Shape::Pcb { path, .. } => Some(path.as_str()),
             _ => None,
         };
         if let Some(ap) = asset {
@@ -507,6 +522,14 @@ fn shift_shape(shape: &Shape, d: [f64; 3]) -> Result<Shape> {
             let data = Some(Arc::new(load_stl(&path, scale, offset)?));
             Shape::Stl { path, scale, offset, data }
         }
+        Shape::Step { path, part_index, part_name, scale, offset, data } => {
+            let new_off = add(offset);
+            let data = match data {
+                Some(prev) => Some(Arc::new(prev.translated(d))),
+                None => Some(Arc::new(crate::step::load_step_part(&path, part_index, scale, new_off)?)),
+            };
+            Shape::Step { path, part_index, part_name, scale, offset: new_off, data }
+        }
         Shape::Pcb { path, offset, data } => Shape::Pcb { path, offset: add(offset), data },
     })
 }
@@ -526,7 +549,7 @@ fn mirror_shape(shape: &Shape, a: usize, at: f64) -> Result<Shape> {
             center[a] = 2.0 * at - center[a];
             Shape::Sphere { center, radius }
         }
-        _ => bail!("mirroring works on boxes, cylinders and spheres (STL parts and boards cannot be mirrored)"),
+        _ => bail!("mirroring works on boxes, cylinders and spheres (STL, STEP parts and boards cannot be mirrored)"),
     })
 }
 
@@ -645,7 +668,7 @@ fn field_arg(a: &Value) -> Result<Option<Field>> {
 fn tool_may_mutate(tool: &str) -> bool {
     matches!(
         tool,
-        "new_model" | "add_box" | "add_cylinder" | "add_sphere" | "import_stl" | "import_kicad"
+        "new_model" | "add_box" | "add_cylinder" | "add_sphere" | "import_stl" | "import_step" | "import_kicad"
             | "add_enclosure" | "remove_body" | "define_material" | "set_material"
             | "set_analysis" | "set_mesh" | "edit_body" | "edit_load" | "transform_body"
             | "remove_load" | "clear_loads" | "apply_design" | "open_project"
@@ -713,6 +736,9 @@ impl Core {
         let a = if a.is_null() { &json!({}) } else { a };
         if tool == "solve" {
             return self.solve();
+        }
+        if tool == "import_step" {
+            return self.import_step_job(a);
         }
         if tool == "__panic" && std::env::var_os("SIMCRAFT_TEST_HOOKS").is_some() {
             // test hook: a solver that panics half-way
@@ -1277,6 +1303,19 @@ impl Core {
                     let mut shape: Shape = serde_json::from_value(sj).map_err(|e| anyhow!("bad shape values: {e}"))?;
                     match (&mut shape, &old.shape) {
                         (Shape::Stl { path, scale, offset, data }, _) => *data = Some(Arc::new(load_stl(path, *scale, *offset)?)),
+                        (
+                            Shape::Step { path, part_index, scale, offset, data, .. },
+                            Shape::Step { scale: os, offset: oo, data: od, .. },
+                        ) => {
+                            *data = if (*scale - *os).abs() == 0.0 {
+                                match od {
+                                    Some(prev) => Some(Arc::new(prev.translated([offset[0] - oo[0], offset[1] - oo[1], offset[2] - oo[2]]))),
+                                    None => Some(Arc::new(crate::step::load_step_part(path, *part_index, *scale, *offset)?)),
+                                }
+                            } else {
+                                Some(Arc::new(crate::step::load_step_part(path, *part_index, *scale, *offset)?))
+                            };
+                        }
                         (Shape::Pcb { data, .. }, Shape::Pcb { data: od, .. }) => *data = od.clone(),
                         _ => {}
                     }
@@ -2107,6 +2146,82 @@ impl Core {
         Ok((s.model.clone(), m, rev))
     }
 
+    fn import_step_job(&self, a: &Value) -> Result<Output> {
+        let raw = opt_str(a, "path").ok_or_else(|| anyhow!("missing 'path'"))?;
+        let ws = self.workspace_dir();
+        let resolved = resolve_io_path(raw, ws.as_deref(), false, &["step", "stp"])?;
+        let path = resolved.to_string_lossy().to_string();
+        let sc = opt_num(a, "scale").unwrap_or(1.0);
+        let off = v3_or(a, "offset", [0.0; 3])?;
+        let operation = op(a)?;
+        let mat_arg = opt_str(a, "material").map(String::from);
+        let name_arg = opt_str(a, "name").map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+
+        self.run_job("STEP import", || -> Result<Output> {
+            {
+                let mut p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                *p = Progress { running: true, fraction: 0.2, message: "Reading STEP CAD…".into() };
+            }
+            self.changed();
+
+            let parts = crate::step::load_step_bodies(&path, sc, off, Some(&self.cancel))?;
+            {
+                let mut p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                *p = Progress { running: true, fraction: 0.9, message: "Adding CAD bodies…".into() };
+            }
+
+            let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(m) = &mat_arg {
+                s.resolve_material(m)?;
+            }
+            let multi = parts.len() > 1;
+            let unit_name = parts[0].unit_name.clone();
+            let unit_scale_mm = parts[0].unit_scale_mm;
+            let mut summary = Vec::with_capacity(parts.len());
+            let mut total_vol = 0.0;
+            for part in parts {
+                let data = Arc::new(part);
+                let want_name = match &name_arg {
+                    Some(req) if !multi => req.clone(),
+                    Some(prefix) => format!("{prefix}_{}", data.part_name),
+                    None => data.part_name.clone(),
+                };
+                let (lo, hi) = data.bounds();
+                let shape = Shape::Step {
+                    path: path.clone(),
+                    part_index: data.part_index,
+                    part_name: data.part_name.clone(),
+                    scale: sc,
+                    offset: off,
+                    data: Some(data.clone()),
+                };
+                let bname = s.add_body(Some(&want_name), "Part", shape, operation, mat_arg.as_deref())?;
+                total_vol += data.volume_mm3;
+                summary.push(json!({
+                    "name": bname,
+                    "part_name": data.part_name,
+                    "faces": data.faces.len(),
+                    "face_names": data.patch_names().into_iter().map(|f| format!("{bname}.{f}")).collect::<Vec<_>>(),
+                    "triangles": data.mesh.tris.len(),
+                    "volume_mm3": crate::results::float(data.volume_mm3),
+                    "bounds_mm": {"min": lo.map(crate::results::float), "max": hi.map(crate::results::float)},
+                }));
+            }
+            s.view_request = Some("fit".into());
+            s.log(format!("Imported STEP '{path}' ({} bodies, unit {unit_name})", summary.len()));
+            Ok(Output::json(json!({
+                "path": path,
+                "detected_unit": unit_name,
+                "unit_scale_mm": unit_scale_mm,
+                "user_scale": sc,
+                "body_count": summary.len(),
+                "total_volume_mm3": crate::results::float(total_vol),
+                "bodies": summary,
+                "note": "Use list_faces to inspect fitted CAD faces after setting element_size_mm or solving.",
+            })))
+        })
+    }
+
     fn solve_inner(&self) -> Result<Output> {
         {
             let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2187,7 +2302,8 @@ pub fn tool_defs() -> Vec<Value> {
         t("pcb_nets", "List the nets of a KiCad board with their pads (REFERENCE.PAD), to choose 'from' / 'to' for pcb_dc. Uses the imported board unless 'path' is given.", json!({"path": {"type": "string"}}), &[]),
         t("pcb_dc", "DC current in one net of a KiCad board: resistance and voltage drop between two pads, Joule power, peak current density and where it occurs, current and IPC-2221 temperature rise of the tracks that carry it, and via currents. Pads are REFERENCE.PAD (e.g. U1.3 → J2.1). Uses the imported board's file unless 'path' is given.", json!({"path": {"type": "string", "description": ".kicad_pcb (default: the imported board)"}, "net": {"type": "string", "description": "net name (default: the net of 'from')"}, "from": {"type": "string", "description": "source pad, e.g. U1.3"}, "to": {"type": "string", "description": "sink pad, e.g. J2.1"}, "current": {"type": "number", "description": "amps (default 1)"}, "temperature_c": {"type": "number", "description": "copper temperature for resistivity (default 20 °C)"}}), &["from", "to"]),
         t("import_stl", "Import a closed STL solid (e.g. exported from SolidCraft / Fusion 360). Smooth regions become faces <name>.face0, face1 …", json!({"path": {"type": "string", "description": "Absolute path to .stl"}, "scale": {"type": "number", "description": "Multiply coordinates (use 1000 if the STL is in metres)"}, "offset": v3s("Translation mm"), "name": name, "operation": op, "material": mat}), &["path"]),
-        t("edit_body", "Change an existing body: any shape field (box: min, size; cylinder: base, axis, radius, height; sphere: center, radius; STL: scale, offset; board: offset), material, operation (add/subtract) or new_name (loads on it follow the rename). Undoable.", json!({"name": {"type": "string"}, "new_name": {"type": "string"}, "material": {"type": "string"}, "operation": {"type": "string", "enum": ["add", "subtract"]}, "min": v3s("box corner mm"), "size": v3s("box size mm"), "base": v3s("cylinder base centre mm"), "axis": {"type": "string", "enum": ["x", "y", "z"]}, "radius": {"type": "number"}, "height": {"type": "number"}, "center": v3s("sphere centre mm"), "scale": {"type": "number"}, "offset": v3s("STL / board offset mm")}), &["name"]),
+        t("import_step", "Import a STEP CAD solid or multi-part assembly (.step / .stp). Automatically converts STEP length units (mm, m, in…) to millimetres, preserves assembly placements and part names, and keeps exact B-rep surfaces for boundary fitting.", json!({"path": {"type": "string", "description": "Path to .step or .stp"}, "scale": {"type": "number", "description": "Optional extra scale factor on top of STEP unit conversion (default 1.0)"}, "offset": v3s("Translation mm"), "name": {"type": "string", "description": "Body name (single solid) or name prefix (assembly)"}, "operation": op, "material": mat}), &["path"]),
+        t("edit_body", "Change an existing body: any shape field (box: min, size; cylinder: base, axis, radius, height; sphere: center, radius; STL/STEP: scale, offset; board: offset), material, operation (add/subtract) or new_name (loads on it follow the rename). Undoable.", json!({"name": {"type": "string"}, "new_name": {"type": "string"}, "material": {"type": "string"}, "operation": {"type": "string", "enum": ["add", "subtract"]}, "min": v3s("box corner mm"), "size": v3s("box size mm"), "base": v3s("cylinder base centre mm"), "axis": {"type": "string", "enum": ["x", "y", "z"]}, "radius": {"type": "number"}, "height": {"type": "number"}, "center": v3s("sphere centre mm"), "scale": {"type": "number"}, "offset": v3s("STL / STEP / board offset mm")}), &["name"]),
         t("edit_load", "Change an existing support or load by id (see get_model): any of its fields, e.g. {id: 3, vector: [0, 0, -500]}, {id: 2, value_mpa: 4}, {id: 5, faces: [\"Plate.xmax\"]}. Undoable.", json!({"id": {"type": "integer"}}), &["id"]),
         t("transform_body", "Move, copy, pattern or mirror a body. move/copy/pattern use 'translate' [dx, dy, dz] mm (pattern: 'count' instances in total, each step 'translate' further); mirror uses 'axis' and the plane coordinate 'at' (copy: true by default). Copies get new names and no loads.", json!({"name": {"type": "string"}, "mode": {"type": "string", "enum": ["move", "copy", "pattern", "mirror"]}, "translate": v3s("offset mm"), "count": {"type": "integer"}, "axis": {"type": "string", "enum": ["x", "y", "z"]}, "at": {"type": "number", "description": "mirror plane coordinate mm"}, "copy": {"type": "boolean"}}), &["name", "mode"]),
         t("get_help", "Read the SimCraft user guide: no arguments = table of contents; 'topic' = one section with its subsections (a number like '7' or a name like 'meshing', 'fatigue', 'KiCad'); 'query' = search the whole guide (ranked sections with snippets). Use it to learn how an analysis, load or result works.", json!({"topic": {"type": "string"}, "query": {"type": "string"}}), &[]),

@@ -164,6 +164,10 @@ impl SimApp {
             self.save_as();
         }
         ui.separator();
+        if ui.button("Import STEP…").clicked() {
+            ui.close();
+            self.import_step();
+        }
         if ui.button("Import STL…").clicked() {
             ui.close();
             self.import_stl();

@@ -43,7 +43,7 @@ Sizes: **S** ≈ one session, **M** ≈ 2–3, **L** ≈ 4–6, **XL** > 6.
 | P2.0b | Fix the fitting defects the benchmark found (see below) | S–M | wrong peak stresses at some element sizes; must come before more physics | done |
 | P2.1 | Thermal radiation + temperature-dependent properties | M | biggest missing physics for electronics cooling; self-contained | done |
 | P2.2 | Path plots, cylindrical results, mesh-convergence assistant | S–M | cheap, raises trust in every result | done |
-| P2.3 | STEP import (spike first) | M–L | unlocks real CAD parts and assemblies | planned |
+| P2.3 | STEP import (spike first) | M–L | unlocks real CAD parts and assemblies | done |
 | P2.4 | Contact, bolt pretension, springs, remote points | L | assemblies; best after P2.3 | planned |
 | P2.5 | Local mesh refinement (octree) + adaptive error control | XL | real parts with small features; touches every FE solver | planned |
 | P2.6 | Broadband FDTD: lumped ports, S-parameters, emissions spectrum, ground plane | M–L | completes the EMC story started in Tier 3 | planned |
@@ -132,18 +132,22 @@ Trilinear hex-mesh point locator and straight-line path sampling (`Mesh::locate_
 - **Validate**: Lamé hoop stress along the wall vs closed form; extrapolated cantilever deflection
   within 0.5 % of theory from three coarse meshes.
 
-### P2.3 STEP import (M–L, spike first)
+### P2.3 STEP import (M–L, spike first) — done
 
-- **Spike (S)**: try the pure-Rust `truck-stepio` reader on five real files (SolidWorks, Fusion 360,
-  Onshape, FreeCAD, a KiCad 3D model). If at least four import as closed solids with correct volume,
-  use it; otherwise wrap OpenCASCADE behind an optional `step` cargo feature (CI builds it once and
-  caches), with a fallback that converts through a locally installed FreeCAD / gmsh.
-- **Design**: each STEP solid becomes a body (name from the product tree); B-rep faces become named
-  patches with their analytic type (plane, cylinder r, cone, sphere, torus, spline) so boundary
-  fitting projects onto the exact surface, not the facets; units read from the file.
-- **Validate**: volume and centroid vs the CAD mass properties (< 0.1 %); plate-with-hole Kt from a
-  STEP plate equals the CSG result; an assembly of three parts keeps its names and contacts.
-- **Risks**: STEP dialect coverage; tolerance gaps between faces (sew with a tolerance, warn).
+- **Pure-Rust implementation (`src/step.rs`, `monstertruck-io` 0.4.3 + `monstertruck-meshing` 0.4.3)**:
+  keeps SimCraft a single zero-C++-dependency binary while reading ISO 10303-21 AP203/AP214/AP242 solids
+  and multi-part assemblies (`PRODUCT`, `NEXT_ASSEMBLY_USAGE_OCCURRENCE`, `ITEM_DEFINED_TRANSFORMATION`,
+  `SHAPE_REPRESENTATION_RELATIONSHIP`).
+- **Units, orientation, and exact surface fitting**: detects STEP `SI_UNIT` / `CONVERSION_BASED_UNIT`
+  (mm, m, cm, in, µm) into millimetres, preserves assembly placements and part names as distinct bodies,
+  orients B-rep faces strictly outward via ray-crossing parity, tessellates into BVH-accelerated
+  `StlData`, and retains exact analytic (`Plane`, `Cylinder`, `Sphere`, `Cone`, `Torus`) and parametric
+  surfaces for `fit_boundary` projection (`import_step` MCP tool, File & Geometry ribbon, `edit_body`,
+  `transform_body`, `.simcraft` project round-trips, `SIMCRAFT_WORKSPACE` + DoS/size/entity caps).
+- **Validated (`tests/step.rs`, `src/bench.rs` `step_kirsch`)**: plate-with-hole volume `< 0.1%`,
+  boundary-fitted hole radius `< 1e-13 mm`, Kt matching CSG & Howland/Kirsch theory, metre/inch unit
+  conversion, 3-part bonded AP214 assembly, elementary analytic surfaces, sandbox/malformed-input safety,
+  and cancellation.
 
 ### P2.4 Assemblies: contact, pretension, connections (L)
 
