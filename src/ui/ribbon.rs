@@ -67,7 +67,7 @@ impl SimApp {
                     if tool(ui, &p, "📂", "Import STL", Some(p.weak), true) {
                         self.import_stl();
                     }
-                    if tool(ui, &p, "🟩", "KiCad PCB", Some(Color32::from_rgb(70, 160, 90)), true) {
+                    if tool(ui, &p, "🟩", "KiCad PCB", Some(p.ok), true) {
                         self.import_kicad();
                     }
                     if tool(ui, &p, "⬚", "Enclosure", Some(Color32::from_rgb(90, 170, 230)), true) {
@@ -224,7 +224,7 @@ impl SimApp {
                 if let Some(path) = board {
                     group(ui, &p, "PCB", |ui| {
                         let on = self.pcb.open;
-                        if tool(ui, &p, "🔌", "DC drop", Some(if on { p.accent } else { Color32::from_rgb(70, 160, 90) }), true) {
+                        if tool(ui, &p, "🔌", "DC drop", Some(if on { p.accent } else { p.ok }), true) {
                             self.open_pcb_dc(ui.ctx(), &path);
                         }
                     });

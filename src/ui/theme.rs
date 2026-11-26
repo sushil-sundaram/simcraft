@@ -31,10 +31,10 @@ pub fn pal(dark: bool) -> Pal {
             text: Color32::from_rgb(228, 230, 235),
             weak: Color32::from_rgb(145, 151, 162),
             border: Color32::from_rgb(56, 60, 69),
-            accent: Color32::from_rgb(245, 130, 50),
-            ok: Color32::from_rgb(90, 200, 120),
+            accent: Color32::from_rgb(108, 140, 255),
+            ok: Color32::from_rgb(56, 189, 248),
             warn: Color32::from_rgb(235, 175, 60),
-            err: Color32::from_rgb(255, 110, 110),
+            err: Color32::from_rgb(251, 113, 133),
         }
     } else {
         Pal {
@@ -46,10 +46,10 @@ pub fn pal(dark: bool) -> Pal {
             text: Color32::from_rgb(32, 34, 38),
             weak: Color32::from_rgb(112, 118, 128),
             border: Color32::from_rgb(222, 225, 230),
-            accent: Color32::from_rgb(232, 112, 32),
-            ok: Color32::from_rgb(30, 150, 70),
+            accent: Color32::from_rgb(59, 91, 219),
+            ok: Color32::from_rgb(2, 132, 199),
             warn: Color32::from_rgb(190, 120, 0),
-            err: Color32::from_rgb(200, 40, 40),
+            err: Color32::from_rgb(225, 29, 72),
         }
     }
 }
@@ -392,7 +392,7 @@ pub fn line_chart(ui: &mut egui::Ui, p: &Pal, series: &[(String, Vec<(f64, f64)>
         painter.line_segment([pos2(plot.min.x, sy(fy)), pos2(plot.max.x, sy(fy))], Stroke::new(0.5, p.border.gamma_multiply(0.5)));
     }
     painter.text(pos2(plot.center().x, rect.max.y - 2.0), Align2::CENTER_BOTTOM, xlabel, FontId::proportional(11.0), p.weak);
-    let colors = [p.accent, Color32::from_rgb(70, 170, 230), Color32::from_rgb(120, 200, 90), Color32::from_rgb(220, 90, 160)];
+    let colors = [p.accent, Color32::from_rgb(236, 72, 153), Color32::from_rgb(250, 204, 21), Color32::from_rgb(56, 189, 248)];
     for (si, (name, s)) in series.iter().enumerate() {
         let c = colors[si % colors.len()];
         let line: Vec<Pos2> = s.iter().filter(|q| q.0.is_finite() && q.1.is_finite()).map(|(x, y)| pos2(sx(*x), sy(*y))).collect();

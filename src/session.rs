@@ -1836,7 +1836,7 @@ impl Core {
                         }
                         (t, f.unit().to_string())
                     }
-                    _ => ("Model (blue = supports, red = forces, orange = pressure, pink = temperature, cyan = convection, yellow = heat flux, purple = voltage/current, green = inlet/outlet; enclosure drawn as the far walls)".to_string(), String::new()),
+                    _ => ("Model (blue = supports, red = forces, magenta = pressure, pink = temperature, cyan = convection, yellow = heat flux, purple = voltage/current, blue/violet = inlet/outlet; enclosure drawn as the far walls)".to_string(), String::new()),
                 };
                 let png = render::render_png(&scene, &cam, w, h, d.show_mesh, &unit, d.dark)?;
                 let mut text = format!("{title}; view {view}");
