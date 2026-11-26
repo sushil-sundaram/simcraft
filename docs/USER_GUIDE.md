@@ -84,11 +84,16 @@ Command-line options:
   (key maxima, reactions, frequencies, derived quantities such as capacitance or drag).
 - **Properties** (right) — the form for the tool you picked (e.g. Box size, Force vector) and the
   faces you have selected.
-- **Viewport** — left-drag to orbit, right/middle-drag to pan, scroll to zoom (towards the cursor).
-  Click a face to select it, Shift+click to add more. Hovering shows the face name. The toolbar
-  (top-right, or bottom-right in narrow windows) has Fit, Iso, Front, Top, Right and Left views.
-- **Header** — **Connect AI** (MCP setup), **✨ Planner** (local AI to-do lists), the MCP status
-  dot and the light/dark switch (remembered between runs).
+- **Viewport** — hardware OpenGL (iGPU) 3D viewport with MSAA and 24-bit depth buffer (falling back
+  to the software rasterizer if GLSL 1.40 / ES 3.00 is unavailable). Left-drag to orbit,
+  right/middle-drag to pan, scroll to zoom (towards the cursor). Click a face to select it,
+  Shift+click to add more. Hovering shows the face name. The toolbar (top-right, or bottom-right in
+  narrow windows) has Fit, Iso, Front, Top, Right, Left, **Persp** (orthographic / perspective
+  camera toggle), and **Glass** (translucent enclosure toggle when an enclosure is present).
+- **Header** — **Connect AI** (MCP setup), **✨ Planner** (local AI to-do lists), **🗂 Workbench**
+  (toggle the docked bottom drawer for Charts & Path, Studies, PCB DC, Planner, and User Guide;
+  every tab supports **↗ Pop out** / **⬇ Dock**), the MCP status dot and the light/dark switch
+  (remembered between runs).
 - **OPTIMIZE** tab — parameter studies, design optimization and topology optimization (§10).
 - **Examples** menu — ready-made models for every kind of analysis; open one and press Solve.
 - **Status bar** — progress of the running solve or study with **■ Stop** (the SOLVE tab's Solve
@@ -116,7 +121,7 @@ highlight = your current selection.
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y |
 | Help for what you are doing | F1 (or the ⓘ next to the analysis name) |
 | Stop a running solve or study | ■ Stop in the status bar |
-| Views | toolbar at the viewport corner: Fit, Iso, Front, Top, Right, Left |
+| Views & camera | toolbar at the viewport corner: Fit, Iso, Front, Top, Right, Left, Persp, Glass (also under RESULTS ▸ DISPLAY: *Perspective camera*, *Translucent enclosure*) |
 
 The **HELP** tab opens this guide inside the app, with a table of contents and search, and seven
 step-by-step **tutorials** (HELP ▸ TUTORIALS: bracket stress, heat sink, vibration and fatigue, KiCad
@@ -573,10 +578,13 @@ are ignored — that exchange is computed; use them on the enclosure's outer fac
 - The **legend** (top-left) shows the 9 colour bands with min/max. For safety factors and fatigue life the
   scale is reversed so that red is always the critical end.
 - **Deformation scale**: Auto (≈ 5 % of the model size), True scale, or Undeformed.
-- **Animate** — mode shapes, buckled shapes and the deformed shape.
+- **Display options** (RESULTS ▸ DISPLAY & viewport corner toolbar): toggle mesh edges,
+  **Perspective camera** (`set_display` / `render_image` with `perspective`), and **Translucent
+  enclosure** (`translucent_enclosure`) to see solid interiors through air/fluid enclosures.
+- **Animate** — smooth GPU uniform-driven animation of mode shapes, buckled shapes, and deformed shapes.
 - **Step / time slider** — modes, buckling modes, or transient time points.
-- **Cut plane** — slice through the model along X, Y or Z and slide it; essential for fields in air
-  and fluid flow.
+- **Cut plane** — slice through the model along X, Y or Z and slide it (preserving structural
+  deformations across the cut); essential for fields in air and fluid flow.
 - **🎯 Probe** (RESULTS ▸ TOOLS) — click the model to pin the value of the shown field at the nearest
   node; up to 8 markers, cleared with **✖ Clear** or when you solve again. MCP: `probe`.
 - **📏 Path** (RESULTS ▸ TOOLS) — plot any result field along a straight segment between two points **A** and **B** (type coordinates, click **🎯 Pick 2 points** in 3D, or **Use last 2 probes**); export via **💾 Export CSV…** or **📋 Copy CSV**. Points outside the mesh or across holes are omitted cleanly without interpolating over voids. MCP: `plot_path` (with optional `csv_path`).

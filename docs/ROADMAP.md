@@ -238,7 +238,7 @@ Full line-by-line checklists live in `todo.md`. Two deployment targets were audi
 |---|---|---|---|---|
 | P2.S | Security, path sandboxing & parser DoS hardening | S–M | blocks untrusted `.simcraft`/`.stl`/`.kicad_pcb`/MCP risk; prerequisite for web/STEP | done |
 | P2.A1 | Non-blocking meshing, STL BVH, `f32`/`f64` GPU split, undo & cancel cleanup | M | prevents UI freezes and panic-unwind hazards before `P2.3` (STEP) and `P2.5` (octree) | done |
-| P2.A2 | Hardware iGPU 3D viewport (`glow`/`wgpu`) + modular `gui.rs` / `egui_dock` | M–L | replaces 0.6× CPU `render.rs` drag rasterizer; unlocks smooth animations, transparency, gizmos | planned |
+| P2.A2 | Hardware iGPU 3D viewport (`eframe::egui_glow`) + modular `src/ui/` & Workbench drawer | M–L | replaces 0.6× CPU `render.rs` drag rasterizer; unlocks smooth animations, perspective & translucent enclosures | done |
 | P2.U | CAE UX overhaul (3D glyphs, body pick/hide, unified edit forms, pre-flight, trackpad, Copilot) | M–L | best after `P2.A2` (hardware viewport + docked drawers) | planned |
 | P2.W | Web / Tauri split architecture (DOM + WebGL2/WebGPU UI + `axum` Rust backend / demo WASM) | L–XL | required for browser laptop/desktop delivery; depends on `P2.S` and `P2.A1` | planned |
 
@@ -288,17 +288,20 @@ Full line-by-line checklists live in `todo.md`. Two deployment targets were audi
 - **Validate**: Non-blocking UI responsiveness during >500k-cell mesh generation; GPU FDTD passes
   on Metal/DX12/non-`f64` adapters; cancellation tests inside parallel loops leave no poisoned state.
 
-### P2.A2 Hardware iGPU 3D viewport & modular UI shell (M–L)
+### P2.A2 Hardware iGPU 3D viewport & modular UI shell (M–L) — done
 
-- **Hardware 3D viewport (`gui.rs`, `render.rs`)**: Replace CPU RGBA texture uploads (`render::rasterize`
-  + `0.6×` drag downscaling) with an `egui::PaintCallback` (`glow` or `wgpu` on the integrated GPU,
-  keeping `prefer_integrated_gpu()` battery savings). Upload mesh vertex buffers, nodal scalars, and
-  deformations once so orbit, mode animation (currently rebuilding `Scene` every frame via `skey` at
-  `gui.rs:3890`), MSAA, perspective toggle, translucent enclosures, and section cuts run at 60+ FPS.
-  Keep `render::render_png` for headless MCP `render_image` and HTML reports.
-- **Modularize `gui.rs`**: Split the 4,421-line file into `ui/{header,ribbon,browser,properties,viewport,charts,dialogs}.rs`
-  and replace overlapping floating `egui::Window` popups (`Study`, `Help`, `Planner`, `PCB DC`,
-  `History`) with dockable/bottom drawers (`egui_dock` + `egui_plot`).
+- **Hardware 3D viewport (`src/ui/gl_viewport.rs`, `src/ui/viewport.rs`, `src/render.rs`)**:
+  Replace CPU RGBA texture uploads (`render::rasterize` + `0.6×` drag downscaling) with a persistent
+  `eframe::egui_glow` (`glow`) `PaintCallback` on the integrated GPU (preserving `prefer_integrated_gpu()`),
+  retaining `render::rasterize`/`render_png` as headless/fallback. Upload `GpuScene` vertex/index
+  buffers once per `(rev, sel, mesh, dark)`, animate deformations strictly via `u_deform_k` uniform,
+  render into an MSAA + 24-bit depth FBO, add `perspective` and `translucent_enclosure` display modes
+  (exposed in UI + `set_display`/`render_image`), deform section cuts, draw crisp `fwidth` element
+  edges, and pick faces via `QuadPicker` BVH (`tests/viewport_p2_a2.rs`).
+- **Modularize `gui.rs` (`src/ui/{mod,header,ribbon,browser,properties,viewport,gl_viewport,charts,dialogs,theme}.rs`)**:
+  Turn `src/gui.rs` into a thin facade and replace overlapping floating `egui::Window` popups (`Charts & Path`,
+  `Studies`, `PCB DC`, `Planner`, `Guide`) with a docked collapsible/resizable **🗂 Workbench** bottom drawer
+  (with `↗ Pop out` / `⬇ Dock` per tab).
 
 ### P2.U CAE UX overhaul (M–L)
 

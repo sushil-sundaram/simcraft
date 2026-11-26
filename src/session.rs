@@ -1514,6 +1514,12 @@ impl Core {
                 if let Some(b) = a.get("dark_mode").and_then(|v| v.as_bool()) {
                     s.display.dark = b;
                 }
+                if let Some(b) = a.get("perspective").and_then(|v| v.as_bool()) {
+                    s.display.perspective = b;
+                }
+                if let Some(b) = a.get("translucent_enclosure").and_then(|v| v.as_bool()) {
+                    s.display.translucent_enclosure = b;
+                }
                 apply_section(&mut s.display, a)?;
                 apply_cylindrical(&mut s.display.cylindrical, a)?;
                 if let Some(v) = opt_str(a, "view") {
@@ -1541,6 +1547,12 @@ impl Core {
                 if let Some(x) = opt_num(a, "deformation_scale") {
                     d.deformation_scale = Some(x);
                 }
+                if let Some(b) = a.get("perspective").and_then(|v| v.as_bool()) {
+                    d.perspective = b;
+                }
+                if let Some(b) = a.get("translucent_enclosure").and_then(|v| v.as_bool()) {
+                    d.translucent_enclosure = b;
+                }
                 apply_section(&mut d, a)?;
                 apply_cylindrical(&mut d.cylindrical, a)?;
                 let w = opt_num(a, "width").unwrap_or(900.0).clamp(200.0, 2000.0) as usize;
@@ -1550,6 +1562,7 @@ impl Core {
                 let hl: HashSet<u32> = HashSet::new();
                 let scene = render::build_scene(&mesh, &s.model, res.as_deref(), &d, &hl, 1.0);
                 let mut cam = Camera::default();
+                cam.perspective = d.perspective;
                 if !cam.set_view(view) {
                     bail!("unknown view '{view}', use {:?}", render::VIEWS);
                 }
@@ -2184,7 +2197,7 @@ pub fn tool_defs() -> Vec<Value> {
         t("get_results", "Summary of the last solution: min/max with locations, reaction forces / heat flows, natural frequencies.", json!({}), &[]),
         t("probe", "Result values at the node nearest to a point (mm), including radial/hoop/axial stresses around the cylindrical axis.", json!({"point": v3s("[x,y,z] mm"), "mode": {"type": "integer", "description": "1-based mode number for modal"}, "cylindrical_origin": v3s("Origin on cylindrical axis mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}}), &["point"]),
         t("plot_path", "Sample any result field along a straight line segment from 'from' to 'to' [x,y,z] mm, returning sample points, min/max/mean and CSV (optionally written to csv_path).", json!({"from": v3s("Start [x,y,z] mm"), "to": v3s("End [x,y,z] mm"), "field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "samples": {"type": "integer", "description": "2..=500 points (default 50)"}, "mode": {"type": "integer"}, "cylindrical_origin": v3s("Cylindrical origin mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}, "csv_path": {"type": "string", "description": "optional .csv output file path"}}), &["from", "to"]),
-        t("set_display", "Change what the GUI viewport shows (including cylindrical coordinate origin/axis for radial/hoop/axial stress).", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean"}, "mode": {"type": "integer"}, "deformation_scale": {"description": "number, or \"auto\"; 0 = undeformed, 1 = true scale"}, "show_mesh": {"type": "boolean"}, "dark_mode": {"type": "boolean", "description": "Dark UI and viewport theme"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"], "description": "Cut-plane view through the domain (great for fields in air and fluid flow)"}, "section_position": {"type": "number", "description": "0..1 across the domain (default 0.5)"}, "cylindrical_origin": v3s("Origin [x,y,z] mm for radial/hoop/axial stresses (default [0,0,0])"), "cylindrical_axis": {"description": "'x', 'y', 'z' or direction [dx,dy,dz] for cylindrical stresses (default 'z')"}, "view": {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top", "bottom", "iso_back", "fit"]}}), &[]),
+        t("set_display", "Change what the GUI viewport shows (including cylindrical coordinate origin/axis, perspective projection, and translucent enclosure walls).", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean"}, "mode": {"type": "integer"}, "deformation_scale": {"description": "number, or \"auto\"; 0 = undeformed, 1 = true scale"}, "show_mesh": {"type": "boolean"}, "dark_mode": {"type": "boolean", "description": "Dark UI and viewport theme"}, "perspective": {"type": "boolean", "description": "Use 3D perspective camera (false = orthographic)"}, "translucent_enclosure": {"type": "boolean", "description": "Render enclosure walls as translucent glass"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"], "description": "Cut-plane view through the domain (great for fields in air and fluid flow)"}, "section_position": {"type": "number", "description": "0..1 across the domain (default 0.5)"}, "cylindrical_origin": v3s("Origin [x,y,z] mm for radial/hoop/axial stresses (default [0,0,0])"), "cylindrical_axis": {"description": "'x', 'y', 'z' or direction [dx,dy,dz] for cylindrical stresses (default 'z')"}, "view": {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top", "bottom", "iso_back", "fit"]}}), &[]),
         t("render_image", "Render a PNG picture of the model or of a result contour so you can see it.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean", "description": "false = show geometry with supports/loads"}, "mode": {"type": "integer"}, "view": {"type": "string", "enum": render::VIEWS}, "deformation_scale": {"type": "number"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"]}, "section_position": {"type": "number"}, "cylindrical_origin": v3s("Cylindrical origin mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}, "width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
         t("export_vtk", "Write mesh + results to a legacy .vtk file for ParaView.", json!({"path": {"type": "string"}}), &["path"]),
         t("save_project", "Save the project (.simcraft JSON).", json!({"path": {"type": "string"}}), &[]),
