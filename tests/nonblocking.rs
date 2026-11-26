@@ -26,7 +26,7 @@ fn mesh_build_cancels_cleanly_on_large_grid() {
     // 576,000 cells (>500k) with boundary fitting enabled
     let cancel = Arc::new(AtomicBool::new(true));
     let t0 = Instant::now();
-    let err = mesh::build_for_cancellable(&m, 1.0, 2_000_000, &cancel).err().expect("pre-cancelled mesh must abort");
+    let err = mesh::build_for_cancellable(&m, 1.0, 2_000_000, &cancel).expect_err("pre-cancelled mesh must abort");
     assert!(err.is::<fem::Cancelled>(), "unexpected error: {err:#}");
     assert!(t0.elapsed().as_secs_f64() < 1.0);
 

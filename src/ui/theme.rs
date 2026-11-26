@@ -54,6 +54,20 @@ pub fn pal(dark: bool) -> Pal {
     }
 }
 
+/// UI typefaces: Adwaita Sans (GNOME's build of Inter, designed for screens) for all text and
+/// Adwaita Mono for code and tables of numbers. Both are bundled (SIL OFL 1.1, `assets/fonts`) so the
+/// app looks the same on every machine; egui's own fonts stay behind them as fallbacks for the emoji
+/// icons used in the ribbon and browser.
+pub fn install_fonts(ctx: &egui::Context) {
+    use std::sync::Arc;
+    let mut f = egui::FontDefinitions::default();
+    f.font_data.insert("adwaita-sans".into(), Arc::new(egui::FontData::from_static(include_bytes!("../../assets/fonts/AdwaitaSans-Regular.ttf"))));
+    f.font_data.insert("adwaita-mono".into(), Arc::new(egui::FontData::from_static(include_bytes!("../../assets/fonts/AdwaitaMono-Regular.ttf"))));
+    f.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "adwaita-sans".into());
+    f.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "adwaita-mono".into());
+    ctx.set_fonts(f);
+}
+
 pub fn install_style(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| {
         let p = pal(s.visuals.dark_mode);
@@ -390,15 +404,14 @@ pub fn line_chart(ui: &mut egui::Ui, p: &Pal, series: &[(String, Vec<(f64, f64)>
         }
         painter.text(plot.min + vec2(8.0, 6.0 + 14.0 * si as f32), Align2::LEFT_TOP, name, FontId::proportional(11.0), c);
     }
-    if let Some(hp) = resp.hover_pos() {
-        if plot.contains(hp) {
+    if let Some(hp) = resp.hover_pos()
+        && plot.contains(hp) {
             let x = x0 + ((hp.x - plot.min.x) / plot.width()) as f64 * (x1 - x0);
             if let Some((bx, by)) = series.first().and_then(|s| s.1.iter().min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs())).copied()) {
                 painter.circle_stroke(pos2(sx(bx), sy(by)), 4.0, Stroke::new(1.5, p.text));
                 painter.text(pos2(sx(bx) + 8.0, sy(by) - 8.0), Align2::LEFT_BOTTOM, format!("{}, {}", render::fmt_val(bx), render::fmt_val(by)), FontId::proportional(11.0), p.text);
             }
         }
-    }
 }
 
 /// Inline markdown (**bold**, `code`, [link](url)) as a wrapped layout job; `hl` is highlighted.
@@ -443,10 +456,10 @@ pub fn md_inline(text: &str, p: &Pal, size: f32, hl: &str) -> egui::text::Layout
             i += 1;
             continue;
         }
-        if !code && c == '[' {
-            if let Some(close) = chars[i..].iter().position(|&x| x == ']').map(|k| i + k) {
-                if chars.get(close + 1) == Some(&'(') {
-                    if let Some(end) = chars[close..].iter().position(|&x| x == ')').map(|k| close + k) {
+        if !code && c == '['
+            && let Some(close) = chars[i..].iter().position(|&x| x == ']').map(|k| i + k)
+                && chars.get(close + 1) == Some(&'(')
+                    && let Some(end) = chars[close..].iter().position(|&x| x == ')').map(|k| close + k) {
                         segs.push((std::mem::take(&mut cur), fmt(bold, code, ital)));
                         let mut f = fmt(bold, code, ital);
                         f.color = p.accent;
@@ -454,9 +467,6 @@ pub fn md_inline(text: &str, p: &Pal, size: f32, hl: &str) -> egui::text::Layout
                         i = end + 1;
                         continue;
                     }
-                }
-            }
-        }
         cur.push(c);
         i += 1;
     }

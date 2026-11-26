@@ -44,7 +44,7 @@ Sizes: **S** ≈ one session, **M** ≈ 2–3, **L** ≈ 4–6, **XL** > 6.
 | P2.1 | Thermal radiation + temperature-dependent properties | M | biggest missing physics for electronics cooling; self-contained | done |
 | P2.2 | Path plots, cylindrical results, mesh-convergence assistant | S–M | cheap, raises trust in every result | done |
 | P2.3 | STEP import (spike first) | M–L | unlocks real CAD parts and assemblies | done |
-| P2.4 | Contact, bolt pretension, springs, remote points | L | assemblies; best after P2.3 | planned |
+| P2.4 | Contact, bolt pretension, springs, remote points | L | assemblies; best after P2.3 | done |
 | P2.5 | Local mesh refinement (octree) + adaptive error control | XL | real parts with small features; touches every FE solver | planned |
 | P2.6 | Broadband FDTD: lumped ports, S-parameters, emissions spectrum, ground plane | M–L | completes the EMC story started in Tier 3 | planned |
 | P2.7 | Fans, grilles / porous media, compact package models, PCB Joule heat | M | Icepak parity for boards and enclosures | planned |

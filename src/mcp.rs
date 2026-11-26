@@ -58,11 +58,10 @@ pub fn run() {
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
                 let (res, backend) = call_tool(&local, &name, &args);
                 let mut res = res;
-                if backend != last_backend && !last_backend.is_empty() {
-                    if let Some(c) = res["content"].as_array_mut() {
+                if backend != last_backend && !last_backend.is_empty()
+                    && let Some(c) = res["content"].as_array_mut() {
                         c.insert(0, json!({"type": "text", "text": format!("(now running in SimCraft {backend})")}));
                     }
-                }
                 last_backend = backend;
                 Ok(res)
             }

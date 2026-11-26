@@ -573,7 +573,7 @@ impl SimApp {
                 self.sel_load = None;
                 return;
             };
-            (format!("l:{id}"), EditTarget::Load(load_to_draft(id, &l.load)))
+            (format!("l:{id}"), EditTarget::Load(Box::new(load_to_draft(id, &l.load))))
         };
 
         if !matches!(&self.edit_target, Some((k, _)) if *k == key) {
@@ -635,22 +635,20 @@ impl SimApp {
                         Shape::Box { min, size } => {
                             ui.label(RichText::new(format!("Corner ({})", lsf.trim())).small().color(p.weak));
                             xyz_scaled(ui, "eb-bmin", min, ls, "", 0.5);
-                            if let Some(c) = snap_pt {
-                                if ui.small_button("📍 Snap corner to selected face center").clicked() {
+                            if let Some(c) = snap_pt
+                                && ui.small_button("📍 Snap corner to selected face center").clicked() {
                                     *min = c;
                                 }
-                            }
                             ui.label(RichText::new(format!("Size ({})", lsf.trim())).small().color(p.weak));
                             xyz_scaled(ui, "eb-bsize", size, ls, "", 0.5);
                         }
                         Shape::Cylinder { base, axis, radius, height } => {
                             ui.label(RichText::new(format!("Base centre ({})", lsf.trim())).small().color(p.weak));
                             xyz_scaled(ui, "eb-cbase", base, ls, "", 0.5);
-                            if let Some(c) = snap_pt {
-                                if ui.small_button("📍 Snap base to selected face center").clicked() {
+                            if let Some(c) = snap_pt
+                                && ui.small_button("📍 Snap base to selected face center").clicked() {
                                     *base = c;
                                 }
-                            }
                             ui.horizontal(|ui| {
                                 ui.label("Axis");
                                 for a in [Axis::X, Axis::Y, Axis::Z] {
@@ -669,11 +667,10 @@ impl SimApp {
                         Shape::Sphere { center, radius } => {
                             ui.label(RichText::new(format!("Centre ({})", lsf.trim())).small().color(p.weak));
                             xyz_scaled(ui, "eb-sc", center, ls, "", 0.5);
-                            if let Some(c) = snap_pt {
-                                if ui.small_button("📍 Snap centre to selected face center").clicked() {
+                            if let Some(c) = snap_pt
+                                && ui.small_button("📍 Snap centre to selected face center").clicked() {
                                     *center = c;
                                 }
-                            }
                             ui.horizontal(|ui| {
                                 ui.label("Radius");
                                 drag_scaled(ui, radius, ls, lsf, 0.2, Some((0.01, 1e6)));
@@ -781,7 +778,7 @@ impl SimApp {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.add_enabled(differs && valid, primary(&p, "Apply")).clicked() {
-                            apply_load = Some(ld.clone());
+                            apply_load = Some((**ld).clone());
                         }
                         if ui.add_enabled(differs, egui::Button::new("Revert")).clicked() {
                             *ld = orig.clone();
@@ -889,12 +886,11 @@ impl SimApp {
                 self.edit_target = None;
             }
         }
-        if let Some((t, a)) = action {
-            if self.run(t, a) {
+        if let Some((t, a)) = action
+            && self.run(t, a) {
                 self.edit_target = None;
                 self.need_fit = true;
             }
-        }
     }
 
     pub(super) fn properties(&mut self, ui: &mut egui::Ui) {
@@ -944,18 +940,27 @@ impl SimApp {
                 ui.add_space(10.0);
                 card(ui, &p, |ui| {
                     ui.label(RichText::new("Navigation & Shortcuts").strong());
-                    for (k, v) in [
-                        ("Left drag", "Orbit"),
-                        ("Right / Middle / Space+drag", "Pan"),
-                        ("Pinch / Wheel", "Zoom (or 2-finger Pan)"),
-                        ("Click / Shift+click", "Select face or body"),
-                        ("Right click", "Depth-peel & body actions"),
-                        ("F · 1–6 · P · H · Del · Esc", "Fit · Views · Persp · Hide · Del"),
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(k).small().color(p.weak));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(v).small()));
-                        });
+                    // one row per shortcut, wrapping as a whole in a narrow panel
+                    {
+                        for (k, v) in [
+                            ("Left drag", "Orbit"),
+                            ("Right / middle drag, Space+drag", "Pan"),
+                            ("Wheel, pinch", "Zoom (two-finger scroll pans in Pan mode)"),
+                            ("Click, Shift+click", "Select face or body"),
+                            ("Right click", "Select behind, body actions"),
+                            ("F", "Fit the view"),
+                            ("1 – 6", "Standard views"),
+                            ("P", "Perspective / orthographic"),
+                            ("H, Shift+H", "Hide selection, show all"),
+                            ("Delete", "Delete selection"),
+                            ("Esc", "Clear selection"),
+                        ] {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(RichText::new(k).small().strong().color(p.weak));
+                                ui.label(RichText::new(v).small());
+                            });
+                        }
                     }
                 });
             }
@@ -965,11 +970,10 @@ impl SimApp {
                     name_row(ui, &mut self.f.name);
                     ui.label(RichText::new(format!("Corner ({})", lsf.trim())).small().color(p.weak));
                     xyz_scaled(ui, "bmin", &mut self.f.bmin, ls, "", 0.5);
-                    if let Some(c) = snap_pt {
-                        if ui.small_button("📍 Snap corner to selected face center").clicked() {
+                    if let Some(c) = snap_pt
+                        && ui.small_button("📍 Snap corner to selected face center").clicked() {
                             self.f.bmin = c;
                         }
-                    }
                     ui.label(RichText::new(format!("Size ({})", lsf.trim())).small().color(p.weak));
                     xyz_scaled(ui, "bsize", &mut self.f.bsize, ls, "", 0.5);
                     ui.checkbox(&mut self.f.subtract, "Cut from existing bodies");
@@ -993,11 +997,10 @@ impl SimApp {
                     name_row(ui, &mut self.f.name);
                     ui.label(RichText::new(format!("Base centre ({})", lsf.trim())).small().color(p.weak));
                     xyz_scaled(ui, "cbase", &mut self.f.cbase, ls, "", 0.5);
-                    if let Some(c) = snap_pt {
-                        if ui.small_button("📍 Snap base to selected face center").clicked() {
+                    if let Some(c) = snap_pt
+                        && ui.small_button("📍 Snap base to selected face center").clicked() {
                             self.f.cbase = c;
                         }
-                    }
                     ui.horizontal(|ui| {
                         ui.label("Axis");
                         for (i, a) in ["X", "Y", "Z"].iter().enumerate() {
@@ -1033,11 +1036,10 @@ impl SimApp {
                     name_row(ui, &mut self.f.name);
                     ui.label(RichText::new(format!("Centre ({})", lsf.trim())).small().color(p.weak));
                     xyz_scaled(ui, "sc", &mut self.f.scenter, ls, "", 0.5);
-                    if let Some(c) = snap_pt {
-                        if ui.small_button("📍 Snap centre to selected face center").clicked() {
+                    if let Some(c) = snap_pt
+                        && ui.small_button("📍 Snap centre to selected face center").clicked() {
                             self.f.scenter = c;
                         }
-                    }
                     ui.horizontal(|ui| {
                         ui.label("Radius");
                         drag_scaled(ui, &mut self.f.sradius, ls, lsf, 0.2, Some((0.01, 1e6)));

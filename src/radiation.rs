@@ -153,11 +153,10 @@ impl Bvh {
             }
             if n.count > 0 {
                 for &t in &self.order[n.start..n.start + n.count] {
-                    if let Some(s) = ray_tri(o, d, &self.tris[t].v) {
-                        if best.is_none_or(|b| s < b.0) {
+                    if let Some(s) = ray_tri(o, d, &self.tris[t].v)
+                        && best.is_none_or(|b| s < b.0) {
                             best = Some((s, self.tris[t].face));
                         }
-                    }
                 }
             } else {
                 stack.push(n.left);

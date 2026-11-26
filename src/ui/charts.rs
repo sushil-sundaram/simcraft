@@ -25,15 +25,14 @@ impl SimApp {
             None => {}
         }
         let sig = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).study.as_ref().map(|st| format!("{}|{}|{}", st.kind, st.message, st.seconds));
-        if let Some(sig) = sig {
-            if sig != self.opt.seen {
+        if let Some(sig) = sig
+            && sig != self.opt.seen {
                 self.opt.seen = sig;
                 self.opt.show_results = true;
                 self.opt.whatif.clear();
                 self.opt.whatif_key.clear();
                 self.open_drawer(DrawerTab::Study);
             }
-        }
 
         if let Some(job) = &self.planner.job {
             let done = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
@@ -48,11 +47,10 @@ impl SimApp {
             let done = job.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
             if let Some(r) = done {
                 self.planner.models_job = None;
-                if let Ok(m) = &r {
-                    if self.planner.model.is_empty() {
+                if let Ok(m) = &r
+                    && self.planner.model.is_empty() {
                         self.planner.model = crate::assistant::default_model(m).unwrap_or_default();
                     }
-                }
                 self.planner.models = Some(r);
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));
@@ -68,13 +66,12 @@ impl SimApp {
                         Ok(nets) => {
                             if nets.is_empty() {
                                 self.pcb.error = Some("This board has no nets with two or more pads".into());
-                            } else if self.pcb.net.is_empty() && self.pcb.from.is_empty() && self.pcb.to.is_empty() {
-                                if let Some(i) = super::default_net(&nets) {
+                            } else if self.pcb.net.is_empty() && self.pcb.from.is_empty() && self.pcb.to.is_empty()
+                                && let Some(i) = super::default_net(&nets) {
                                     self.pcb.net = nets[i].0.clone();
                                     self.pcb.from = nets[i].1.first().cloned().unwrap_or_default();
                                     self.pcb.to = nets[i].1.last().cloned().unwrap_or_default();
                                 }
-                            }
                             self.pcb.nets = nets;
                         }
                         Err(e) => self.pcb.error = Some(e),
@@ -326,14 +323,13 @@ impl SimApp {
                 self.path.to = m.nodes[two_probes[0] as usize];
             }
             if let Some(pp) = &self.path.plot {
-                if ui.button("💾 Export CSV…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("path-plot.csv").save_file() {
+                if ui.button("💾 Export CSV…").clicked()
+                    && let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("path-plot.csv").save_file() {
                         match std::fs::write(&path, pp.to_csv()) {
                             Ok(()) => self.toast = Some((format!("Saved {}", path.display()), false, 4.0)),
                             Err(e) => self.toast = Some((format!("CSV error: {e}"), true, 6.0)),
                         }
                     }
-                }
                 if ui.button("📋 Copy CSV").clicked() {
                     ui.ctx().copy_text(pp.to_csv());
                     self.toast = Some(("Copied path CSV to clipboard".into(), false, 3.0));
@@ -645,15 +641,14 @@ impl SimApp {
                         }
                     }
                 });
-                if let Some(n) = picked {
-                    if n != f.net {
+                if let Some(n) = picked
+                    && n != f.net {
                         let pads = f.nets.iter().find(|(m, _)| *m == n).map(|x| x.1.clone()).unwrap_or_default();
                         f.from = pads.first().cloned().unwrap_or_default();
                         f.to = pads.last().cloned().unwrap_or_default();
                         f.net = n;
                         f.result = None;
                     }
-                }
             });
             ui.end_row();
             let pads: Vec<String> = f.nets.iter().find(|(n, _)| *n == f.net).map(|x| x.1.clone()).unwrap_or_default();
@@ -691,11 +686,10 @@ impl SimApp {
                 ui.label(RichText::new("pick two different pads").color(p.warn));
             }
         });
-        if cancel_nets {
-            if let Some((c, _)) = f.nets_job.take() {
+        if cancel_nets
+            && let Some((c, _)) = f.nets_job.take() {
                 c.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-        }
         if let Some(e) = &f.error {
             ui.add_space(4.0);
             ui.label(RichText::new(format!("⚠ {e}")).color(p.err));
@@ -738,11 +732,10 @@ impl SimApp {
                     ui.label(RichText::new(label).color(p.weak));
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(value).strong());
-                        if let Some(pt) = pt_opt {
-                            if ui.small_button("📍 Locate").clicked() {
+                        if let Some(pt) = pt_opt
+                            && ui.small_button("📍 Locate").clicked() {
                                 pin = Some(pt);
                             }
-                        }
                     });
                     ui.end_row();
                 }
@@ -1037,11 +1030,10 @@ impl SimApp {
             });
         }
         for (idx_opt, t, a) in actions {
-            if self.run(&t, a) {
-                if let Some(i) = idx_opt {
+            if self.run(&t, a)
+                && let Some(i) = idx_opt {
                     self.planner.executed_actions.insert(i);
                 }
-            }
         }
     }
 

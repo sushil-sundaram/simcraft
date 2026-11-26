@@ -471,11 +471,10 @@ impl PcbData {
         let mut layer_names: Vec<String> = Vec::new();
         if let Some(ls) = root.get("layers") {
             for l in ls.items().iter().skip(1) {
-                if let Some(name) = l.atom(1) {
-                    if name.ends_with(".Cu") {
+                if let Some(name) = l.atom(1)
+                    && name.ends_with(".Cu") {
                         layer_names.push(name.to_string());
                     }
-                }
             }
         }
         // F.Cu first, inner layers in order, B.Cu last
@@ -502,11 +501,10 @@ impl PcbData {
             for l in st.all("layer") {
                 let t = l.get("thickness").and_then(|t| t.num(1)).unwrap_or(0.0);
                 stack_total += t;
-                if let Some(name) = l.atom(1) {
-                    if name.ends_with(".Cu") {
+                if let Some(name) = l.atom(1)
+                    && name.ends_with(".Cu") {
                         cu_t.insert(name.to_string(), t);
                     }
-                }
             }
         }
         let thickness = root.get("general").and_then(|g| g.get("thickness")).and_then(|t| t.num(1)).filter(|t| *t > 0.0).unwrap_or(if stack_total > 0.2 { stack_total } else { 1.6 });
@@ -515,24 +513,22 @@ impl PcbData {
         // ---- outline
         let mut pieces: Vec<Vec<P2>> = Vec::new();
         for g in root.items() {
-            if g.str_of("layer") == Some("Edge.Cuts") {
-                if let Some(p) = graphic(g) {
+            if g.str_of("layer") == Some("Edge.Cuts")
+                && let Some(p) = graphic(g) {
                     pieces.push(p);
                 }
-            }
         }
         let footprints_sx: Vec<&Sx> = root.all("footprint").chain(root.all("module")).collect();
         for fp in &footprints_sx {
             let (fx, fy, frot) = fp.xy("at").unwrap_or((0.0, 0.0, 0.0));
             for g in fp.items() {
-                if g.str_of("layer") == Some("Edge.Cuts") {
-                    if let Some(p) = graphic(g) {
+                if g.str_of("layer") == Some("Edge.Cuts")
+                    && let Some(p) = graphic(g) {
                         pieces.push(p.into_iter().map(|q| {
                             let r = rot(q[0], q[1], frot);
                             [fx + r[0], fy + r[1]]
                         }).collect());
                     }
-                }
             }
         }
         let (mut loops, open) = join_loops(pieces, 0.02);
@@ -597,16 +593,14 @@ impl PcbData {
             let mut found = false;
             for want in [["F.CrtYd", "B.CrtYd"], ["F.Fab", "B.Fab"]] {
                 for g in fp.items() {
-                    if let Some(l) = g.str_of("layer") {
-                        if want.contains(&l) {
-                            if let Some(pts) = graphic(g) {
+                    if let Some(l) = g.str_of("layer")
+                        && want.contains(&l)
+                            && let Some(pts) = graphic(g) {
                                 for q in pts {
                                     grow(to_world(q));
                                     found = true;
                                 }
                             }
-                        }
-                    }
                 }
                 if found {
                     break;

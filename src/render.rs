@@ -402,12 +402,11 @@ impl QuadPicker {
             }
             if nd.left == usize::MAX {
                 for &qi in &self.indices[nd.start..nd.start + nd.len] {
-                    if let Some((t, pt)) = Self::quad_hit(&self.quads[qi], orig, dir, anim, skip_enclosure, true) {
-                        if t < best_t {
+                    if let Some((t, pt)) = Self::quad_hit(&self.quads[qi], orig, dir, anim, skip_enclosure, true)
+                        && t < best_t {
                             best_t = t;
                             best_face = Some((self.quads[qi].face, pt));
                         }
-                    }
                 }
             } else {
                 let dl = Self::ray_aabb(orig, inv_d, self.nodes[nd.left].lo, self.nodes[nd.left].hi, self.nodes[nd.left].max_d * anim_scale + 1e-4, best_t);
@@ -527,12 +526,11 @@ fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &D
             range = Some((mn, mx));
             values = Some(v);
         }
-        if let Some(d) = r.deformation(disp.mode) {
-            if d.len() == mesh.nodes.len() {
+        if let Some(d) = r.deformation(disp.mode)
+            && d.len() == mesh.nodes.len() {
                 scale_used = disp.deformation_scale.unwrap_or_else(|| auto_scale(mesh, d));
                 defl = Some(d);
             }
-        }
     }
     let mut face_color: Vec<Option<[u8; 3]>> = vec![None; mesh.faces.len()];
     if !use_res {
@@ -544,8 +542,8 @@ fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &D
             }
         }
         for it in &model.loads {
-            if let Some(b) = it.load.body() {
-                if let Ok(els) = mesh.body_elems(b) {
+            if let Some(b) = it.load.body()
+                && let Ok(els) = mesh.body_elems(b) {
                     let set: HashSet<u32> = els.iter().map(|&e| e as u32).collect();
                     for (fi, f) in mesh.faces.iter().enumerate() {
                         if !f.outer && set.contains(&f.elem) && face_color[fi].is_none() {
@@ -553,7 +551,6 @@ fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &D
                         }
                     }
                 }
-            }
         }
     }
     let section = disp.section.map(|sec| {
@@ -578,11 +575,10 @@ fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &D
         if bname.is_some_and(|n| disp.hidden_bodies.contains(n)) {
             continue;
         }
-        if let Some((a, pc)) = section {
-            if !f.outer && mesh.elem_center(f.elem as usize)[a] < pc {
+        if let Some((a, pc)) = section
+            && !f.outer && mesh.elem_center(f.elem as usize)[a] < pc {
                 continue;
             }
-        }
         if f.outer {
             has_enclosure = true;
         }
@@ -767,7 +763,7 @@ pub fn build_gpu_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, di
         }
     }
     let mut undeformed_lines = Vec::with_capacity(prep.undeformed.len() * 2);
-    for quad in prep.undeformed.chunks_exact(4) {
+    for quad in prep.undeformed.as_chunks::<4>().0 {
         for e in 0..4 {
             let a = quad[e];
             let b = quad[(e + 1) % 4];

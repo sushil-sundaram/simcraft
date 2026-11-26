@@ -19,7 +19,7 @@ const G: f64 = 9.80665;
 const TWO_PI: f64 = std::f64::consts::TAU;
 
 fn modes_for(model: &Model) -> usize {
-    model.analysis.modes.max(12).min(40)
+    model.analysis.modes.clamp(12, 40)
 }
 
 fn von_mises(s: &[f64; 6]) -> f64 {

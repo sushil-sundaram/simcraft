@@ -578,10 +578,12 @@ impl Gpu {
         if big > al.max_storage_buffer_binding_size as u64 || big > al.max_buffer_size {
             bail!("FDTD grid ({} MB per buffer) exceeds the GPU's buffer size limit", big / 1_000_000);
         }
-        let mut limits = wgpu::Limits::default();
-        limits.max_storage_buffers_per_shader_stage = 8;
-        limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
-        limits.max_buffer_size = al.max_buffer_size;
+        let limits = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 8,
+            max_storage_buffer_binding_size: al.max_storage_buffer_binding_size,
+            max_buffer_size: al.max_buffer_size,
+            ..wgpu::Limits::default()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("simcraft-fdtd"),
             required_features: wgpu::Features::empty(),
