@@ -15,9 +15,75 @@ use crate::results::*;
 use crate::sparse::*;
 use anyhow::{Result, bail};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-pub type Prog<'a> = &'a dyn Fn(f64, &str);
+/// Error returned when a long-running job is stopped cooperatively via an [`AtomicBool`].
+#[derive(Debug, Clone, Copy)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+pub static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(anyhow::Error::new(Cancelled))
+    } else {
+        Ok(())
+    }
+}
+
+/// Progress reporter paired with a shared cooperative cancellation flag (`Sync` across `rayon` workers).
+#[derive(Clone, Copy)]
+pub struct Progress<'a> {
+    pub cancel: &'a AtomicBool,
+    cb: &'a (dyn Fn(f64, &str) + Sync),
+    offset: f64,
+    scale: f64,
+}
+
+impl<'a> Progress<'a> {
+    pub fn new(cancel: &'a AtomicBool, cb: &'a (dyn Fn(f64, &str) + Sync)) -> Self {
+        Self { cancel, cb, offset: 0.0, scale: 1.0 }
+    }
+    pub fn cancel_only(cancel: &'a AtomicBool) -> Self {
+        Self { cancel, cb: &|_, _| {}, offset: 0.0, scale: 1.0 }
+    }
+    pub fn noop() -> Self {
+        Self::cancel_only(&NEVER_CANCEL)
+    }
+    pub fn slice(self, offset: f64, scale: f64) -> Self {
+        Self { cancel: self.cancel, cb: self.cb, offset: self.offset + self.scale * offset, scale: self.scale * scale }
+    }
+    #[inline]
+    pub fn check(self) -> Result<()> {
+        check_cancel(self.cancel)
+    }
+    #[inline]
+    pub fn report(self, frac: f64, msg: &str) -> Result<()> {
+        self.check()?;
+        (self.cb)(self.offset + self.scale * frac, msg);
+        Ok(())
+    }
+    pub fn scalar(self, offset: f64, scale: f64, msg: &'a str) -> impl Fn(f64) -> Result<()> + Sync + 'a {
+        let sub = self.slice(offset, scale);
+        move |p| sub.report(p, msg)
+    }
+    pub fn check_scalar(self) -> impl Fn(f64) -> Result<()> + Sync + 'a {
+        let cancel = self.cancel;
+        move |_| check_cancel(cancel)
+    }
+}
+
+pub type Prog<'a> = Progress<'a>;
 
 pub const GP: f64 = 0.577_350_269_189_625_8;
 
@@ -455,10 +521,10 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog) -> Result<Results> {
         StaticStructural => structural(model, mesh, None, prog, &mut res)?,
         SteadyThermal => thermal(model, mesh, None, prog, &mut res)?,
         ThermalStress => {
-            thermal(model, mesh, None, &|f, m| prog(f * 0.4, m), &mut res)?;
+            thermal(model, mesh, None, prog.slice(0.0, 0.4), &mut res)?;
             let t = res.temp.clone().unwrap();
             res.reactions.clear();
-            structural(model, mesh, Some(&t), &|f, m| prog(0.4 + 0.6 * f, m), &mut res)?;
+            structural(model, mesh, Some(&t), prog.slice(0.4, 0.6), &mut res)?;
         }
         Modal => modal(model, mesh, prog, &mut res)?,
         HarmonicResponse => crate::vibration::harmonic(model, mesh, prog, &mut res)?,
@@ -477,9 +543,9 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog) -> Result<Results> {
             crate::fields::current_flow(model, mesh, prog, &mut res)?;
         }
         ThermalElectric => {
-            let q = crate::fields::current_flow(model, mesh, &|f, m| prog(f * 0.4, m), &mut res)?;
+            let q = crate::fields::current_flow(model, mesh, prog.slice(0.0, 0.4), &mut res)?;
             let currents = std::mem::take(&mut res.reactions);
-            thermal(model, mesh, Some(&q), &|f, m| prog(0.4 + 0.6 * f, m), &mut res)?;
+            thermal(model, mesh, Some(&q), prog.slice(0.4, 0.6), &mut res)?;
             for r in std::mem::replace(&mut res.reactions, currents) {
                 res.quantity(&format!("Heat flow through #{} ({})", r.load_id, r.label), r.value[0], "W");
             }
@@ -518,13 +584,18 @@ pub struct Assembled {
 pub fn assemble_structural(model: &Model, mesh: &Mesh, prog: Prog) -> Result<(Assembled, Vec<ElemUnit>)> {
     let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
-    prog(0.0, "assembling stiffness");
+    prog.report(0.0, "assembling stiffness")?;
     let units: Vec<ElemUnit> = mesh.materials.iter().map(|m| hex_elastic_unit(m.poisson_ratio)).collect();
     let mut k = NodeSparse::new(nn, &mesh.elems, 3);
     let general: Vec<Option<ElemGeneral>> = (0..mesh.elems.len())
         .into_par_iter()
-        .map(|e| mesh.is_fitted(e).then(|| hex_elastic_general(&elem_xyz_m(mesh, e), mesh.materials[mesh.elem_mat[e] as usize].poisson_ratio)))
-        .collect();
+        .map(|e| -> Result<_> {
+            if e % 1024 == 0 {
+                prog.check()?;
+            }
+            Ok(mesh.is_fitted(e).then(|| hex_elastic_general(&elem_xyz_m(mesh, e), mesh.materials[mesh.elem_mat[e] as usize].poisson_ratio)))
+        })
+        .collect::<Result<Vec<_>>>()?;
     for (e, en) in mesh.elems.iter().enumerate() {
         let m = &mesh.materials[mesh.elem_mat[e] as usize];
         match &general[e] {
@@ -623,12 +694,12 @@ fn structural_mg(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog, 
     let mut u = vec![0.0; nn * 3];
     let mut pass = 0;
     loop {
-        prog(0.03, "building multigrid");
+        prog.report(0.03, "building multigrid")?;
         let t0 = Instant::now();
         let mg = crate::elastic_mg::ElasticMg::new(mesh, &units, fixed.iter().map(|g| g.is_some()).collect())?;
         let ug: Vec<f64> = fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
         let t1 = Instant::now();
-        let its = mg.solve(&f_ext, &ug, &mut u, 1e-8, 500, &|p| prog(0.08 + 0.82 * p, "solving (multigrid CG)"))?;
+        let its = mg.solve(&f_ext, &ug, &mut u, 1e-8, 500, &prog.scalar(0.08, 0.82, "solving (multigrid CG)"))?;
         if std::env::var_os("SIMCRAFT_PROFILE").is_some() {
             eprintln!("[mg] setup {:.2} s, {its} CG iterations {:.2} s", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
         }
@@ -653,7 +724,7 @@ fn structural_mg(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog, 
             }
         }
         pass += 1;
-        prog(0.5, &format!("contact iteration {pass}: {changed} change(s)"));
+        prog.report(0.5, &format!("contact iteration {pass}: {changed} change(s)"))?;
         if changed == 0 {
             break;
         }
@@ -668,9 +739,9 @@ fn structural_mg(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog, 
         res.quantity("Contact nodes lifted off", open as f64, "");
     }
     res.info.dofs = nn * 3;
-    prog(0.92, "computing stresses");
+    prog.report(0.92, "computing stresses")?;
     structural_post(model, mesh, &u, temps, &units, &fixed, &f_ext, &support_nodes, &owner, res);
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -762,9 +833,9 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
         let mut f = f_ext.clone();
         k.apply_dirichlet(&fixed, &mut f);
         u = fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
-        prog(0.05, "factorising");
+        prog.report(0.05, "factorising")?;
         let solver = Solver::new(&k).map_err(|e| if contact.is_empty() { e } else { anyhow::anyhow!("{e} (the part may be lifting off its compression-only supports: add a support that holds it)") })?;
-        let its = solver.solve(&k, &f, &mut u, 1e-8, &|p| prog(0.05 + 0.85 * p, "solving (PCG)"))?;
+        let its = solver.solve(&k, &f, &mut u, 1e-8, &prog.scalar(0.05, 0.85, "solving (PCG)"))?;
         res.info.solver = solver.name().to_string();
         res.info.iterations += its;
         if contact.is_empty() {
@@ -786,7 +857,7 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
             }
         }
         pass += 1;
-        prog(0.5, &format!("contact iteration {pass}: {changed} change(s)"));
+        prog.report(0.5, &format!("contact iteration {pass}: {changed} change(s)"))?;
         if changed == 0 {
             break;
         }
@@ -801,9 +872,9 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
         res.quantity("Contact nodes lifted off", open as f64, "");
     }
     res.info.dofs = nn * 3;
-    prog(0.92, "computing stresses");
+    prog.report(0.92, "computing stresses")?;
     structural_post(model, mesh, &u, temps, &units, &fixed, &f_ext, &support_nodes, &owner, res);
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -1175,17 +1246,17 @@ pub fn assemble_thermal_k(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, se
 fn solve_thermal_linear(model: &Model, mesh: &Mesh, k: &NodeSparse, f: &[f64], t: &mut [f64], prog: Prog, res: &mut Results) -> Result<usize> {
     if use_multigrid(model, mesh) {
         // aggregation multigrid on the voxel lattice (nodes placed by position)
-        prog(0.03, "building multigrid");
+        prog.report(0.03, "building multigrid")?;
         let t0 = Instant::now();
         let coords: Vec<[u32; 3]> = mesh.nodes.iter().map(|p| [0, 1, 2].map(|k| ((p[k] - mesh.origin[k]) / mesh.h).round().max(0.0) as u32)).collect();
         let mg = crate::multigrid::Multigrid::new(k, &coords)?;
-        let its = mg.solve(f, t, 1e-10, 2000)?;
+        let its = mg.solve_cancellable(f, t, 1e-10, 2000, prog.cancel)?;
         crate::sparse::SOLVE_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         res.info.solver = format!("multigrid CG ({} levels, CPU)", mg.levels());
         Ok(its)
     } else {
         let solver = Solver::new(k)?;
-        let its = solver.solve(k, f, t, 1e-10, &|p| prog(0.05 + 0.85 * p, "solving thermal (PCG)"))?;
+        let its = solver.solve(k, f, t, 1e-10, &prog.scalar(0.05, 0.85, "solving thermal (PCG)"))?;
         res.info.solver = solver.name().to_string();
         Ok(its)
     }
@@ -1193,8 +1264,8 @@ fn solve_thermal_linear(model: &Model, mesh: &Mesh, k: &NodeSparse, f: &[f64], t
 
 pub fn thermal(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, prog: Prog, res: &mut Results) -> Result<()> {
     let nn = mesh.nodes.len();
-    prog(0.0, "assembling conduction");
-    let rad = crate::radiation::Radiation::new(model, mesh, &|m| prog(0.01, m))?;
+    prog.report(0.0, "assembling conduction")?;
+    let rad = crate::radiation::Radiation::new(model, mesh, prog.slice(0.0, 0.05))?;
     let kdep = mesh.materials.iter().any(|m| !m.conductivity_table.is_empty());
     let nonlinear = rad.is_some() || kdep;
     let base = assemble_thermal(model, mesh, elem_q)?;
@@ -1244,7 +1315,7 @@ pub fn thermal(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, prog: Prog, r
         for (a, b) in t.iter_mut().zip(&tn) {
             *a += omega * (b - *a);
         }
-        prog(0.05 + 0.9 * (it as f64 / max_it as f64), &format!("non-linear iteration {} (ΔT {change:.2e} K)", it + 1));
+        prog.report(0.05 + 0.9 * (it as f64 / max_it as f64), &format!("non-linear iteration {} (ΔT {change:.2e} K)", it + 1))?;
         if change < 1e-4 {
             converged = true;
             break;
@@ -1262,7 +1333,7 @@ pub fn thermal(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, prog: Prog, r
         radiation_quantities(r, &t, res);
     }
     res.temp = Some(t);
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -1370,7 +1441,7 @@ pub fn modal(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
     if res.modes.iter().take(6).filter(|m| m.frequency_hz < 1e-3 * res.modes.last().map(|l| l.frequency_hz).unwrap_or(1.0)).count() > 0 {
         res.warnings.push("near-zero frequencies found: the model has rigid-body modes (it is not fully supported)".into());
     }
-    prog(1.0, "done");
+    prog.report(1.0, "done")?;
     Ok(())
 }
 
@@ -1408,7 +1479,7 @@ pub fn modal_basis(model: &Model, mesh: &Mesh, nmodes: usize, prog: Prog, res: &
             mdiag[i] = 0.0;
         }
     }
-    prog(0.02, "factorising");
+    prog.report(0.02, "factorising")?;
     let solver = Solver::new(&k)?;
     res.info.solver = solver.name().to_string();
     let free = fixed.iter().filter(|f| f.is_none()).count();
@@ -1432,13 +1503,14 @@ pub fn modal_basis(model: &Model, mesh: &Mesh, nmodes: usize, prog: Prog, res: &
     let mut iters = 0;
     let max_it = 60;
     let mut first = true;
+    let check_fn = prog.check_scalar();
     for it in 0..max_it {
-        prog(it as f64 / max_it as f64 * 0.95, &format!("subspace iteration {}", it + 1));
+        prog.report(it as f64 / max_it as f64 * 0.95, &format!("subspace iteration {}", it + 1))?;
         let mut y = Vec::with_capacity(p);
         for j in 0..p {
             let rhs: Vec<f64> = x[j].iter().zip(&mdiag).map(|(a, b)| a * b).collect();
             let mut yj: Vec<f64> = if first { vec![0.0; n] } else { x[j].iter().map(|v| v / mu[j]).collect() };
-            iters += solver.solve(&k, &rhs, &mut yj, 1e-8, &|_| {})?;
+            iters += solver.solve(&k, &rhs, &mut yj, 1e-8, &check_fn)?;
             y.push(yj);
         }
         first = false;

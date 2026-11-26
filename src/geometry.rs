@@ -57,6 +57,126 @@ pub enum Op {
     Subtract,
 }
 
+/// Triangle bounding-volume hierarchy (median centroid split on longest axis) for fast STL queries.
+#[derive(Debug, Default)]
+struct BvhNode {
+    lo: V3,
+    hi: V3,
+    /// Inner nodes use `left` and `left + 1` with `count == 0`; leaves use `order[start..start + count]`.
+    left: usize,
+    start: usize,
+    count: usize,
+}
+
+#[derive(Debug, Default)]
+struct StlBvh {
+    order: Vec<u32>,
+    nodes: Vec<BvhNode>,
+}
+
+const STL_BVH_LEAF: usize = 8;
+
+#[inline]
+fn tri_centroid(t: &[V3; 3], ax: usize) -> f64 {
+    (t[0][ax] + t[1][ax] + t[2][ax]) / 3.0
+}
+
+#[inline]
+fn aabb_dist2(lo: V3, hi: V3, p: V3) -> f64 {
+    let mut d2 = 0.0;
+    for k in 0..3 {
+        let d = if p[k] < lo[k] { lo[k] - p[k] } else if p[k] > hi[k] { p[k] - hi[k] } else { 0.0 };
+        d2 += d * d;
+    }
+    d2
+}
+
+impl StlBvh {
+    fn build(tris: &[[V3; 3]]) -> Self {
+        if tris.is_empty() {
+            return Self::default();
+        }
+        let mut b = Self { order: (0..tris.len() as u32).collect(), nodes: Vec::with_capacity(tris.len() / 2 + 1) };
+        let count = b.order.len();
+        b.nodes.push(BvhNode { lo: [0.0; 3], hi: [0.0; 3], left: 0, start: 0, count });
+        b.split(0, tris);
+        b
+    }
+
+    fn split(&mut self, ni: usize, tris: &[[V3; 3]]) {
+        let (start, count) = (self.nodes[ni].start, self.nodes[ni].count);
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for &t in &self.order[start..start + count] {
+            for v in &tris[t as usize] {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(v[k]);
+                    hi[k] = hi[k].max(v[k]);
+                }
+            }
+        }
+        self.nodes[ni].lo = lo;
+        self.nodes[ni].hi = hi;
+        if count <= STL_BVH_LEAF {
+            return;
+        }
+        let ax = (0..3).max_by(|&a, &b| (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b]))).unwrap();
+        let half = count / 2;
+        self.order[start..start + count].select_nth_unstable_by(half, |&a, &b| {
+            tri_centroid(&tris[a as usize], ax).total_cmp(&tri_centroid(&tris[b as usize], ax))
+        });
+        let left = self.nodes.len();
+        self.nodes.push(BvhNode { lo: [0.0; 3], hi: [0.0; 3], left: 0, start, count: half });
+        self.nodes.push(BvhNode { lo: [0.0; 3], hi: [0.0; 3], left: 0, start: start + half, count: count - half });
+        self.nodes[ni].left = left;
+        self.nodes[ni].count = 0;
+        self.split(left, tris);
+        self.split(left + 1, tris);
+    }
+
+    /// Best-first branch-and-bound traversal maintaining `limit_d2` (best squared distance found so far).
+    fn visit_closest(&self, p: V3, mut leaf: impl FnMut(usize, &mut f64)) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let mut limit_d2 = f64::INFINITY;
+        let mut stack = Vec::with_capacity(64);
+        stack.push(0usize);
+        let prune = |d2: f64, lim: f64| lim.is_finite() && d2 > lim * (1.0 + 1e-12) + 1e-24;
+        while let Some(ni) = stack.pop() {
+            let n = &self.nodes[ni];
+            if prune(aabb_dist2(n.lo, n.hi, p), limit_d2) {
+                continue;
+            }
+            if n.count > 0 {
+                for &t in &self.order[n.start..n.start + n.count] {
+                    leaf(t as usize, &mut limit_d2);
+                }
+            } else {
+                let l = n.left;
+                let r = n.left + 1;
+                let dl = aabb_dist2(self.nodes[l].lo, self.nodes[l].hi, p);
+                let dr = aabb_dist2(self.nodes[r].lo, self.nodes[r].hi, p);
+                if dl <= dr {
+                    if !prune(dr, limit_d2) {
+                        stack.push(r);
+                    }
+                    if !prune(dl, limit_d2) {
+                        stack.push(l);
+                    }
+                } else {
+                    if !prune(dl, limit_d2) {
+                        stack.push(l);
+                    }
+                    if !prune(dr, limit_d2) {
+                        stack.push(r);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Triangle soup loaded from an STL file plus its segmentation into smooth faces.
 #[derive(Debug, Default)]
 pub struct StlData {
@@ -66,6 +186,7 @@ pub struct StlData {
     pub n_segments: usize,
     pub min: V3,
     pub max: V3,
+    bvh: StlBvh,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -293,16 +414,18 @@ impl Shape {
             Shape::Stl { data, .. } => {
                 let d = data.as_ref()?;
                 let mut best: Option<(f64, V3)> = None;
-                for (i, tri) in d.tris.iter().enumerate() {
+                d.bvh.visit_closest(p, |i, limit_d2| {
                     if d.segment[i] as usize != patch {
-                        continue;
+                        return;
                     }
-                    let q = closest_point_triangle(p, tri);
-                    let dist = norm(sub(p, q));
-                    if best.is_none_or(|b| dist < b.0) {
-                        best = Some((dist, q));
+                    let q = closest_point_triangle(p, &d.tris[i]);
+                    let dv = sub(p, q);
+                    let d2 = dot(dv, dv);
+                    if d2 < *limit_d2 {
+                        *limit_d2 = d2;
+                        best = Some((d2, q));
                     }
-                }
+                });
                 best.map(|b| b.1)
             }
             Shape::Pcb { .. } => None,
@@ -397,19 +520,20 @@ impl Shape {
             Shape::Stl { data, .. } => {
                 let Some(d) = data else { return (0, f64::INFINITY) };
                 let mut best = (0, f64::INFINITY);
-                for (i, tri) in d.tris.iter().enumerate() {
-                    let q = closest_point_triangle(p, tri);
+                d.bvh.visit_closest(p, |i, limit_d2| {
+                    let q = closest_point_triangle(p, &d.tris[i]);
                     let dist = norm(sub(p, q));
-                    if dist - h > best.1 {
-                        continue;
+                    if dist > best.1 {
+                        return;
                     }
                     let nn = d.normals[i];
                     let axis_flat = nn.iter().any(|c| c.abs() > 0.999);
                     let s = if axis_flat { flat(dist, nn) } else { score(dist, nn) };
                     if s < best.1 {
                         best = (d.segment[i] as usize, s);
+                        *limit_d2 = best.1 * best.1;
                     }
-                }
+                });
                 best
             }
         }
@@ -590,7 +714,8 @@ pub fn load_stl(path: &str, scale_f: f64, offset: V3) -> Result<StlData> {
         }
         n_seg += 1;
     }
-    Ok(StlData { tris, normals, segment, n_segments: n_seg as usize, min, max })
+    let bvh = StlBvh::build(&tris);
+    Ok(StlData { tris, normals, segment, n_segments: n_seg as usize, min, max, bvh })
 }
 
 impl StlData {
@@ -598,15 +723,57 @@ impl StlData {
     /// Returns sorted x positions of surface crossings at (y, z).
     pub fn x_crossings(&self, y: f64, z: f64) -> Vec<f64> {
         let mut xs = Vec::new();
-        for t in &self.tris {
-            let (a, b, c) = (t[0], t[1], t[2]);
-            // barycentric in the yz-plane
-            let d = (b[1] - a[1]) * (c[2] - a[2]) - (c[1] - a[1]) * (b[2] - a[2]);
-            if d.abs() < 1e-18 {
+        if self.bvh.nodes.is_empty() {
+            return xs;
+        }
+        let mut stack = Vec::with_capacity(64);
+        stack.push(0usize);
+        while let Some(ni) = stack.pop() {
+            let n = &self.bvh.nodes[ni];
+            if y < n.lo[1] || y > n.hi[1] || z < n.lo[2] || z > n.hi[2] {
                 continue;
             }
-            let l1 = ((y - a[1]) * (c[2] - a[2]) - (c[1] - a[1]) * (z - a[2])) / d;
-            let l2 = ((b[1] - a[1]) * (z - a[2]) - (y - a[1]) * (b[2] - a[2])) / d;
+            if n.count > 0 {
+                for &ti in &self.bvh.order[n.start..n.start + n.count] {
+                    let t = &self.tris[ti as usize];
+                    let (a, b, c) = (t[0], t[1], t[2]);
+                    // barycentric in the yz-plane
+                    let d = (b[1] - a[1]) * (c[2] - a[2]) - (c[1] - a[1]) * (b[2] - a[2]);
+                    if d.abs() < 1e-18 {
+                        continue;
+                    }
+                    let l1 = ((y - a[1]) * (c[2] - a[2]) - (c[1] - a[1]) * (z - a[2])) / d;
+                    let l2 = ((b[1] - a[1]) * (z - a[2]) - (y - a[1]) * (b[2] - a[2])) / d;
+                    let l0 = 1.0 - l1 - l2;
+                    if l0 >= 0.0 && l1 >= 0.0 && l2 >= 0.0 {
+                        xs.push(l0 * a[0] + l1 * b[0] + l2 * c[0]);
+                    }
+                }
+            } else {
+                stack.push(n.left);
+                stack.push(n.left + 1);
+            }
+        }
+        xs.sort_by(|a, b| a.total_cmp(b));
+        xs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        xs
+    }
+}
+
+#[cfg(test)]
+mod stl_bvh_tests {
+    use super::*;
+
+    fn brute_x_crossings(d: &StlData, y: f64, z: f64) -> Vec<f64> {
+        let mut xs = Vec::new();
+        for t in &d.tris {
+            let (a, b, c) = (t[0], t[1], t[2]);
+            let det = (b[1] - a[1]) * (c[2] - a[2]) - (c[1] - a[1]) * (b[2] - a[2]);
+            if det.abs() < 1e-18 {
+                continue;
+            }
+            let l1 = ((y - a[1]) * (c[2] - a[2]) - (c[1] - a[1]) * (z - a[2])) / det;
+            let l2 = ((b[1] - a[1]) * (z - a[2]) - (y - a[1]) * (b[2] - a[2])) / det;
             let l0 = 1.0 - l1 - l2;
             if l0 >= 0.0 && l1 >= 0.0 && l2 >= 0.0 {
                 xs.push(l0 * a[0] + l1 * b[0] + l2 * c[0]);
@@ -615,5 +782,75 @@ impl StlData {
         xs.sort_by(|a, b| a.total_cmp(b));
         xs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
         xs
+    }
+
+    #[test]
+    fn stl_bvh_matches_bruteforce_queries() {
+        let mut tris = Vec::new();
+        let mut normals = Vec::new();
+        let mut segment = Vec::new();
+        // Subdivided octasphere with 512 triangles across 4 patches.
+        let n = 8usize;
+        let pts = |i: usize, j: usize| -> V3 {
+            let u = std::f64::consts::PI * i as f64 / n as f64;
+            let v = std::f64::consts::TAU * j as f64 / (2 * n) as f64;
+            [10.0 * u.sin() * v.cos(), 10.0 * u.sin() * v.sin(), 10.0 * u.cos()]
+        };
+        for i in 0..n {
+            for j in 0..2 * n {
+                let a = pts(i, j);
+                let b = pts(i + 1, j);
+                let c = pts(i + 1, j + 1);
+                let d = pts(i, j + 1);
+                let seg = ((j / n) * 2 + (i >= n / 2) as usize) as u32;
+                for tri in [[a, b, c], [a, c, d]] {
+                    let cr = cross(sub(tri[1], tri[0]), sub(tri[2], tri[0]));
+                    if norm(cr) > 1e-12 {
+                        normals.push(normalize(cr));
+                        tris.push(tri);
+                        segment.push(seg);
+                    }
+                }
+            }
+        }
+        let bvh = StlBvh::build(&tris);
+        let stl = StlData { tris, normals, segment, n_segments: 4, min: [-10.0; 3], max: [10.0; 3], bvh };
+        let shape = Shape::Stl { path: "s.stl".into(), scale: 1.0, offset: [0.0; 3], data: Some(Arc::new(stl)) };
+        let Shape::Stl { data: Some(d), .. } = &shape else { unreachable!() };
+        for &(y, z) in &[(0.13, 0.27), (-4.5, 3.1), (9.9, 9.9), (0.0, -7.2)] {
+            assert_eq!(d.x_crossings(y, z), brute_x_crossings(d, y, z));
+        }
+        for p in [[12.3, 1.5, -2.0], [0.5, -15.0, 4.0], [-6.2, 6.2, 6.2]] {
+            for patch in 0..4 {
+                let brute = d.tris.iter().enumerate()
+                    .filter(|(i, _)| d.segment[*i] as usize == patch)
+                    .map(|(_, t)| closest_point_triangle(p, t))
+                    .min_by(|a, b| norm(sub(p, *a)).total_cmp(&norm(sub(p, *b))));
+                match (shape.project(patch, p), brute) {
+                    (Some(g), Some(b)) => {
+                        let dg = norm(sub(p, g));
+                        let db = norm(sub(p, b));
+                        assert!((dg - db).abs() < 1e-12, "patch {patch} p {p:?}: bvh dist {dg} vs brute {db}");
+                    }
+                    (None, None) => {}
+                    (g, b) => panic!("mismatch: bvh {g:?} brute {b:?}"),
+                }
+            }
+            let nr = normalize(p);
+            let got = shape.best_patch(p, nr, 1.0, false);
+            let mut want = (0, f64::INFINITY);
+            for (i, t) in d.tris.iter().enumerate() {
+                let dist = norm(sub(p, closest_point_triangle(p, t)));
+                let nn = d.normals[i];
+                let dp = dot(nn, nr).clamp(-1.0, 1.0);
+                let lim = if nn.iter().any(|c| c.abs() > 0.999) { 0.5 } else { -0.2 };
+                let s = if dp < lim { f64::INFINITY } else { dist + 1.0 - dp };
+                if s < want.1 {
+                    want = (d.segment[i] as usize, s);
+                }
+            }
+            assert_eq!(got.0, want.0);
+            assert!((got.1 - want.1).abs() < 1e-12);
+        }
     }
 }

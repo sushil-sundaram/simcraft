@@ -12,7 +12,7 @@ fn beam(h: f64) -> (Model, mesh::Mesh) {
 #[test]
 fn cantilever_static_and_modal() {
     let (mut m, me) = beam(2.5);
-    let r = fem::solve(&m, &me, &|_, _| {}).unwrap();
+    let r = fem::solve(&m, &me, fem::Progress::noop()).unwrap();
     let tip = r.disp.as_ref().unwrap().iter().map(|d| d[2]).fold(0.0, f64::min);
     println!("tip deflection {tip} mm (theory -0.200 + shear); reaction {:?}; iters {}", r.reactions, r.info.iterations);
     assert!((tip + 0.2).abs() < 0.02, "tip {tip}");
@@ -20,7 +20,7 @@ fn cantilever_static_and_modal() {
     let vmax = r.vm.as_ref().unwrap().iter().cloned().fold(0.0, f64::max);
     println!("max von Mises {vmax} MPa (beam theory at root 60 MPa)");
     m.analysis.kind = AnalysisType::Modal;
-    let r = fem::solve(&m, &me, &|_, _| {}).unwrap();
+    let r = fem::solve(&m, &me, fem::Progress::noop()).unwrap();
     let f: Vec<f64> = r.modes.iter().map(|m| m.frequency_hz).collect();
     println!("modal freqs {f:?} (theory first bending 815 Hz)");
     assert!((f[0] - 815.0).abs() / 815.0 < 0.05);
@@ -34,7 +34,7 @@ fn thermal_bar() {
     m.loads.push(LoadItem { id: 1, load: Load::Temperature { faces: vec!["bar.xmin".into()], value: 100.0 } });
     m.loads.push(LoadItem { id: 2, load: Load::Temperature { faces: vec!["bar.xmax".into()], value: 0.0 } });
     let me = mesh::build_mesh(&m.bodies, 2.5, &material::library(), false).unwrap();
-    let r = fem::solve(&m, &me, &|_, _| {}).unwrap();
+    let r = fem::solve(&m, &me, fem::Progress::noop()).unwrap();
     // Q = k A dT / L = 391 * 1e-4 * 100 / 0.1 = 39.1 W
     println!("heat flows {:?}", r.reactions);
     assert!((r.reactions[0].value[0] - 39.1).abs() < 0.4);
@@ -50,7 +50,7 @@ fn free_thermal_expansion_no_stress() {
     m.loads.push(LoadItem { id: 3, load: Load::Displacement { faces: vec!["b.ymin".into()], x: None, y: Some(0.0), z: None } });
     m.loads.push(LoadItem { id: 4, load: Load::Displacement { faces: vec!["b.zmin".into()], x: None, y: None, z: Some(0.0) } });
     let me = mesh::build_mesh(&m.bodies, 2.5, &material::library(), false).unwrap();
-    let r = fem::solve(&m, &me, &|_, _| {}).unwrap();
+    let r = fem::solve(&m, &me, fem::Progress::noop()).unwrap();
     let ux = r.disp.as_ref().unwrap().iter().map(|d| d[0]).fold(0.0, f64::max);
     let vm = r.vm.as_ref().unwrap().iter().cloned().fold(0.0, f64::max);
     println!("ux {ux} mm (theory 0.06), vm {vm}");

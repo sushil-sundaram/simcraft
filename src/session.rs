@@ -19,8 +19,12 @@ pub struct Session {
     /// Model snapshots before each change (newest last) and undone ones, for undo / redo.
     pub undo: Vec<Model>,
     pub redo: Vec<Model>,
-    /// Model as last saved / opened / created (JSON), to detect unsaved changes.
-    pub saved_model: String,
+    undo_revs: Vec<u64>,
+    redo_revs: Vec<u64>,
+    /// Monotonic revision tag of the current `Model` and the last saved revision (None if recovered/unsaved).
+    pub model_rev: u64,
+    next_model_rev: u64,
+    saved_rev: Option<u64>,
     pub model: Model,
     pub mesh: Option<Arc<Mesh>>,
     mesh_rev: u64,
@@ -66,7 +70,11 @@ impl Default for Session {
             undo: Vec::new(),
             ui_request: None,
             redo: Vec::new(),
-            saved_model: serde_json::to_string(&Model::default()).unwrap_or_default(),
+            undo_revs: Vec::new(),
+            redo_revs: Vec::new(),
+            model_rev: 0,
+            next_model_rev: 1,
+            saved_rev: Some(0),
             study: None,
             surrogate: None,
         }
@@ -74,7 +82,11 @@ impl Default for Session {
 }
 
 impl Session {
-    pub fn touch_geometry(&mut self) {
+    fn bump_model_rev(&mut self) {
+        self.model_rev = self.next_model_rev;
+        self.next_model_rev += 1;
+    }
+    pub fn invalidate_geometry(&mut self) {
         self.geom_rev += 1;
         self.results = None;
         self.results_stale = false;
@@ -82,11 +94,33 @@ impl Session {
         self.selection.clear();
         self.revision += 1;
     }
+    pub fn touch_geometry(&mut self) {
+        self.invalidate_geometry();
+        self.bump_model_rev();
+    }
     pub fn touch_setup(&mut self) {
         if self.results.is_some() {
             self.results_stale = true;
         }
         self.revision += 1;
+        self.bump_model_rev();
+    }
+    pub fn mesh_key(&self) -> (u64, bool, bool, u64) {
+        (self.geom_rev, self.model.mesh_with_enclosure(), self.model.mesh_fitted(), self.element_size().to_bits())
+    }
+    pub fn install_mesh(&mut self, m: Mesh, rev: u64, mode: (bool, bool)) -> Option<Arc<Mesh>> {
+        if self.geom_rev != rev || mode.0 != self.model.mesh_with_enclosure() {
+            return None;
+        }
+        let m = Arc::new(m);
+        if self.results.as_ref().is_some_and(|r| r.node_len().is_some_and(|n| n != m.nodes.len())) {
+            self.results = None;
+        }
+        self.mesh_mode = mode;
+        self.mesh = Some(m.clone());
+        self.mesh_rev = self.geom_rev;
+        self.revision += 1;
+        Some(m)
     }
     pub fn log(&mut self, s: impl Into<String>) {
         let s = s.into();
@@ -147,16 +181,9 @@ impl Session {
         let h = self.element_size();
         let mode = (self.model.mesh_with_enclosure(), self.model.mesh_fitted());
         let limit = mesh::max_cells_for(&self.model);
-        let m = Arc::new(mesh::build_for(&self.model, h, limit)?);
-        // results computed on another mesh cannot be shown on this one
-        if self.results.as_ref().is_some_and(|r| r.node_len().is_some_and(|n| n != m.nodes.len())) {
-            self.results = None;
-        }
-        self.mesh_mode = mode;
-        self.mesh = Some(m.clone());
-        self.mesh_rev = self.geom_rev;
-        self.revision += 1;
-        Ok(m)
+        let rev = self.geom_rev;
+        let m = mesh::build_for(&self.model, h, limit)?;
+        Ok(self.install_mesh(m, rev, mode).expect("session lock held"))
     }
     /// Plain voxel mesh (no boundary fitting), e.g. for topology optimisation on the voxel grid.
     /// Becomes the session mesh so results display on it; the next fitted solve rebuilds.
@@ -274,10 +301,10 @@ impl Session {
 
     /// True when the model differs from the last saved / opened / new one.
     pub fn is_dirty(&self) -> bool {
-        serde_json::to_string(&self.model).map(|m| m != self.saved_model).unwrap_or(false)
+        self.saved_rev != Some(self.model_rev)
     }
     pub fn mark_saved(&mut self) {
-        self.saved_model = serde_json::to_string(&self.model).unwrap_or_default();
+        self.saved_rev = Some(self.model_rev);
     }
     /// Write the model to the autosave file (does not change the project path or saved state).
     pub fn autosave(&self) -> Result<()> {
@@ -529,9 +556,6 @@ fn push_recent(path: &str) {
     let _ = std::fs::write(config_dir().join("recent.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
 }
 
-/// Unwind payload used to stop a job when the user cancels it.
-struct Cancelled;
-
 /// Clears the busy flag and the progress bar when a job ends — also when it panics or is cancelled.
 struct JobGuard<'a>(&'a Core);
 impl Drop for JobGuard<'_> {
@@ -618,6 +642,21 @@ fn field_arg(a: &Value) -> Result<Option<Field>> {
     }
 }
 
+fn tool_may_mutate(tool: &str) -> bool {
+    matches!(
+        tool,
+        "new_model" | "add_box" | "add_cylinder" | "add_sphere" | "import_stl" | "import_kicad"
+            | "add_enclosure" | "remove_body" | "define_material" | "set_material"
+            | "set_analysis" | "set_mesh" | "edit_body" | "edit_load" | "transform_body"
+            | "remove_load" | "clear_loads" | "apply_design" | "open_project"
+            | "add_fixed_support" | "add_displacement" | "add_force" | "add_pressure"
+            | "add_gravity" | "add_temperature" | "add_heat_flux" | "add_convection"
+            | "add_radiation" | "add_heat_generation" | "add_compression_only_support"
+            | "add_symmetry" | "add_voltage" | "add_current" | "add_coil" | "add_magnet"
+            | "add_inlet" | "add_moving_wall" | "add_port" | "add_outlet"
+    )
+}
+
 impl Core {
     fn changed(&self) {
         if let Some(f) = self.notify.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
@@ -631,27 +670,31 @@ impl Core {
 
     /// Execute a tool by name. Used by the GUI, the TCP bridge and the MCP server.
     pub fn call(&self, tool: &str, args: &Value) -> Result<Output> {
-        // snapshot for undo (cheap: shape data is shared, only the description is copied)
-        let before = if matches!(tool, "undo" | "redo") {
-            None
-        } else {
+        // Explicit command-level snapshot (O(1) dirty check; skips read-only queries and solvers).
+        let before = if tool_may_mutate(tool) {
             let s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            serde_json::to_string(&s.model).ok().map(|j| (j, s.model.clone()))
+            Some((s.model_rev, s.model.clone()))
+        } else {
+            None
         };
         let r = self.call_inner(tool, args);
         {
             let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let (Ok(_), Some((json_before, model_before))) = (&r, before) {
-                if serde_json::to_string(&s.model).ok().is_some_and(|now| now != json_before) {
+            if let (Ok(_), Some((rev_before, model_before))) = (&r, before) {
+                if s.model_rev != rev_before {
                     if tool == "open_project" {
                         s.undo.clear();
+                        s.undo_revs.clear();
                     } else {
                         s.undo.push(model_before);
+                        s.undo_revs.push(rev_before);
                         if s.undo.len() > 100 {
                             s.undo.remove(0);
+                            s.undo_revs.remove(0);
                         }
                     }
                     s.redo.clear();
+                    s.redo_revs.clear();
                 }
             }
             match &r {
@@ -723,6 +766,8 @@ impl Core {
             }
             "new_model" => {
                 let rev = s.revision;
+                let next = s.next_model_rev;
+                let empty = s.model_rev == 0 && s.model.bodies.is_empty() && s.model.loads.is_empty() && s.model.custom_materials.is_empty() && s.model.element_size.is_none();
                 // the theme and edge display are user preferences, not part of the model
                 let (dark, show_mesh) = (s.display.dark, s.display.show_mesh);
                 let plan = s.plan.take();
@@ -732,6 +777,13 @@ impl Core {
                 s.display.show_mesh = show_mesh;
                 s.revision = rev + 1;
                 s.geom_rev = rev + 1;
+                if empty {
+                    s.next_model_rev = next;
+                } else {
+                    s.model_rev = next;
+                    s.next_model_rev = next + 1;
+                    s.saved_rev = Some(next);
+                }
                 s.view_request = Some("fit".into());
                 s.log("New model");
                 Ok(Output::text("Started a new empty model."))
@@ -923,16 +975,22 @@ impl Core {
                 let m = s.resolve_material(opt_str(a, "material").ok_or_else(|| anyhow!("missing 'material'"))?)?;
                 let targets: Option<Vec<String>> = a.get("bodies").and_then(|b| b.as_array()).map(|v| v.iter().filter_map(|x| x.as_str().map(|s| s.to_lowercase())).collect());
                 let mut n = 0;
+                let mut changed = false;
                 for b in s.model.bodies.iter_mut() {
                     if targets.as_ref().is_none_or(|t| t.contains(&b.name.to_lowercase())) {
-                        b.material = m.name.clone();
+                        if b.material != m.name {
+                            b.material = m.name.clone();
+                            changed = true;
+                        }
                         n += 1;
                     }
                 }
                 if n == 0 {
                     bail!("no matching bodies");
                 }
-                s.touch_geometry();
+                if changed {
+                    s.touch_geometry();
+                }
                 s.log(format!("Material '{}' assigned to {n} body(ies)", m.name));
                 Ok(Output::text(format!("Assigned {} to {n} body(ies).", m.name)))
             }
@@ -1174,15 +1232,18 @@ impl Core {
             }
             "undo" | "redo" => {
                 let undo = tool == "undo";
-                let prev = if undo { s.undo.pop() } else { s.redo.pop() };
-                let Some(prev) = prev else { bail!("nothing to {tool}") };
+                let prev = if undo { s.undo.pop().zip(s.undo_revs.pop()) } else { s.redo.pop().zip(s.redo_revs.pop()) };
+                let Some((prev, prev_rev)) = prev else { bail!("nothing to {tool}") };
                 let cur = std::mem::replace(&mut s.model, prev);
+                let cur_rev = std::mem::replace(&mut s.model_rev, prev_rev);
                 if undo {
                     s.redo.push(cur);
+                    s.redo_revs.push(cur_rev);
                 } else {
                     s.undo.push(cur);
+                    s.undo_revs.push(cur_rev);
                 }
-                s.touch_geometry();
+                s.invalidate_geometry();
                 let msg = format!("{} — {} more undo, {} redo available", if undo { "Undid the last change" } else { "Redid the change" }, s.undo.len(), s.redo.len());
                 s.log(msg.clone());
                 Ok(Output::text(msg))
@@ -1359,8 +1420,10 @@ impl Core {
                 Ok(Output::text(format!("Removed load #{id}.")))
             }
             "clear_loads" => {
-                s.model.loads.clear();
-                s.touch_setup();
+                if !s.model.loads.is_empty() {
+                    s.model.loads.clear();
+                    s.touch_setup();
+                }
                 Ok(Output::text("All supports and loads removed."))
             }
             "set_mesh" => {
@@ -1370,8 +1433,10 @@ impl Core {
                         bail!("element_size_mm must be positive");
                     }
                 }
-                s.model.element_size = es;
-                s.touch_geometry();
+                if s.model.element_size != es {
+                    s.model.element_size = es;
+                    s.touch_geometry();
+                }
                 let m = s.ensure_mesh()?;
                 s.log(format!("Mesh: {} elements, {} nodes, size {} mm", m.elems.len(), m.nodes.len(), m.h));
                 Ok(Output::json(json!({"element_size_mm": m.h, "elements": m.elems.len(), "nodes": m.nodes.len(), "dofs": m.nodes.len()*3, "warnings": m.warnings})))
@@ -1521,7 +1586,7 @@ impl Core {
                 } else {
                     // a recovered autosave or MCP handoff has no user project file yet
                     s.project_path = None;
-                    s.saved_model.clear();
+                    s.saved_rev = None;
                     if is_handoff {
                         let _ = std::fs::remove_file(&resolved);
                     }
@@ -1713,21 +1778,23 @@ impl Core {
     }
 
     fn study_inner(&self, tool: &str, a: &Value) -> Result<Output> {
-        let (model, mesh, project) = {
-            let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mesh = if tool == "topology_optimize" { Some(s.ensure_plain_mesh()?) } else { None };
-            (s.model.clone(), mesh, s.project_path.clone())
-        };
         *self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Progress { running: true, fraction: 0.0, message: "starting study".into() };
         self.changed();
-        let prog = |f: f64, msg: &str| {
-            self.check_cancel();
-            {
-                let mut p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                p.fraction = f;
-                p.message = msg.to_string();
-            }
+        let cb = |f: f64, msg: &str| {
+            let mut p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            p.fraction = f;
+            p.message = msg.to_string();
+            drop(p);
             self.changed();
+        };
+        let prog = fem::Progress::new(&self.cancel, &cb);
+        let (model, mesh, project) = if tool == "topology_optimize" {
+            let (m, mesh, _) = self.prepare_mesh(true, &cb)?;
+            let proj = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).project_path.clone();
+            (m, Some(mesh), proj)
+        } else {
+            let s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (s.model.clone(), None, s.project_path.clone())
         };
         let parse_params = || -> Result<Vec<crate::study::Parameter>> {
             serde_json::from_value(a.get("parameters").cloned().ok_or_else(|| anyhow!("missing 'parameters' [{{target, min, max}}]"))?).map_err(|e| anyhow!("bad 'parameters': {e}"))
@@ -1737,7 +1804,7 @@ impl Core {
             "run_parameter_study" => {
                 let responses: Vec<String> = serde_json::from_value(a.get("responses").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'responses': {e}"))?;
                 let samples = opt_num(a, "samples").map(|v| v as usize);
-                crate::study::parameter_study(&model, parse_params()?, responses, samples, &prog)?
+                crate::study::parameter_study(&model, parse_params()?, responses, samples, prog)?
             }
             "surrogate_optimize" => {
                 let objective: crate::study::Objective = serde_json::from_value(a.get("objective").cloned().ok_or_else(|| anyhow!("missing 'objective' {{response, goal}}"))?).map_err(|e| anyhow!("bad 'objective': {e}"))?;
@@ -1760,13 +1827,13 @@ impl Core {
                         _ => vec![],
                     }
                 };
-                crate::study::surrogate_optimize(&model, params, objective, constraints, budget, prior, &prog)?
+                crate::study::surrogate_optimize(&model, params, objective, constraints, budget, prior, prog)?
             }
             "optimize_design" => {
                 let objective: crate::study::Objective = serde_json::from_value(a.get("objective").cloned().ok_or_else(|| anyhow!("missing 'objective' {{response, goal}}"))?).map_err(|e| anyhow!("bad 'objective': {e}"))?;
                 let constraints: Vec<crate::study::Constraint> = serde_json::from_value(a.get("constraints").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'constraints': {e}"))?;
                 let budget = opt_num(a, "max_evaluations").unwrap_or(30.0) as usize;
-                crate::study::optimize(&model, parse_params()?, objective, constraints, budget, &prog)?
+                crate::study::optimize(&model, parse_params()?, objective, constraints, budget, prog)?
             }
             _ => {
                 let mesh = mesh.unwrap();
@@ -1797,7 +1864,7 @@ impl Core {
                     filter_radius_mm: opt_num(a, "filter_radius_mm"),
                     penal: 3.0,
                 };
-                let tr = crate::topo::run(&model, &mesh, &settings, &prog)?;
+                let tr = crate::topo::run(&model, &mesh, &settings, prog)?;
                 let ntri = crate::topo::write_stl(&mesh, &tr.density, 0.5, &path)?;
                 let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.results = Some(Arc::new(tr.results));
@@ -1909,11 +1976,11 @@ impl Core {
         self.cancel.store(false, Ordering::SeqCst);
         let _guard = JobGuard(self);
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-            Ok(r) => r,
-            Err(payload) if payload.is::<Cancelled>() => {
+            Ok(Err(e)) if e.is::<fem::Cancelled>() => {
                 self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).log(format!("{what} cancelled"));
                 bail!("{what} cancelled")
             }
+            Ok(r) => r,
             Err(payload) => {
                 let msg = payload.downcast_ref::<String>().cloned().or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "unknown error".into());
                 bail!("internal error during {what}: {msg}. The model is unchanged; please report this (with the project file) if it repeats")
@@ -1921,32 +1988,50 @@ impl Core {
         }
     }
 
-    /// Called from progress callbacks: unwinds the running job if the user pressed Stop.
-    fn check_cancel(&self) {
-        if self.cancel.load(Ordering::SeqCst) {
-            std::panic::resume_unwind(Box::new(Cancelled));
-        }
+    /// Build or fetch the session mesh outside the session lock so meshing stays responsive and cancellable.
+    fn prepare_mesh(&self, plain: bool, cb: &(dyn Fn(f64, &str) + Sync)) -> Result<(Model, Arc<Mesh>, u64)> {
+        let (model, h, limit, mode, rev) = {
+            let s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if s.mesh_valid() {
+                let m = s.mesh.clone().unwrap();
+                if !plain || m.fitted.is_empty() {
+                    return Ok((s.model.clone(), m, s.geom_rev));
+                }
+            }
+            let limit = if plain { mesh::MAX_CELLS } else { mesh::max_cells_for(&s.model) };
+            let mode = (s.model.mesh_with_enclosure(), !plain && s.model.mesh_fitted());
+            (s.model.clone(), s.element_size(), limit, mode, s.geom_rev)
+        };
+        fem::check_cancel(&self.cancel)?;
+        cb(0.0, "meshing");
+        let built = if plain {
+            mesh::build_mesh_ex_cancellable(&model.bodies, h, &model.materials(), mode.0, limit, false, &self.cancel)?
+        } else {
+            mesh::build_for_cancellable(&model, h, limit, &self.cancel)?
+        };
+        let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let m = s.install_mesh(built, rev, mode).ok_or_else(|| anyhow!("geometry changed during meshing; solve again"))?;
+        Ok((s.model.clone(), m, rev))
     }
 
     fn solve_inner(&self) -> Result<Output> {
-        let (model, mesh, rev) = {
+        {
             let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let lbl = s.model.analysis.kind.label();
             s.log(format!("Solving {lbl}…"));
-            let m = s.ensure_mesh()?;
-            (s.model.clone(), m, s.geom_rev)
-        };
+        }
         *self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Progress { running: true, fraction: 0.0, message: "starting".into() };
         self.changed();
-        let prog = |f: f64, msg: &str| {
-            self.check_cancel();
+        let cb = |f: f64, msg: &str| {
             let mut p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             p.fraction = f;
             p.message = msg.to_string();
             drop(p);
             self.changed();
         };
-        let res = fem::solve(&model, &mesh, &prog)?;
+        let (model, mesh, rev) = self.prepare_mesh(false, &cb)?;
+        let prog = fem::Progress::new(&self.cancel, &cb);
+        let res = fem::solve(&model, &mesh, prog)?;
         let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.geom_rev != rev {
             bail!("geometry changed during the solve; solve again");

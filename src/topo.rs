@@ -28,7 +28,7 @@ pub struct TopoResult {
     pub results: crate::results::Results,
 }
 
-pub fn run(model: &Model, mesh: &Mesh, s: &TopoSettings, prog: &dyn Fn(f64, &str)) -> Result<TopoResult> {
+pub fn run(model: &Model, mesh: &Mesh, s: &TopoSettings, prog: fem::Prog) -> Result<TopoResult> {
     if model.analysis.kind != crate::model::AnalysisType::StaticStructural {
         bail!("topology optimization works on a Static Structural setup (supports + loads)");
     }
@@ -38,7 +38,7 @@ pub fn run(model: &Model, mesh: &Mesh, s: &TopoSettings, prog: &dyn Fn(f64, &str
     let h = mesh.h * 1e-3;
     let ne = mesh.elems.len();
     let nn = mesh.nodes.len();
-    let (asm, units) = fem::assemble_structural(model, mesh, &|_, _| {})?;
+    let (asm, units) = fem::assemble_structural(model, mesh, fem::Progress::cancel_only(prog.cancel))?;
     let Assembled { fixed, support_nodes, .. } = asm;
     if support_nodes.is_empty() {
         bail!("add a support before optimizing");
@@ -121,7 +121,7 @@ pub fn run(model: &Model, mesh: &Mesh, s: &TopoSettings, prog: &dyn Fn(f64, &str
             }
         }
         let solver = Solver::new(&k)?;
-        solver.solve(&k, &f, &mut u, 1e-8, &|_| {})?;
+        solver.solve(&k, &f, &mut u, 1e-8, &prog.check_scalar())?;
         // element strain energy for the unit modulus
         let ce: Vec<f64> = mesh
             .elems
@@ -178,7 +178,7 @@ pub fn run(model: &Model, mesh: &Mesh, s: &TopoSettings, prog: &dyn Fn(f64, &str
         last_u = u;
         let vf = design.iter().map(|&e| rho[e]).sum::<f64>() / design.len() as f64;
         history.push((it, compliance, vf));
-        prog(it as f64 / iters as f64, &format!("topology iteration {it}/{iters}: compliance {compliance:.4e} J, change {change:.3}"));
+        prog.report(it as f64 / iters as f64, &format!("topology iteration {it}/{iters}: compliance {compliance:.4e} J, change {change:.3}"))?;
         if it > 10 && change < 0.01 {
             break;
         }

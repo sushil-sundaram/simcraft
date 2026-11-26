@@ -896,7 +896,7 @@ impl<'a> ElasticMg<'a> {
 
     /// Solve K u = f with u prescribed on the constrained dofs (`ug` holds those values, zero
     /// elsewhere). Returns CG iterations; `u` receives the solution.
-    pub fn solve(&self, f: &[f64], ug: &[f64], u: &mut [f64], tol: f64, max_it: usize, progress: &dyn Fn(f64)) -> Result<usize> {
+    pub fn solve(&self, f: &[f64], ug: &[f64], u: &mut [f64], tol: f64, max_it: usize, progress: &(dyn Fn(f64) -> Result<()> + Sync)) -> Result<usize> {
         let n = f.len();
         let fixed = &self.fine.fixed;
         // move prescribed displacements to the right-hand side
@@ -951,7 +951,7 @@ impl<'a> ElasticMg<'a> {
                     bail!("multigrid CG diverged");
                 }
                 if its % 2 == 0 {
-                    progress(((lr0 - rn.max(1e-300).ln()) / (lr0 - ltol)).clamp(0.0, 1.0));
+                    progress(((lr0 - rn.max(1e-300).ln()) / (lr0 - ltol)).clamp(0.0, 1.0))?;
                 }
                 if rn < tol {
                     break;

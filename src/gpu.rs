@@ -1,5 +1,5 @@
 //! Optional GPU acceleration: double-precision Jacobi-preconditioned conjugate gradients running as
-//! Vulkan compute shaders (via wgpu), preferring the discrete GPU.
+//! GPU compute shaders (via wgpu), preferring the discrete GPU.
 //!
 //! The GPU is only touched when a solve actually uses it (never at app start-up), and the device
 //! is released when the solver is dropped so a hybrid laptop's dGPU can power down again.
@@ -196,17 +196,38 @@ pub struct GpuSystem {
     fault: std::sync::Arc<Mutex<Option<String>>>,
 }
 
-pub(crate) fn pick_adapter() -> Result<wgpu::Adapter> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
-    let adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN));
-    let rank = |a: &wgpu::Adapter| match a.get_info().device_type {
+/// Pick the best GPU adapter across `items`: DiscreteGpu before IntegratedGpu, skipping CPU/Virtual
+/// devices and optionally requiring `SHADER_F64`.
+pub(crate) fn select_adapter_index<T>(
+    items: &[T],
+    require_f64: bool,
+    dev_type: impl Fn(&T) -> wgpu::DeviceType,
+    has_f64: impl Fn(&T) -> bool,
+) -> Option<usize> {
+    let rank = |item: &T| match dev_type(item) {
         wgpu::DeviceType::DiscreteGpu => 0,
         wgpu::DeviceType::IntegratedGpu => 1,
         _ => 9,
     };
-    let mut usable: Vec<wgpu::Adapter> = adapters.into_iter().filter(|a| a.features().contains(wgpu::Features::SHADER_F64) && rank(a) < 9).collect();
-    usable.sort_by_key(rank);
-    usable.into_iter().next().ok_or_else(|| anyhow!("no Vulkan GPU with 64-bit float shader support found"))
+    (0..items.len())
+        .filter(|&i| (!require_f64 || has_f64(&items[i])) && rank(&items[i]) < 9)
+        .min_by_key(|&i| rank(&items[i]))
+}
+
+pub(crate) fn pick_adapter(require_f64: bool) -> Result<wgpu::Adapter> {
+    let backends = wgpu::Backends::PRIMARY;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+    let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+    let mut adapters = adapters;
+    let idx = select_adapter_index(&adapters, require_f64, |a| a.get_info().device_type, |a| a.features().contains(wgpu::Features::SHADER_F64));
+    match idx {
+        Some(i) => Ok(adapters.swap_remove(i)),
+        None => Err(if require_f64 {
+            anyhow!("no Vulkan/Metal/DX12 GPU with 64-bit float shader support found")
+        } else {
+            anyhow!("no Vulkan/Metal/DX12 GPU adapter found")
+        }),
+    }
 }
 
 pub(crate) fn read_f64(device: &wgpu::Device, buf: &wgpu::Buffer, len: usize) -> Result<Vec<f64>> {
@@ -228,7 +249,7 @@ pub(crate) fn read_f64(device: &wgpu::Device, buf: &wgpu::Buffer, len: usize) ->
 impl GpuSystem {
     /// Upload the matrix (after Dirichlet conditions have been applied) to the GPU.
     pub fn new(a: &NodeSparse) -> Result<GpuSystem> {
-        let adapter = pick_adapter()?;
+        let adapter = pick_adapter(true)?;
         let info = adapter.get_info();
         let al = adapter.limits();
         let n = a.n();
@@ -369,7 +390,7 @@ impl GpuSystem {
     }
 
     /// Solve A x = b. `x` holds the initial guess (and the prescribed values on Dirichlet rows).
-    pub fn solve(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, max_iter: usize, progress: &dyn Fn(f64)) -> Result<usize> {
+    pub fn solve(&self, a: &NodeSparse, b: &[f64], x: &mut [f64], tol: f64, max_iter: usize, progress: &(dyn Fn(f64) -> Result<()> + Sync)) -> Result<usize> {
         let n = self.n;
         // initial residual on the CPU (one mat-vec)
         let mut r = vec![0.0; n];
@@ -424,7 +445,7 @@ impl GpuSystem {
             if !rel.is_finite() {
                 bail!("GPU solver broke down (matrix not positive definite?): the model is probably under-constrained");
             }
-            progress(((log_r0 - rel.max(1e-300).ln()) / (log_r0 - log_tol)).clamp(0.0, 1.0));
+            progress(((log_r0 - rel.max(1e-300).ln()) / (log_r0 - log_tol)).clamp(0.0, 1.0))?;
             if rel < tol {
                 break;
             }
@@ -438,5 +459,28 @@ impl GpuSystem {
         let out = read_f64(&self.device, &self.staging_x, n)?;
         x.copy_from_slice(&out);
         Ok(it)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_split_prefers_f32_integrated_when_f64_not_required() {
+        let cands = [
+            (wgpu::DeviceType::Cpu, true),
+            (wgpu::DeviceType::IntegratedGpu, false),
+            (wgpu::DeviceType::VirtualGpu, false),
+        ];
+        assert_eq!(select_adapter_index(&cands, true, |x| x.0, |x| x.1), None);
+        assert_eq!(select_adapter_index(&cands, false, |x| x.0, |x| x.1), Some(1));
+
+        let dual = [
+            (wgpu::DeviceType::IntegratedGpu, true),
+            (wgpu::DeviceType::DiscreteGpu, false),
+        ];
+        assert_eq!(select_adapter_index(&dual, true, |x| x.0, |x| x.1), Some(0));
+        assert_eq!(select_adapter_index(&dual, false, |x| x.0, |x| x.1), Some(1));
     }
 }

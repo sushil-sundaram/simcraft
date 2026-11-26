@@ -11,6 +11,7 @@ use crate::session::Shared;
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Stroke, TextStyle, pos2, vec2};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------- theme
@@ -562,11 +563,22 @@ fn line_chart(ui: &mut egui::Ui, p: &Pal, series: &[(String, Vec<(f64, f64)>)], 
 
 /// Help window state.
 /// SOLVE ▸ PCB ▸ DC drop dialog.
+type MeshKey = (u64, bool, bool, u64);
+
+struct MeshJob {
+    key: MeshKey,
+    cancel: Arc<AtomicBool>,
+    done: Arc<std::sync::Mutex<Option<Result<Mesh, String>>>>,
+}
+
+type NetsJobSlot = Arc<std::sync::Mutex<Option<(String, Result<Vec<(String, Vec<String>)>, String>)>>>;
+
 #[derive(Default)]
 struct PcbUi {
     open: bool,
     path: String,
     nets: Vec<(String, Vec<String>)>,
+    nets_job: Option<(Arc<AtomicBool>, NetsJobSlot)>,
     filter: String,
     net: String,
     from: String,
@@ -839,7 +851,8 @@ pub struct SimApp {
     selected: HashSet<u32>,
     sel_version: u64,
     mesh_ptr: usize,
-    mesh_err: Option<(u64, String)>,
+    mesh_job: Option<MeshJob>,
+    mesh_err: Option<(MeshKey, String)>,
     bridge: String,
     animate: bool,
     need_fit: bool,
@@ -1012,6 +1025,7 @@ impl SimApp {
             selected: HashSet::new(),
             sel_version: 0,
             mesh_ptr: 0,
+            mesh_job: None,
             mesh_err: None,
             bridge,
             animate: false,
@@ -2055,7 +2069,7 @@ impl SimApp {
                     group(ui, &p, "PCB", |ui| {
                         let on = self.pcb.open;
                         if tool(ui, &p, "🔌", "DC drop", Some(if on { p.accent } else { Color32::from_rgb(70, 160, 90) }), true) {
-                            self.open_pcb_dc(&path);
+                            self.open_pcb_dc(ui.ctx(), &path);
                         }
                     });
                 }
@@ -2323,36 +2337,70 @@ impl SimApp {
         });
     }
 
-    fn open_pcb_dc(&mut self, path: &str) {
-        if self.pcb.path != path || self.pcb.nets.is_empty() {
-            match crate::kicad::dc::net_pads(path) {
-                Ok(nets) => {
-                    let pick = default_net(&nets);
-                    self.pcb = PcbUi { path: path.to_string(), current: self.pcb.current, temp: self.pcb.temp, ..Default::default() };
-                    if let Some(i) = pick {
-                        self.pcb.net = nets[i].0.clone();
-                        self.pcb.from = nets[i].1.first().cloned().unwrap_or_default();
-                        self.pcb.to = nets[i].1.last().cloned().unwrap_or_default();
-                    }
-                    self.pcb.nets = nets;
-                }
-                Err(e) => {
-                    self.toast = Some((format!("{e:#}"), true, 8.0));
-                    return;
-                }
-            }
-        }
-        if self.pcb.nets.is_empty() {
-            self.toast = Some(("This board has no nets with two or more pads".into(), true, 6.0));
+    fn open_pcb_dc(&mut self, ctx: &egui::Context, path: &str) {
+        if self.pcb.path == path && (!self.pcb.nets.is_empty() || self.pcb.nets_job.is_some()) {
+            self.pcb.open = true;
             return;
         }
-        self.pcb.open = true;
+        if let Some((old_cancel, _)) = self.pcb.nets_job.take() {
+            old_cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let slot: NetsJobSlot = Arc::new(std::sync::Mutex::new(None));
+        self.pcb = PcbUi {
+            open: true,
+            path: path.to_string(),
+            current: self.pcb.current,
+            temp: self.pcb.temp,
+            nets_job: Some((cancel.clone(), slot.clone())),
+            ..Default::default()
+        };
+        let path_owned = path.to_string();
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let r = crate::kicad::dc::net_pads(&path_owned).map_err(|e| format!("{e:#}"));
+            if !cancel.load(Ordering::Relaxed) {
+                *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path_owned, r));
+                ctx_clone.request_repaint();
+            }
+        });
     }
 
     /// DC current in one net of the imported board (kicad::dc), solved on a worker thread.
     fn pcb_window(&mut self, ctx: &egui::Context) {
         if !self.pcb.open {
+            if let Some((cancel, _)) = self.pcb.nets_job.take() {
+                cancel.store(true, Ordering::Relaxed);
+            }
             return;
+        }
+        if let Some((cancel, slot)) = &self.pcb.nets_job {
+            let done = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            if let Some((done_path, r)) = done {
+                self.pcb.nets_job = None;
+                if done_path == self.pcb.path {
+                    match r {
+                        Ok(nets) => {
+                            if nets.is_empty() {
+                                self.pcb.error = Some("This board has no nets with two or more pads".into());
+                            } else if self.pcb.net.is_empty() && self.pcb.from.is_empty() && self.pcb.to.is_empty() {
+                                if let Some(i) = default_net(&nets) {
+                                    self.pcb.net = nets[i].0.clone();
+                                    self.pcb.from = nets[i].1.first().cloned().unwrap_or_default();
+                                    self.pcb.to = nets[i].1.last().cloned().unwrap_or_default();
+                                }
+                            }
+                            self.pcb.nets = nets;
+                        }
+                        Err(e) => {
+                            self.pcb.error = Some(e);
+                        }
+                    }
+                }
+            } else {
+                let _ = cancel;
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
+            }
         }
         // collect a finished job
         if let Some(job) = &self.pcb.job {
@@ -2377,6 +2425,7 @@ impl SimApp {
         let mut open = true;
         let mut go = false;
         let mut help = false;
+        let mut cancel_nets = false;
         egui::Window::new(RichText::new("🔌 PCB DC drop").strong())
             .open(&mut open)
             .resizable(true)
@@ -2392,6 +2441,16 @@ impl SimApp {
                 }
             });
             ui.add_space(4.0);
+            if f.nets_job.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Reading KiCad board and extracting nets…").color(p.weak));
+                    if ui.small_button("Cancel").clicked() {
+                        cancel_nets = true;
+                    }
+                });
+                ui.add_space(4.0);
+            }
             egui::Grid::new("pcbdc-in").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Net");
                 ui.horizontal(|ui| {
@@ -2441,17 +2500,22 @@ impl SimApp {
                 ui.end_row();
             });
             ui.add_space(6.0);
-            let running = f.job.is_some();
+            let running = f.job.is_some() || f.nets_job.is_some();
             ui.horizontal(|ui| {
                 let ok = !f.from.is_empty() && !f.to.is_empty() && f.from != f.to && !running;
                 go = ui.add_enabled(ok, primary(&p, "Calculate")).clicked();
-                if running {
+                if f.job.is_some() {
                     ui.spinner();
                     ui.label(RichText::new("solving the copper network…").color(p.weak));
                 } else if f.from == f.to && !f.from.is_empty() {
                     ui.label(RichText::new("pick two different pads").color(p.warn));
                 }
             });
+            if cancel_nets {
+                if let Some((c, _)) = f.nets_job.take() {
+                    c.store(true, Ordering::Relaxed);
+                }
+            }
             if let Some(e) = &f.error {
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("⚠ {e}")).color(p.err));
@@ -2514,6 +2578,9 @@ impl SimApp {
         }
         if go {
             self.start_pcb_job();
+        }
+        if cancel_nets {
+            open = false;
         }
         self.pcb.open = open;
     }
@@ -3838,35 +3905,98 @@ impl SimApp {
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
 
-        let (mesh, model, results, display, rev, view_req, stale) = {
-            let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mesh = if s.model.bodies.is_empty() || self.mesh_err.as_ref().is_some_and(|(r, _)| *r == s.geom_rev) {
-                None
-            } else {
-                match s.ensure_mesh() {
-                    Ok(m) => {
-                        self.mesh_err = None;
-                        Some(m)
+        if let Some(job) = &self.mesh_job {
+            let done = job.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            if let Some(res) = done {
+                let finished = self.mesh_job.take().unwrap();
+                let cancelled = finished.cancel.load(Ordering::Relaxed);
+                match res {
+                    Ok(m) if !cancelled => {
+                        let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if s.mesh_key() == finished.key {
+                            let _ = s.install_mesh(m, finished.key.0, (finished.key.1, finished.key.2));
+                            self.mesh_err = None;
+                        }
                     }
+                    Ok(_) => {}
+                    Err(_) if cancelled => {}
                     Err(e) => {
-                        self.mesh_err = Some((s.geom_rev, format!("{e:#}")));
-                        None
+                        self.mesh_err = Some((finished.key, e));
                     }
                 }
-            };
+            }
+        }
+
+        let (mesh, model, results, display, rev, view_req, stale) = {
+            let mut s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if s.model.bodies.is_empty() {
+                if let Some(old) = self.mesh_job.take() {
+                    old.cancel.store(true, Ordering::Relaxed);
+                }
+                self.mesh_err = None;
+            } else if s.mesh_valid() {
+                if let Some(old) = self.mesh_job.take() {
+                    old.cancel.store(true, Ordering::Relaxed);
+                }
+                self.mesh_err = None;
+            } else {
+                let key = s.mesh_key();
+                if self.mesh_err.as_ref().is_some_and(|(k, _)| *k != key) {
+                    self.mesh_err = None;
+                }
+                if self.mesh_err.is_none() && self.mesh_job.as_ref().is_none_or(|j| j.key != key) {
+                    if let Some(old) = self.mesh_job.take() {
+                        old.cancel.store(true, Ordering::Relaxed);
+                    }
+                    let model = s.model.clone();
+                    let h = s.element_size();
+                    let limit = crate::mesh::max_cells_for(&model);
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let done = Arc::new(std::sync::Mutex::new(None));
+                    let (c2, d2, ctx2) = (cancel.clone(), done.clone(), ui.ctx().clone());
+                    std::thread::spawn(move || {
+                        let r = crate::mesh::build_for_cancellable(&model, h, limit, &c2).map_err(|e| format!("{e:#}"));
+                        *d2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
+                        ctx2.request_repaint();
+                    });
+                    self.mesh_job = Some(MeshJob { key, cancel, done });
+                }
+            }
+            let mesh = if s.model.bodies.is_empty() { None } else { s.mesh.clone() };
             (mesh, s.model.clone(), s.results.clone(), s.display.clone(), s.revision, s.view_request.take(), s.results_stale)
         };
+        if self.mesh_job.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(80));
+        }
 
         let (bt, bb) = render::background(self.dark);
         let c32 = |c: [f32; 3]| Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
         let Some(mesh) = mesh else {
             painter.rect_filled(rect, 0.0, c32(bb));
-            let (title, sub) = match &self.mesh_err {
-                Some((_, e)) => ("⚠  Geometry problem".to_string(), e.clone()),
-                None => ("Start a new simulation".into(), "GEOMETRY ▸ Box / Cylinder / Import STL      or      Examples ▸ Cantilever bracket".into()),
-            };
-            painter.text(rect.center() - vec2(0.0, 14.0), Align2::CENTER_CENTER, title, FontId::proportional(22.0), p.text);
-            painter.text(rect.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, sub, FontId::proportional(13.0), p.weak);
+            if self.mesh_job.is_some() {
+                painter.text(rect.center() - vec2(0.0, 22.0), Align2::CENTER_CENTER, "⚙  Meshing geometry…", FontId::proportional(20.0), p.text);
+                painter.text(rect.center() + vec2(0.0, 4.0), Align2::CENTER_CENTER, "Window stays responsive while building the mesh", FontId::proportional(13.0), p.weak);
+                let btn = Rect::from_center_size(rect.center() + vec2(0.0, 34.0), vec2(110.0, 26.0));
+                if ui.put(btn, egui::Button::new("Cancel meshing")).clicked() {
+                    if let Some(j) = self.mesh_job.take() {
+                        j.cancel.store(true, Ordering::Relaxed);
+                        self.mesh_err = Some((j.key, "Meshing cancelled.".into()));
+                    }
+                }
+            } else {
+                let (title, sub) = match &self.mesh_err {
+                    Some((_, e)) => ("⚠  Geometry / mesh notice".to_string(), e.clone()),
+                    None => ("Start a new simulation".into(), "GEOMETRY ▸ Box / Cylinder / Import STL      or      Examples ▸ Cantilever bracket".into()),
+                };
+                painter.text(rect.center() - vec2(0.0, 14.0), Align2::CENTER_CENTER, title, FontId::proportional(22.0), p.text);
+                painter.text(rect.center() + vec2(0.0, 16.0), Align2::CENTER_CENTER, sub, FontId::proportional(13.0), p.weak);
+                if self.mesh_err.is_some() {
+                    let btn = Rect::from_center_size(rect.center() + vec2(0.0, 46.0), vec2(100.0, 26.0));
+                    if ui.put(btn, egui::Button::new("Retry mesh")).clicked() {
+                        self.mesh_err = None;
+                    }
+                }
+            }
             let _ = bt;
             return;
         };
@@ -4148,6 +4278,18 @@ impl SimApp {
                 ui.ctx().request_repaint();
             }
         }
+        if self.mesh_job.is_some() {
+            let pill = Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 24.0), vec2(210.0, 28.0));
+            painter.rect(pill, 8.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
+            painter.text(pill.left_center() + vec2(12.0, 0.0), Align2::LEFT_CENTER, "⚙  Updating mesh…", FontId::proportional(12.5), text_col);
+            let cbtn = Rect::from_min_size(pos2(pill.right() - 62.0, pill.top() + 4.0), vec2(54.0, 20.0));
+            if ui.put(cbtn, egui::Button::new(RichText::new("Cancel").small())).clicked() {
+                if let Some(j) = self.mesh_job.take() {
+                    j.cancel.store(true, Ordering::Relaxed);
+                    self.mesh_err = Some((j.key, "Meshing cancelled.".into()));
+                }
+            }
+        }
     }
 
     // ------------------------------------------------ status bar
@@ -4370,7 +4512,7 @@ impl eframe::App for SimApp {
             if let Some(d) = q.get("pcb_dc") {
                 let path = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pcb_path();
                 if let Some(path) = path {
-                    self.open_pcb_dc(&path);
+                    self.open_pcb_dc(&ctx, &path);
                     for (k, slot) in [("net", &mut self.pcb.net), ("from", &mut self.pcb.from), ("to", &mut self.pcb.to)] {
                         if let Some(v) = d[k].as_str() {
                             *slot = v.to_string();

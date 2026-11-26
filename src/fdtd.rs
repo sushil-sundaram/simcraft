@@ -570,7 +570,7 @@ struct Gpu {
 
 impl Gpu {
     fn new(s: &Setup) -> Result<Gpu> {
-        let adapter = crate::gpu::pick_adapter()?;
+        let adapter = crate::gpu::pick_adapter(false)?;
         let info = adapter.get_info();
         let al = adapter.limits();
         let nn = s.nn;
@@ -829,13 +829,14 @@ pub fn solve_steady(model: &Model, s: &Setup, prog: Prog) -> Result<Solution> {
     };
     let max_periods = model.analysis.max_periods.clamp(RAMP_PERIODS + 2 * BLOCK_PERIODS, 20_000);
     let block = BLOCK_PERIODS * s.period;
-    prog(0.02, "ramping up the source");
+    prog.report(0.02, "ramping up the source")?;
     engine.run(s, RAMP_PERIODS * s.period, false)?;
     let mut periods = RAMP_PERIODS;
     let mut prev: Option<(f64, f64)> = None;
     let mut stable = 0;
     let mut change = 1.0;
     let (re, im) = loop {
+        prog.check()?;
         engine.reset_dft()?;
         engine.run(s, block, true)?;
         periods += BLOCK_PERIODS;
@@ -854,7 +855,7 @@ pub fn solve_steady(model: &Model, s: &Setup, prog: Prog) -> Result<Solution> {
             stable = if change < TOL { stable + 1 } else { 0 };
         }
         prev = Some((pin, pabs));
-        prog(0.02 + 0.93 * (periods as f64 / max_periods as f64).min(1.0), &format!("{} · period {periods}, change {:.2}%", engine.name(), change * 100.0));
+        prog.report(0.02 + 0.93 * (periods as f64 / max_periods as f64).min(1.0), &format!("{} · period {periods}, change {:.2}%", engine.name(), change * 100.0))?;
         if stable >= 2 || periods + BLOCK_PERIODS > max_periods {
             break (re, im);
         }
@@ -869,7 +870,7 @@ pub fn solve_steady(model: &Model, s: &Setup, prog: Prog) -> Result<Solution> {
 /// power density per mesh element [W/m³].
 pub fn full_wave(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<Vec<f64>> {
     let t0 = std::time::Instant::now();
-    prog(0.0, "building the FDTD grid");
+    prog.report(0.0, "building the FDTD grid")?;
     let s = setup(model, mesh)?;
     if std::env::var_os("SIMCRAFT_PROFILE").is_some() {
         eprintln!("[fdtd] setup {:.2} s", t0.elapsed().as_secs_f64());
@@ -953,7 +954,7 @@ pub fn full_wave(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> R
         res.warnings.push(format!("power balance: only {:.1}% of the input is absorbed in a closed cavity (expected ~100%) — results may not be converged", 100.0 * total_abs / s.power));
     }
     if s.pad > 0 {
-        prog(0.97, "far field");
+        prog.report(0.97, "far field")?;
         let ff = far_field(&s, &sol.re, &sol.im, scale)?;
         let eta = (MU0 / EPS0).sqrt();
         let d = 4.0 * std::f64::consts::PI * ff.umax / ff.prad.max(1e-300);
@@ -997,7 +998,7 @@ pub fn full_wave(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> R
 
 /// Microwave heating: full-wave EM, then transient conduction in the solids with the absorbed power.
 pub fn microwave_heating(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<()> {
-    let q = full_wave(model, mesh, &|f, m| prog(0.7 * f, m), res)?;
+    let q = full_wave(model, mesh, prog.slice(0.0, 0.7), res)?;
     let fdtd = res.info.solver.clone();
     let periods = res.info.iterations;
     let sel: Vec<bool> = mesh.elem_region.iter().map(|r| *r == REGION_SOLID).collect();
@@ -1007,7 +1008,7 @@ pub fn microwave_heating(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Resul
     if heat <= 0.0 {
         res.warnings.push("no power is absorbed in the solid bodies: check their materials (loss tangent) and the port".into());
     }
-    crate::dynamics::transient_thermal_sel(model, mesh, Some(&qs), Some(&sel), &|f, m| prog(0.7 + 0.3 * f, m), res)?;
+    crate::dynamics::transient_thermal_sel(model, mesh, Some(&qs), Some(&sel), prog.slice(0.7, 0.3), res)?;
     res.info.solver = format!("{fdtd} + {}", res.info.solver);
     res.info.iterations = periods;
     res.quantity("Heating power in solids", heat, "W");

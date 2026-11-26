@@ -6,10 +6,12 @@
 //! the coarsest level) preconditions conjugate gradients, which typically converges in 10–25
 //! iterations instead of hundreds for diagonal preconditioning.
 
+use crate::fem::check_cancel;
 use crate::sparse::{Factor, NodeSparse};
 use anyhow::{Result, anyhow, bail};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 
 const CH: usize = 8192;
 
@@ -208,6 +210,10 @@ impl Multigrid {
     /// Multigrid-preconditioned CG; `x` is the initial guess. Converges to `tol` relative to the
     /// initial residual. Returns iterations.
     pub fn solve(&self, b: &[f64], x: &mut [f64], tol: f64, max_it: usize) -> Result<usize> {
+        self.solve_cancellable(b, x, tol, max_it, &crate::fem::NEVER_CANCEL)
+    }
+
+    pub fn solve_cancellable(&self, b: &[f64], x: &mut [f64], tol: f64, max_it: usize, cancel: &AtomicBool) -> Result<usize> {
         let lev = &self.levels[0];
         let n = lev.n();
         let mut r = vec![0.0; n];
@@ -225,6 +231,9 @@ impl Multigrid {
         let mut rz = dot(&r, &z);
         let mut ap = vec![0.0; n];
         for it in 1..=max_it {
+            if it % 4 == 0 {
+                check_cancel(cancel)?;
+            }
             lev.matvec(&p, &mut ap);
             let alpha = rz / dot(&p, &ap);
             each(x, |i, xi| *xi += alpha * p[i]);

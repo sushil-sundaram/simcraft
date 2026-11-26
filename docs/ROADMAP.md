@@ -235,7 +235,7 @@ Full line-by-line checklists live in `todo.md`. Two deployment targets were audi
 | # | Item | Size | Why / depends on | State |
 |---|---|---|---|---|
 | P2.S | Security, path sandboxing & parser DoS hardening | S–M | blocks untrusted `.simcraft`/`.stl`/`.kicad_pcb`/MCP risk; prerequisite for web/STEP | done |
-| P2.A1 | Non-blocking meshing, STL BVH, `f32`/`f64` GPU split, undo & cancel cleanup | M | prevents UI freezes and panic-unwind hazards before `P2.3` (STEP) and `P2.5` (octree) | planned |
+| P2.A1 | Non-blocking meshing, STL BVH, `f32`/`f64` GPU split, undo & cancel cleanup | M | prevents UI freezes and panic-unwind hazards before `P2.3` (STEP) and `P2.5` (octree) | done |
 | P2.A2 | Hardware iGPU 3D viewport (`glow`/`wgpu`) + modular `gui.rs` / `egui_dock` | M–L | replaces 0.6× CPU `render.rs` drag rasterizer; unlocks smooth animations, transparency, gizmos | planned |
 | P2.U | CAE UX overhaul (3D glyphs, body pick/hide, unified edit forms, pre-flight, trackpad, Copilot) | M–L | best after `P2.A2` (hardware viewport + docked drawers) | planned |
 | P2.W | Web / Tauri split architecture (DOM + WebGL2/WebGPU UI + `axum` Rust backend / demo WASM) | L–XL | required for browser laptop/desktop delivery; depends on `P2.S` and `P2.A1` | planned |
@@ -267,7 +267,7 @@ Full line-by-line checklists live in `todo.md`. Two deployment targets were audi
 - **Validate**: Regression tests with malformed/extreme-aspect/deeply-nested `.kicad_pcb`, `NaN`/`Inf`
   and huge-dim `.stl`/CSG inputs, path-traversal rejections, and `cargo test --release`.
 
-### P2.A1 Non-blocking engine, STL BVH, GPU adapter split & undo/cancel cleanup (M)
+### P2.A1 Non-blocking engine, STL BVH, GPU adapter split & undo/cancel cleanup (M) — done
 
 - **Off-UI-thread meshing & KiCad inspection (`gui.rs`, `geometry.rs`)**: Move `ensure_mesh()` out
   of `viewport()` (`gui.rs:3796`) and `net_pads()` out of `open_pcb_dc()` (`gui.rs:2325`) onto
