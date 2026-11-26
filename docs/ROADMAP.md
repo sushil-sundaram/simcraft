@@ -42,7 +42,7 @@ Sizes: **S** ≈ one session, **M** ≈ 2–3, **L** ≈ 4–6, **XL** > 6.
 | P2.0 | Benchmark suite (`simcraft bench`): 24 reference cases, mesh sweeps, HTML report, other-solver column, CI gate | S–M | measures every later item against references and Ansys | done |
 | P2.0b | Fix the fitting defects the benchmark found (see below) | S–M | wrong peak stresses at some element sizes; must come before more physics | done |
 | P2.1 | Thermal radiation + temperature-dependent properties | M | biggest missing physics for electronics cooling; self-contained | done |
-| P2.2 | Path plots, cylindrical results, mesh-convergence assistant | S–M | cheap, raises trust in every result | planned |
+| P2.2 | Path plots, cylindrical results, mesh-convergence assistant | S–M | cheap, raises trust in every result | done |
 | P2.3 | STEP import (spike first) | M–L | unlocks real CAD parts and assemblies | planned |
 | P2.4 | Contact, bolt pretension, springs, remote points | L | assemblies; best after P2.3 | planned |
 | P2.5 | Local mesh refinement (octree) + adaptive error control | XL | real parts with small features; touches every FE solver | planned |
@@ -119,7 +119,9 @@ surface-to-surface radiation across the CHT fluid, spectral / specular surfaces.
 - **Risks**: view-factor cost (patching + BVH keep it O(N log N)); non-linear convergence at high
   emissivity (relaxation, fall back to Newton).
 
-### P2.2 Results you can trust (S–M)
+### P2.2 Results you can trust (S–M) — done
+
+Trilinear hex-mesh point locator and straight-line path sampling (`Mesh::locate_points` / `sample_path` / `sample_path_tensor`, `Results::path_plot`, CSV export, void-gap handling across holes, viewport line overlay, `RESULTS ▸ TOOLS ▸ Path`, `Charts & Path Plot` window, MCP `plot_path`), cylindrical stress tensor rotation (`CylindricalAxis`, `hoop_stress` / `radial_stress` / `axial_stress` in `RESULTS ▸ STRESS`, contextual `CYLINDRICAL AXIS` group, `set_display` / `probe` / `plot_path`), and general 3-grid Richardson extrapolation (`richardson_extrapolate`, `mesh_convergence`, `OPTIMIZE ▸ Convergence`, `apply_design` element-size adoption + undo, MCP `mesh_convergence`). Validated in `tests/results_p2_2.rs` and `src/bench.rs` (`lame_path` 0.63 % hoop / 2.38 % radial along 45° diagonal, `cantilever_conv` Richardson-extrapolated deflection 0.38 % from Timoshenko theory from 3 coarse meshes, plus hole gaps, custom axis orientation, invalid inputs, workspace-jailed CSV, and cancellation). Original plan:
 
 - **Path plots**: pick two points (or a probe line) → any result along it in the chart window, CSV
   export; MCP `plot_path`.

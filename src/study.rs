@@ -61,8 +61,32 @@ pub struct Run {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct ConvergenceStep {
+    pub element_size_mm: f64,
+    pub elements: usize,
+    pub dofs: usize,
+    pub responses: Vec<Option<f64>>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct ConvergenceReport {
+    pub response: String,
+    pub values: Vec<Option<f64>>,
+    pub extrapolated: Option<f64>,
+    pub observed_order: Option<f64>,
+    pub order_used: Option<f64>,
+    pub fine_error_pct: Option<f64>,
+    pub gci_fine_pct: Option<f64>,
+    pub recommended_size_mm: Option<f64>,
+    pub monotonic: bool,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct Study {
-    /// "parameter_study", "optimization" or "topology"
+    /// "parameter_study", "optimization", "surrogate_optimization", "topology" or "convergence"
     pub kind: String,
     pub parameters: Vec<Parameter>,
     pub responses: Vec<String>,
@@ -81,6 +105,14 @@ pub struct Study {
     /// Topology optimization: (iteration, compliance [J], volume fraction).
     #[serde(default)]
     pub history: Vec<(usize, f64, f64)>,
+    #[serde(default)]
+    pub convergence_steps: Vec<ConvergenceStep>,
+    #[serde(default)]
+    pub convergence: Vec<ConvergenceReport>,
+    #[serde(default)]
+    pub target_error_pct: Option<f64>,
+    #[serde(default)]
+    pub recommended_size_mm: Option<f64>,
     #[serde(default)]
     pub seconds: f64,
 }
@@ -224,7 +256,7 @@ pub fn suggested_responses(model: &Model) -> Vec<String> {
     let k = model.analysis.kind;
     let f = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     r.extend(match k {
-        StaticStructural | TransientStructural | NonlinearStructural | ThermalStress => f(&["max:von_mises", "min:safety_factor", "max:total_deformation", "min:deformation_z", "max:max_principal"]),
+        StaticStructural | TransientStructural | NonlinearStructural | ThermalStress => f(&["max:von_mises", "min:safety_factor", "max:total_deformation", "min:deformation_z", "max:max_principal", "max:hoop_stress", "min:radial_stress", "max:axial_stress"]),
         Modal => f(&["frequency:1", "frequency:2", "frequency:3"]),
         LinearBuckling => f(&["load_multiplier:1", "max:von_mises"]),
         HarmonicResponse => f(&["quantity:Peak displacement amplitude", "quantity:Peak response frequency", "max:von_mises"]),
@@ -297,12 +329,17 @@ pub fn evaluate(model: &Model, responses: &[String]) -> Result<Vec<Option<f64>>>
     evaluate_with(model, responses, &fem::NEVER_CANCEL)
 }
 
-fn evaluate_with(model: &Model, responses: &[String], cancel: &AtomicBool) -> Result<Vec<Option<f64>>> {
+fn evaluate_detail_with(model: &Model, responses: &[String], cancel: &AtomicBool) -> Result<(usize, usize, Vec<Option<f64>>)> {
     let h = model.element_size.unwrap_or_else(|| mesh::auto_size(&model.bodies, model.mesh_with_enclosure()));
     let m = mesh::build_for_cancellable(model, h, mesh::max_cells_for(model), cancel)?;
     let res = fem::solve(model, &m, fem::Progress::cancel_only(cancel))?;
     let sum = res.summary(&m);
-    Ok(responses.iter().map(|k| response(&sum, res.info.mass_kg, m.volume_mm3(), k).ok()).collect())
+    let vals = responses.iter().map(|k| response(&sum, res.info.mass_kg, m.volume_mm3(), k).ok()).collect();
+    Ok((res.info.elements.max(m.elems.len()), res.info.dofs.max(m.nodes.len()), vals))
+}
+
+fn evaluate_with(model: &Model, responses: &[String], cancel: &AtomicBool) -> Result<Vec<Option<f64>>> {
+    Ok(evaluate_detail_with(model, responses, cancel)?.2)
 }
 
 fn validate(model: &Model, params: &[Parameter]) -> Result<()> {
@@ -744,4 +781,209 @@ pub fn surrogate_optimize(model: &Model, params: Vec<Parameter>, objective: Obje
         seconds: t0.elapsed().as_secs_f64(),
         ..Default::default()
     })
+}
+
+// ------------------------------------------------------------------ mesh convergence & Richardson extrapolation
+
+/// General 3-grid Richardson extrapolation for arbitrary step ratios `hs[0] > hs[1] > hs[2] > 0`.
+pub fn richardson_extrapolate(hs: [f64; 3], fs: [f64; 3], target_err_pct: f64, response: impl Into<String>) -> ConvergenceReport {
+    let name = response.into();
+    let values = fs.iter().copied().map(Some).collect();
+    if !(hs[0] > hs[1] && hs[1] > hs[2] && hs[2] > 0.0) || fs.iter().any(|v| !v.is_finite()) {
+        return ConvergenceReport { response: name, values, note: "invalid mesh sizes or non-finite values".into(), ..Default::default() };
+    }
+    let target = target_err_pct.clamp(1e-3, 50.0);
+    let (r21, r32) = (hs[0] / hs[1], hs[1] / hs[2]);
+    let (d1, d2) = (fs[1] - fs[0], fs[2] - fs[1]);
+    let scale = fs[2].abs().max(1.0);
+    let fl = crate::results::float;
+
+    if d1.abs() <= 1e-12 * scale && d2.abs() <= 1e-12 * scale {
+        return ConvergenceReport {
+            response: name,
+            values,
+            extrapolated: Some(fl(fs[2])),
+            observed_order: Some(2.0),
+            order_used: Some(2.0),
+            fine_error_pct: Some(0.0),
+            gci_fine_pct: Some(0.0),
+            recommended_size_mm: Some(fl(hs[2])),
+            monotonic: true,
+            note: "already converged across all three meshes".into(),
+        };
+    }
+
+    let monotone = d1 * d2 > 0.0 && d2.abs() < d1.abs();
+    let (obs_p, p_used, note_extra) = if monotone && d2.abs() > 1e-14 * scale {
+        let ratio = d1 / d2;
+        let min_r = r21.ln() / r32.ln();
+        if ratio <= min_r {
+            (Some(0.5), 0.5, "slow asymptotic convergence (using p = 0.5)")
+        } else {
+            // Solve (h1^p - h2^p) / (h2^p - h3^p) = ratio, i.e. r32^p * (r21^p - 1) / (r32^p - 1) = ratio.
+            let eval = |p: f64| r32.powf(p) * (r21.powf(p) - 1.0) / (r32.powf(p) - 1.0) - ratio;
+            let (mut lo, mut hi) = (0.05f64, 12.0f64);
+            if eval(hi) < 0.0 {
+                (Some(12.0), 4.0, "rapid convergence (order clamped to 4)")
+            } else {
+                for _ in 0..60 {
+                    let mid = 0.5 * (lo + hi);
+                    if eval(mid) < 0.0 { lo = mid; } else { hi = mid; }
+                }
+                let p = 0.5 * (lo + hi);
+                (Some(fl(p)), p.clamp(0.5, 4.0), "monotonic Richardson extrapolation")
+            }
+        }
+    } else if monotone {
+        (Some(2.0), 2.0, "fine-grid difference negligible")
+    } else {
+        (None, 2.0, "non-monotonic convergence (e.g. voxel snapping); conservative 2nd-order estimate")
+    };
+
+    let rp = r32.powf(p_used);
+    let ext = (rp * fs[2] - fs[1]) / (rp - 1.0);
+    let ext_denom = if ext.abs() > 1e-9 * scale { ext.abs() } else { fs[2].abs().max(1e-12) };
+    let fine_denom = fs[2].abs().max(ext_denom).max(1e-12);
+    let fine_err_pct = if monotone {
+        100.0 * (ext - fs[2]).abs() / ext_denom
+    } else {
+        100.0 * (fs[2] - fs[1]).abs().max((ext - fs[2]).abs()) / (rp - 1.0).max(1.0) / ext_denom
+    };
+    let gci_fine_pct = 125.0 * (fs[2] - fs[1]).abs() / (fine_denom * (rp - 1.0));
+    let rec_h = if fine_err_pct <= target {
+        hs[2]
+    } else {
+        (hs[2] * (target / fine_err_pct.max(1e-9)).powf(1.0 / p_used)).max(hs[2] * 0.1)
+    };
+    let note = if fine_err_pct <= target {
+        format!("{note_extra}; fine mesh {:.3} mm already meets {target}% target", fl(hs[2]))
+    } else {
+        format!("{note_extra}; refine to <= {:.3} mm for {target}% target", fl(rec_h))
+    };
+
+    ConvergenceReport {
+        response: name,
+        values,
+        extrapolated: Some(fl(ext)),
+        observed_order: obs_p,
+        order_used: Some(fl(p_used)),
+        fine_error_pct: Some(fl(fine_err_pct)),
+        gci_fine_pct: Some(fl(gci_fine_pct)),
+        recommended_size_mm: Some(fl(rec_h)),
+        monotonic: monotone,
+        note,
+    }
+}
+
+/// Solve at `h`, `h / 1.4` and `h / 2.0`, Richardson-extrapolate responses and estimate accuracy.
+pub fn mesh_convergence(model: &Model, responses: Vec<String>, base_h: Option<f64>, target_error_pct: f64, prog: StudyProg) -> Result<Study> {
+    if let Some(h) = base_h {
+        if !h.is_finite() || h <= 0.0 {
+            bail!("base_element_size_mm must be finite and positive");
+        }
+    }
+    if !target_error_pct.is_finite() || target_error_pct <= 0.0 || target_error_pct > 50.0 {
+        bail!("target_error_pct must be between 0 and 50");
+    }
+    let mut responses = responses;
+    if responses.is_empty() {
+        responses = suggested_responses(model)
+            .into_iter()
+            .filter(|r| r != "mass" && r != "volume")
+            .take(3)
+            .collect();
+        if responses.is_empty() {
+            responses = vec!["mass".into()];
+        }
+    }
+    let h0 = base_h.unwrap_or_else(|| model.element_size.unwrap_or_else(|| mesh::auto_size(&model.bodies, model.mesh_with_enclosure())));
+    let hs = [h0, h0 / 1.4, h0 / 2.0];
+    let t0 = std::time::Instant::now();
+    let mut steps = Vec::with_capacity(3);
+    let mut runs = Vec::with_capacity(3);
+
+    for (i, &hi) in hs.iter().enumerate() {
+        prog.report(i as f64 / 3.0, &format!("convergence {}/3: solving at h = {:.3} mm", i + 1, hi))?;
+        let mut m = model.clone();
+        m.element_size = Some(hi);
+        match evaluate_detail_with(&m, &responses, prog.cancel) {
+            Ok((elements, dofs, vals)) => {
+                steps.push(ConvergenceStep { element_size_mm: crate::results::float(hi), elements, dofs, responses: vals.clone(), error: None });
+                runs.push(Run { values: vec![crate::results::float(hi)], responses: vals, feasible: true, error: None, phase: "convergence".into() });
+            }
+            Err(e) if e.is::<fem::Cancelled>() => return Err(e),
+            Err(e) => {
+                let msg = format!("{e:#}");
+                steps.push(ConvergenceStep { element_size_mm: crate::results::float(hi), elements: 0, dofs: 0, responses: vec![None; responses.len()], error: Some(msg.clone()) });
+                runs.push(Run { values: vec![crate::results::float(hi)], responses: vec![None; responses.len()], feasible: false, error: Some(msg), phase: "convergence".into() });
+            }
+        }
+    }
+
+    if steps.iter().all(|s| s.error.is_some()) {
+        bail!("all three meshes failed (last error: {})", steps.last().and_then(|s| s.error.as_deref()).unwrap_or("unknown"));
+    }
+
+    let mut convergence = Vec::with_capacity(responses.len());
+    for (ri, rname) in responses.iter().enumerate() {
+        let col: [Option<f64>; 3] = [steps[0].responses[ri], steps[1].responses[ri], steps[2].responses[ri]];
+        if let [Some(a), Some(b), Some(c)] = col {
+            convergence.push(richardson_extrapolate(hs, [a, b, c], target_error_pct, rname.clone()));
+        } else {
+            convergence.push(ConvergenceReport {
+                response: rname.clone(),
+                values: col.to_vec(),
+                note: "could not evaluate all three meshes".into(),
+                ..Default::default()
+            });
+        }
+    }
+
+    let rec = convergence.iter().filter_map(|c| c.recommended_size_mm).fold(f64::INFINITY, f64::min);
+    let recommended_size_mm = rec.is_finite().then(|| crate::results::float(rec));
+    let summary_parts: Vec<String> = convergence
+        .iter()
+        .filter_map(|c| {
+            let ext = c.extrapolated?;
+            let err = c.fine_error_pct?;
+            Some(format!("{} -> {} ({}% err at {} mm)", c.response, crate::results::float(ext), crate::results::float(err), crate::results::float(hs[2])))
+        })
+        .collect();
+    let rec_msg = recommended_size_mm.map(|r| format!(" Recommended <= {r} mm for {target_error_pct}% accuracy.")).unwrap_or_default();
+    let message = format!("Mesh convergence h = [{:.3}, {:.3}, {:.3}] mm: {}.{rec_msg}", hs[0], hs[1], hs[2], summary_parts.join("; "));
+    prog.report(1.0, "done")?;
+
+    Ok(Study {
+        kind: "convergence".into(),
+        parameters: vec![Parameter { target: "element_size".into(), min: hs[2], max: hs[0], steps: Some(3) }],
+        responses,
+        runs,
+        best: None,
+        message,
+        convergence_steps: steps,
+        convergence,
+        target_error_pct: Some(target_error_pct),
+        recommended_size_mm,
+        seconds: t0.elapsed().as_secs_f64(),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod convergence_tests {
+    use super::*;
+
+    #[test]
+    fn richardson_recovers_exact_order_two_and_limit() {
+        // f(h) = 100.0 + 0.5 * h^2 at h = [4.0, 4.0/1.4, 2.0]
+        let hs = [4.0, 4.0 / 1.4, 2.0];
+        let fs = hs.map(|h| 100.0 + 0.5 * h * h);
+        let rep = richardson_extrapolate(hs, fs, 0.5, "test");
+        assert!(rep.monotonic);
+        assert!((rep.extrapolated.unwrap() - 100.0).abs() < 1e-6);
+        assert!((rep.observed_order.unwrap() - 2.0).abs() < 1e-4);
+        // error at h=2 is 2.0 / 100.0 = 2%; for 0.5% error, h_rec = 2 * sqrt(0.5/2) = 1.0 mm
+        assert!((rep.fine_error_pct.unwrap() - 2.0).abs() < 1e-4);
+        assert!((rep.recommended_size_mm.unwrap() - 1.0).abs() < 1e-3);
+    }
 }

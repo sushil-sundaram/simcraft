@@ -256,6 +256,7 @@ enum Form {
     Enclosure,
     Study,
     Optimize,
+    Convergence,
     Topology,
     Load(LoadKind),
 }
@@ -863,7 +864,24 @@ pub struct SimApp {
     show_mcp: bool,
     planner: Planner,
     opt: OptUi,
+    path: PathUi,
     copied: Option<(&'static str, f64)>,
+}
+
+#[derive(Default)]
+struct PathUi {
+    /// 0 = History, 1 = Path plot
+    tab: usize,
+    from: [f64; 3],
+    to: [f64; 3],
+    samples: usize,
+    field: Option<Field>,
+    /// 0 = off, 1 = picking start A, 2 = picking end B
+    picking: u8,
+    inited_res: u64,
+    cache_key: String,
+    plot: Option<crate::results::PathPlot>,
+    error: Option<String>,
 }
 
 /// State of the OPTIMIZE tab forms and the study results window.
@@ -885,6 +903,9 @@ struct OptUi {
     whatif_pred: Option<Value>,
     vf: f64,
     iters: usize,
+    conv_custom_h: bool,
+    conv_base_h: f64,
+    conv_target_err: f64,
     show_results: bool,
     job: Option<Arc<std::sync::Mutex<Option<Result<(), String>>>>>,
     error: Option<String>,
@@ -1035,7 +1056,8 @@ impl SimApp {
             dark,
             p: pal(dark),
             show_mcp: std::env::var_os("SIMCRAFT_OPEN_CONNECT").is_some(),
-            opt: OptUi { max_evals: 12, bayes: true, vf: 0.4, iters: 40, objective: "mass".into(), ..Default::default() },
+            opt: OptUi { max_evals: 12, bayes: true, vf: 0.4, iters: 40, conv_base_h: 4.0, conv_target_err: 1.0, objective: "mass".into(), ..Default::default() },
+            path: PathUi { samples: 50, to: [100.0, 0.0, 0.0], ..Default::default() },
             planner: Planner { open: std::env::var_os("SIMCRAFT_OPEN_PLANNER").is_some(), ..Default::default() },
             copied: None,
         }
@@ -1294,6 +1316,7 @@ impl SimApp {
         let title = match form {
             Form::Study => "📊 Parameter study",
             Form::Optimize => "🎯 Optimize design",
+            Form::Convergence => "📐 Mesh convergence",
             _ => "🦴 Topology optimization",
         };
         ui.heading(title);
@@ -1304,7 +1327,7 @@ impl SimApp {
                 }
             });
         };
-        if form != Form::Topology {
+        if matches!(form, Form::Study | Form::Optimize) {
             card(ui, &p, |ui| {
                 ui.label(RichText::new("Parameters (what to vary)").strong());
                 let mut remove = None;
@@ -1415,6 +1438,43 @@ impl SimApp {
                     }
                 }
             }
+            Form::Convergence => {
+                card(ui, &p, |ui| {
+                    ui.label(RichText::new("Solves at h, h/1.4 and h/2, Richardson-extrapolates each response, and estimates discretisation error and required element size.").color(p.weak));
+                    ui.add_space(4.0);
+                    let cur_h = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).element_size();
+                    ui.checkbox(&mut self.opt.conv_custom_h, format!("Custom coarsest h (auto: {} mm)", render::fmt_val(cur_h)));
+                    if self.opt.conv_custom_h {
+                        ui.horizontal(|ui| {
+                            ui.label("Base h");
+                            ui.add(egui::DragValue::new(&mut self.opt.conv_base_h).speed(0.1).range(0.05..=500.0).suffix(" mm"));
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Target error");
+                        ui.add(egui::DragValue::new(&mut self.opt.conv_target_err).speed(0.05).range(0.05..=25.0).suffix(" %"));
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Responses (optional; defaults to main physics responses)").strong());
+                    for r in &responses {
+                        let mut on = self.opt.responses.contains(r);
+                        if ui.checkbox(&mut on, r).changed() {
+                            if on {
+                                self.opt.responses.push(r.clone());
+                            } else {
+                                self.opt.responses.retain(|x| x != r);
+                            }
+                        }
+                    }
+                });
+                if ui.add_enabled(!busy, primary(&p, "Run convergence")).clicked() {
+                    let mut args = json!({"responses": self.opt.responses, "target_error_pct": self.opt.conv_target_err});
+                    if self.opt.conv_custom_h {
+                        args["base_element_size_mm"] = json!(self.opt.conv_base_h);
+                    }
+                    self.start_job("mesh_convergence", args);
+                }
+            }
             _ => {
                 card(ui, &p, |ui| {
                     ui.label(RichText::new("Keeps the stiffest layout of material for your supports and loads. Regions under loads and supports stay solid.").color(p.weak));
@@ -1474,6 +1534,7 @@ impl SimApp {
             "optimization" => "🎯 Optimization results",
             "surrogate_optimization" => "🎯 Surrogate optimization results",
             "topology" => "🦴 Topology optimization",
+            "convergence" => "📐 Mesh convergence study",
             _ => "📊 Parameter study",
         };
         egui::Window::new(RichText::new(title).strong())
@@ -1485,6 +1546,64 @@ impl SimApp {
                 ui.label(RichText::new(&st.message).strong());
                 ui.label(RichText::new(format!("{:.1} s", st.seconds)).small().color(p.weak));
                 ui.add_space(6.0);
+                if st.kind == "convergence" {
+                    if let Some(rec) = st.recommended_size_mm {
+                        ui.horizontal(|ui| {
+                            if ui.add(primary(&p, &format!("Apply {rec} mm mesh"))).clicked() {
+                                actions.push(("apply_design".into(), json!({"values": {"element_size_mm": rec}})));
+                            }
+                            if let Some(t) = st.target_error_pct {
+                                ui.label(RichText::new(format!("Target error <= {t}% (set element_size_mm then Solve)")).small().color(p.weak));
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                    egui::Grid::new("conv-summary").striped(true).show(ui, |ui| {
+                        for h in ["Response", "Fine value", "Extrapolated", "Order p", "Est. err %", "GCI %", "Rec. h (mm)", "Status"] {
+                            ui.label(RichText::new(h).strong());
+                        }
+                        ui.end_row();
+                        for rep in &st.convergence {
+                            ui.label(RichText::new(&rep.response).strong());
+                            ui.label(rep.values.last().and_then(|v| *v).map(render::fmt_val).unwrap_or_else(|| "—".into()));
+                            ui.label(rep.extrapolated.map(render::fmt_val).unwrap_or_else(|| "—".into()));
+                            ui.label(rep.observed_order.map(|x| format!("{x:.2}")).unwrap_or_else(|| "est. 2".into()));
+                            ui.label(rep.fine_error_pct.map(|x| format!("{x:.2}%")).unwrap_or_else(|| "—".into()));
+                            ui.label(rep.gci_fine_pct.map(|x| format!("{x:.2}%")).unwrap_or_else(|| "—".into()));
+                            ui.label(rep.recommended_size_mm.map(render::fmt_val).unwrap_or_else(|| "—".into()));
+                            ui.label(RichText::new(&rep.note).small().color(if rep.monotonic { p.ok } else { p.warn }));
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(8.0);
+                    egui::Grid::new("conv-steps").striped(true).show(ui, |ui| {
+                        ui.label(RichText::new("h (mm)").strong());
+                        ui.label(RichText::new("Elements").strong());
+                        ui.label(RichText::new("DOFs").strong());
+                        for r in &st.responses {
+                            ui.label(RichText::new(r).strong());
+                        }
+                        ui.end_row();
+                        for s in &st.convergence_steps {
+                            ui.label(render::fmt_val(s.element_size_mm));
+                            ui.label(s.elements.to_string());
+                            ui.label(s.dofs.to_string());
+                            for v in &s.responses {
+                                ui.label(v.map(render::fmt_val).unwrap_or_else(|| "—".into()));
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(6.0);
+                    for (ri, rname) in st.responses.iter().enumerate() {
+                        let pts: Vec<(f64, f64)> = st.convergence_steps.iter().filter_map(|s| Some((s.element_size_mm, s.responses.get(ri).copied().flatten()?))).collect();
+                        if pts.len() >= 2 {
+                            line_chart(ui, &p, &[(rname.clone(), pts)], "element size h [mm]", vec2(ui.available_width().max(300.0), 140.0));
+                            ui.add_space(4.0);
+                        }
+                    }
+                    return;
+                }
                 if st.kind == "topology" {
                     egui::Grid::new("topohist").striped(true).num_columns(3).show(ui, |ui| {
                         ui.label(RichText::new("Iteration").strong());
@@ -2321,6 +2440,9 @@ impl SimApp {
                     if tool(ui, &p, "🎯", "Optimize", None, true) {
                         self.form = Form::Optimize;
                     }
+                    if tool(ui, &p, "📐", "Convergence", None, true) {
+                        self.form = Form::Convergence;
+                    }
                 });
                 group(ui, &p, "SHAPE", |ui| {
                     if tool(ui, &p, "🦴", "Topology", Some(Color32::from_rgb(120, 170, 255)), kind == AnalysisType::StaticStructural) {
@@ -2690,7 +2812,7 @@ impl SimApp {
         };
         let groups: [(&str, &[(Field, &str, &str)]); 7] = [
             ("DEFORMATION", &[(Field::TotalDeformation, "📐", "Total"), (Field::DeformationX, "X", "Dir. X"), (Field::DeformationY, "Y", "Dir. Y"), (Field::DeformationZ, "Z", "Dir. Z")]),
-            ("STRESS", &[(Field::VonMises, "🔶", "Von Mises"), (Field::MaxPrincipal, "⬆", "Max Princ."), (Field::MinPrincipal, "⬇", "Min Princ."), (Field::SafetyFactor, "🛡", "Safety"), (Field::PlasticStrain, "〰", "Plastic ε")]),
+            ("STRESS", &[(Field::VonMises, "🔶", "Von Mises"), (Field::MaxPrincipal, "⬆", "Max Princ."), (Field::MinPrincipal, "⬇", "Min Princ."), (Field::RadialStress, "◎", "Radial"), (Field::HoopStress, "⭕", "Hoop"), (Field::AxialStress, "↕", "Axial"), (Field::SafetyFactor, "🛡", "Safety"), (Field::PlasticStrain, "〰", "Plastic ε")]),
             ("THERMAL", &[(Field::Temperature, "🌡", "Temperature"), (Field::HeatFlux, "☀", "Heat Flux")]),
             ("ELECTRIC", &[(Field::ElectricPotential, "⚡", "Potential"), (Field::ElectricField, "↯", "E-Field"), (Field::CurrentDensity, "🔌", "Current"), (Field::JouleHeat, "🔥", "Joule Heat")]),
             ("RF", &[(Field::AbsorbedPower, "♨", "Absorbed"), (Field::Sar, "🩺", "SAR")]),
@@ -2726,9 +2848,49 @@ impl SimApp {
                 }
             });
         }
+        if disp.field.cyl_comp().is_some() {
+            group(ui, &p, "CYLINDRICAL AXIS", |ui| {
+                ui.vertical(|ui| {
+                    let mut origin = disp.cylindrical.origin;
+                    let dir = disp.cylindrical.direction;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Axis").small());
+                        for (ax, lbl, dv) in [(0, "X", [1.0, 0.0, 0.0]), (1, "Y", [0.0, 1.0, 0.0]), (2, "Z", [0.0, 0.0, 1.0])] {
+                            let on = dir[ax].abs() > 0.9 && dir[(ax + 1) % 3].abs() < 0.2 && dir[(ax + 2) % 3].abs() < 0.2;
+                            if ui.selectable_label(on, lbl).clicked() {
+                                self.run("set_display", json!({"cylindrical_axis": dv}));
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Origin").small());
+                        let mut changed = false;
+                        for (i, k) in ["X", "Y", "Z"].iter().enumerate() {
+                            changed |= ui.add(egui::DragValue::new(&mut origin[i]).speed(0.5).prefix(format!("{k}:")).max_decimals(2)).changed();
+                        }
+                        if changed {
+                            self.run("set_display", json!({"cylindrical_origin": origin}));
+                        }
+                    });
+                });
+            });
+        }
         group(ui, &p, "TOOLS", |ui| {
-            if tool(ui, &p, "📈", "History", Some(if self.show_chart { p.accent } else { p.weak }), !r.history.is_empty()) {
-                self.show_chart = !self.show_chart;
+            if tool(ui, &p, "📈", "History", Some(if self.show_chart && self.path.tab == 0 { p.accent } else { p.weak }), !r.history.is_empty()) {
+                if self.show_chart && self.path.tab == 0 {
+                    self.show_chart = false;
+                } else {
+                    self.path.tab = 0;
+                    self.show_chart = true;
+                }
+            }
+            if tool(ui, &p, "📏", "Path", Some(if self.show_chart && self.path.tab == 1 { p.accent } else { p.weak }), true) {
+                if self.show_chart && self.path.tab == 1 {
+                    self.show_chart = false;
+                } else {
+                    self.path.tab = 1;
+                    self.show_chart = true;
+                }
             }
             if tool(ui, &p, "🎯", "Probe", Some(if self.probe_mode { p.accent } else { p.weak }), true) {
                 self.probe_mode = !self.probe_mode;
@@ -2948,26 +3110,128 @@ impl SimApp {
         self.help.open = open;
     }
 
-    /// History chart of the current results (transient, harmonic sweep, load steps, convergence).
+    /// Chart window: history plot (transient/harmonic/buckling) or straight-line Path plot + CSV export.
     fn chart_window(&mut self, ctx: &egui::Context) {
         if !self.show_chart {
             return;
         }
-        let Some(r) = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).results.clone() else {
+        let (res, mesh, disp) = {
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (s.results.clone(), s.mesh.clone(), s.display.clone())
+        };
+        let (Some(r), Some(m)) = (res, mesh) else {
             self.show_chart = false;
             return;
         };
-        if r.history.is_empty() {
-            self.show_chart = false;
-            return;
+        let rid = Arc::as_ptr(&r) as u64;
+        if self.path.inited_res != rid {
+            self.path.inited_res = rid;
+            let (lo, hi) = m.bbox;
+            let ym = 0.5 * (lo[1] + hi[1]);
+            let zm = 0.5 * (lo[2] + hi[2]);
+            self.path.from = [lo[0], ym, zm];
+            self.path.to = [hi[0], ym, zm];
+            self.path.cache_key.clear();
+        }
+        if r.history.is_empty() && self.path.tab == 0 {
+            self.path.tab = 1;
         }
         let p = self.p;
         let mut open = true;
-        egui::Window::new(RichText::new("📈 History").strong()).open(&mut open).resizable(true).default_size(vec2(560.0, 340.0)).show(ctx, |ui| {
-            let label = if r.history_label.is_empty() { "value".to_string() } else { r.history_label.clone() };
-            let xl = if r.history_x.is_empty() { "step".to_string() } else { r.history_x.clone() };
-            let sz = vec2(ui.available_width().max(300.0), (ui.available_height() - 6.0).max(200.0));
-            line_chart(ui, &p, &[(label, r.history.clone())], &xl, sz);
+        egui::Window::new(RichText::new("📈 Charts & Path Plot").strong()).open(&mut open).resizable(true).default_size(vec2(620.0, 420.0)).show(ctx, |ui| {
+            if !r.history.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.path.tab, 0, "📈 History");
+                    ui.selectable_value(&mut self.path.tab, 1, "📏 Path plot");
+                });
+                ui.separator();
+            } else {
+                self.path.tab = 1;
+            }
+            if self.path.tab == 0 {
+                let label = if r.history_label.is_empty() { "value".to_string() } else { r.history_label.clone() };
+                let xl = if r.history_x.is_empty() { "step".to_string() } else { r.history_x.clone() };
+                let sz = vec2(ui.available_width().max(300.0), (ui.available_height() - 6.0).max(200.0));
+                line_chart(ui, &p, &[(label, r.history.clone())], &xl, sz);
+                return;
+            }
+            let avail = r.available_fields();
+            let field = self.path.field.filter(|f| r.has(*f)).unwrap_or_else(|| if r.has(disp.field) { disp.field } else { avail[0] });
+            ui.horizontal(|ui| {
+                ui.label("Field");
+                let mut picked = field;
+                egui::ComboBox::from_id_salt("path-field").width(200.0).selected_text(field.label()).show_ui(ui, |ui| {
+                    for &f in &avail {
+                        ui.selectable_value(&mut picked, f, f.label());
+                    }
+                });
+                self.path.field = Some(picked);
+                ui.label("Samples");
+                ui.add(egui::DragValue::new(&mut self.path.samples).range(2..=500));
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("A").strong().color(p.accent));
+                xyz(ui, "path-a", &mut self.path.from, " mm", 0.5);
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("B").strong().color(p.ok));
+                xyz(ui, "path-b", &mut self.path.to, " mm", 0.5);
+            });
+            ui.horizontal(|ui| {
+                let pick_lbl = match self.path.picking {
+                    1 => "Click start point A in 3D…",
+                    2 => "Click end point B in 3D…",
+                    _ => "🎯 Pick 2 points",
+                };
+                if ui.selectable_label(self.path.picking > 0, pick_lbl).clicked() {
+                    self.path.picking = if self.path.picking > 0 { 0 } else { 1 };
+                }
+                let two_probes = self.probes.iter().rev().filter(|(_, id)| *id == rid).take(2).map(|(n, _)| *n).collect::<Vec<_>>();
+                if ui.add_enabled(two_probes.len() == 2, egui::Button::new("Use last 2 probes")).clicked() {
+                    self.path.from = m.nodes[two_probes[1] as usize];
+                    self.path.to = m.nodes[two_probes[0] as usize];
+                }
+                if let Some(pp) = &self.path.plot {
+                    if ui.button("💾 Export CSV…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("path-plot.csv").save_file() {
+                            match std::fs::write(&path, pp.to_csv()) {
+                                Ok(()) => self.toast = Some((format!("Saved {}", path.display()), false, 4.0)),
+                                Err(e) => self.toast = Some((format!("CSV error: {e}"), true, 6.0)),
+                            }
+                        }
+                    }
+                    if ui.button("📋 Copy CSV").clicked() {
+                        ui.ctx().copy_text(pp.to_csv());
+                        self.toast = Some(("Copied path CSV to clipboard".into(), false, 3.0));
+                    }
+                }
+            });
+            let f_use = self.path.field.filter(|f| r.has(*f)).unwrap_or(field);
+            let key = format!("{rid}|{}|{}|{:?}|{:?}|{:?}|{}", f_use.key(), disp.mode, disp.cylindrical, self.path.from, self.path.to, self.path.samples);
+            if key != self.path.cache_key {
+                self.path.cache_key = key;
+                match r.path_plot(&m, f_use, disp.mode, disp.cylindrical, self.path.from, self.path.to, self.path.samples) {
+                    Ok(pp) => {
+                        self.path.plot = Some(pp);
+                        self.path.error = None;
+                    }
+                    Err(e) => {
+                        self.path.plot = None;
+                        self.path.error = Some(format!("{e:#}"));
+                    }
+                }
+            }
+            if let Some(e) = &self.path.error {
+                ui.label(RichText::new(format!("⚠ {e}")).color(p.err));
+            } else if let Some(pp) = &self.path.plot {
+                let series_pts: Vec<(f64, f64)> = pp.points.iter().filter_map(|pt| pt.value.map(|v| (pt.distance_mm, v))).collect();
+                let title = if pp.unit.is_empty() { pp.label.clone() } else { format!("{} [{}]", pp.label, pp.unit) };
+                let sz = vec2(ui.available_width().max(300.0), (ui.available_height() - 26.0).max(180.0));
+                line_chart(ui, &p, &[(title, series_pts)], "distance along path [mm]", sz);
+                if let (Some(mn), Some(mx), Some(mean)) = (pp.min, pp.max, pp.mean) {
+                    ui.label(RichText::new(format!("min {} · max {} · mean {} {} · length {} mm ({}/{} inside)", render::fmt_val(mn), render::fmt_val(mx), render::fmt_val(mean), pp.unit, render::fmt_val(pp.length_mm), pp.valid_samples, pp.points.len())).small().color(p.weak));
+                }
+            }
         });
         self.show_chart = open;
     }
@@ -3622,7 +3886,7 @@ impl SimApp {
                 }
             }
             Form::Load(k) => self.load_form(ui, k, mesh.as_ref()),
-            Form::Study | Form::Optimize | Form::Topology => {
+            Form::Study | Form::Optimize | Form::Convergence | Form::Topology => {
                 let f = self.form;
                 self.opt_form(ui, f);
             }
@@ -4104,6 +4368,7 @@ impl SimApp {
         };
         let res_id = results.as_ref().map(|r| Arc::as_ptr(r) as u64).unwrap_or(0);
         let probing = self.probe_mode && display.show_results && results.is_some();
+        let path_picking = self.path.picking > 0 && display.show_results && results.is_some();
         // screen position of a node (deformed like the picture)
         let node_screen = |n: usize| -> Pos2 {
             let mut q = mesh.nodes[n];
@@ -4117,14 +4382,32 @@ impl SimApp {
             let (x, y, _) = self.cam.project(q, rect.width() as f64, rect.height() as f64);
             rect.min + vec2(x as f32, y as f32)
         };
-        if probing && resp.clicked() {
+        let world_screen = |q: [f64; 3]| -> Pos2 {
+            let (x, y, _) = self.cam.project(q, rect.width() as f64, rect.height() as f64);
+            rect.min + vec2(x as f32, y as f32)
+        };
+        if (probing || path_picking) && resp.clicked() {
             if let (Some(pos), Some(fid)) = (resp.interact_pointer_pos(), resp.interact_pointer_pos().and_then(|q| pick(q))) {
                 let n = mesh.faces[fid as usize].nodes.iter().copied().min_by(|a, b| node_screen(*a as usize).distance(pos).total_cmp(&node_screen(*b as usize).distance(pos))).unwrap();
-                self.probes.retain(|(_, rid)| *rid == res_id);
-                if !self.probes.iter().any(|(m, _)| *m == n) {
-                    self.probes.push((n, res_id));
-                    if self.probes.len() > 8 {
-                        self.probes.remove(0);
+                if path_picking {
+                    if self.path.picking == 1 {
+                        self.path.from = mesh.nodes[n as usize];
+                        self.path.picking = 2;
+                        self.toast = Some(("Path start A set — click end point B on the model".into(), false, 4.0));
+                    } else {
+                        self.path.to = mesh.nodes[n as usize];
+                        self.path.picking = 0;
+                        self.path.tab = 1;
+                        self.show_chart = true;
+                        self.toast = Some(("Path end B set".into(), false, 3.0));
+                    }
+                } else {
+                    self.probes.retain(|(_, rid)| *rid == res_id);
+                    if !self.probes.iter().any(|(m, _)| *m == n) {
+                        self.probes.push((n, res_id));
+                        if self.probes.len() > 8 {
+                            self.probes.remove(0);
+                        }
                     }
                 }
             }
@@ -4164,11 +4447,11 @@ impl SimApp {
             }
         }
 
-        // ---- probe markers
+        // ---- probe markers & path line
         if display.show_results {
             if let Some(r) = &results {
                 let f = if r.has(display.field) { display.field } else { r.available_fields()[0] };
-                if let Some(vals) = r.scalar(f, display.mode) {
+                if let Some(vals) = r.scalar_at(&mesh, f, display.mode, display.cylindrical) {
                     for (n, rid) in &self.probes {
                         if *rid != res_id || *n as usize >= vals.len() {
                             continue;
@@ -4183,6 +4466,15 @@ impl SimApp {
                         let br = Rect::from_min_size(sp + vec2(8.0, -22.0), galley.size() + vec2(10.0, 6.0));
                         painter.rect_filled(br, 4.0, Color32::from_black_alpha(190));
                         painter.galley(br.min + vec2(5.0, 3.0), galley, Color32::WHITE);
+                    }
+                }
+                if (self.show_chart && self.path.tab == 1 && self.path.inited_res == res_id) || self.path.picking > 0 {
+                    let a = world_screen(self.path.from);
+                    let b = world_screen(self.path.to);
+                    painter.line_segment([a, b], Stroke::new(2.5, p.accent));
+                    for (pt, lbl, col) in [(a, "A", p.accent), (b, "B", p.ok)] {
+                        painter.circle(pt, 5.0, col, Stroke::new(1.5, Color32::WHITE));
+                        painter.text(pt + vec2(7.0, -14.0), Align2::LEFT_CENTER, lbl, FontId::monospace(12.0), Color32::WHITE);
                     }
                 }
             }
