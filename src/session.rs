@@ -1673,18 +1673,65 @@ impl Core {
                 Ok(Output::text("All supports and loads removed."))
             }
             "set_mesh" => {
-                let es = opt_num(a, "element_size_mm");
+                let refine_keys = ["local_refinement", "feature_refinement", "max_levels", "refinements", "adaptive_passes", "adaptive_error_pct"];
+                // changing only the refinement settings keeps the current base size
+                let es = if a.get("element_size_mm").is_none() && refine_keys.iter().any(|k| a.get(*k).is_some()) { s.model.element_size } else { opt_num(a, "element_size_mm") };
                 if let Some(e) = es
                     && e <= 0.0 {
                         bail!("element_size_mm must be positive");
                     }
-                if s.model.element_size != es {
+                let mut ms = s.model.mesh.clone();
+                if let Some(v) = a.get("local_refinement").and_then(|v| v.as_bool()) {
+                    ms.local_refinement = v;
+                }
+                if let Some(v) = a.get("feature_refinement").and_then(|v| v.as_bool()) {
+                    ms.feature_refinement = v;
+                }
+                if let Some(v) = opt_num(a, "max_levels") {
+                    if !(1.0..=5.0).contains(&v) {
+                        bail!("max_levels must be 1..5");
+                    }
+                    ms.max_levels = v as u8;
+                }
+                if let Some(v) = opt_num(a, "adaptive_passes") {
+                    if !(0.0..=8.0).contains(&v) {
+                        bail!("adaptive_passes must be 0..8");
+                    }
+                    ms.adaptive_passes = v as u8;
+                }
+                if let Some(v) = opt_num(a, "adaptive_error_pct") {
+                    if !(v > 0.0 && v < 100.0) {
+                        bail!("adaptive_error_pct must be in (0, 100)");
+                    }
+                    ms.adaptive_error_pct = v;
+                }
+                if let Some(r) = a.get("refinements") {
+                    let rs: Vec<crate::model::MeshRefinement> = serde_json::from_value(r.clone())
+                        .map_err(|e| anyhow!("refinements: {e} (expected a list like [{{\"faces\": [\"Body.face\"], \"size_mm\": 0.5}}] or [{{\"body\": \"Name\", \"size_mm\": 1}}])"))?;
+                    for r in &rs {
+                        if !(r.size_mm.is_finite() && r.size_mm > 0.0) {
+                            bail!("refinement size_mm must be positive");
+                        }
+                        if r.body.is_none() && r.faces.is_empty() {
+                            bail!("each refinement needs a body or faces");
+                        }
+                    }
+                    ms.refinements = rs;
+                }
+                if s.model.element_size != es || s.model.mesh != ms {
                     s.model.element_size = es;
+                    s.model.mesh = ms;
                     s.touch_geometry();
                 }
                 let m = s.ensure_mesh()?;
-                s.log(format!("Mesh: {} elements, {} nodes, size {} mm", m.elems.len(), m.nodes.len(), m.h));
-                Ok(Output::json(json!({"element_size_mm": m.h, "elements": m.elems.len(), "nodes": m.nodes.len(), "dofs": m.nodes.len()*3, "warnings": m.warnings})))
+                let oct = if m.octree { format!(", octree refined to {:.3} mm, {} hanging nodes", m.min_h_mm(), m.hanging.len()) } else { String::new() };
+                s.log(format!("Mesh: {} elements, {} nodes, size {} mm{oct}", m.elems.len(), m.nodes.len(), m.h));
+                let mut out = json!({"element_size_mm": m.h, "elements": m.elems.len(), "nodes": m.nodes.len(), "dofs": m.nodes.len()*3, "warnings": m.warnings});
+                if m.octree {
+                    let levels: Vec<usize> = (0..=m.max_level).map(|l| m.elem_level.iter().filter(|&&x| x == l).count()).collect();
+                    out["octree"] = json!({"min_element_size_mm": m.min_h_mm(), "hanging_nodes": m.hanging.len(), "elements_per_level": levels});
+                }
+                Ok(Output::json(out))
             }
             "get_results" => {
                 let r = s.results.clone().ok_or_else(|| anyhow!("no results yet; run solve"))?;
@@ -2543,7 +2590,20 @@ pub fn tool_defs() -> Vec<Value> {
         t("add_enclosure", "Add the surrounding air/fluid box used by electrostatic, magnetostatic and CFD analyses. By default it pads the parts by 50% of their size on every side; give padding (fraction), padding_mm [xmin,xmax,ymin,ymax,zmin,zmax] or explicit min/size. Its faces are Enclosure.xmin … Enclosure.zmax.", json!({"material": {"type": "string", "description": "Air (default), Water or Engine Oil"}, "padding": {"type": "number"}, "padding_mm": {"type": "array", "items": {"type": "number"}, "minItems": 6, "maxItems": 6}, "min": v3s("Explicit min corner mm"), "size": v3s("Explicit size mm"), "name": {"type": "string"}}), &[]),
         t("remove_load", "Remove a support/load by id (ids are shown in get_model).", json!({"id": {"type": "integer"}}), &["id"]),
         t("clear_loads", "Remove all supports and loads.", json!({}), &[]),
-        t("set_mesh", "Set the element size in mm (omit for automatic) and generate the mesh.", json!({"element_size_mm": {"type": "number"}}), &[]),
+        t(
+            "set_mesh",
+            "Set the element size in mm (omit for automatic) and generate the mesh. Local refinement (FE analyses; CFD/full-wave stay uniform): refinements=[{faces:['Body.face'], size_mm}] or [{body:'Name', size_mm}] build a 2:1-balanced octree finer where asked; feature_refinement=true refines small holes/curved/thin features automatically; adaptive_passes=1..8 re-solves, refining where the Zienkiewicz-Zhu error is high until it falls below adaptive_error_pct (default 2 %). max_levels (1..5, default 3) caps the octree depth. Contact pairs and bolt pretension use the uniform mesh.",
+            json!({
+                "element_size_mm": {"type": "number"},
+                "local_refinement": {"type": "boolean"},
+                "feature_refinement": {"type": "boolean"},
+                "max_levels": {"type": "integer"},
+                "refinements": {"type": "array", "items": {"type": "object", "properties": {"body": {"type": "string"}, "faces": {"type": "array", "items": {"type": "string"}}, "size_mm": {"type": "number"}}, "required": ["size_mm"]}},
+                "adaptive_passes": {"type": "integer"},
+                "adaptive_error_pct": {"type": "number"}
+            }),
+            &[],
+        ),
         t("solve", "Mesh (if needed) and solve the current analysis. Returns min/max of every result, reactions and modal frequencies.", json!({}), &[]),
         t("get_results", "Summary of the last solution: min/max with locations, reaction forces / heat flows, natural frequencies.", json!({}), &[]),
         t("probe", "Result values at the node nearest to a point (mm), including radial/hoop/axial stresses around the cylindrical axis.", json!({"point": v3s("[x,y,z] mm"), "mode": {"type": "integer", "description": "1-based mode number for modal"}, "cylindrical_origin": v3s("Origin on cylindrical axis mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}}), &["point"]),

@@ -108,6 +108,7 @@ pub fn run(model: &Model, mesh: &Mesh, s: &TopoSettings, prog: fem::Prog) -> Res
     for it in 1..=iters {
         // stiffness for current densities
         let mut k = NodeSparse::new(nn, &mesh.elems, 3);
+        k.hang = mesh.hang_ctx();
         for (e, en) in mesh.elems.iter().enumerate() {
             let ee = e0[e] * (emin_ratio + rho[e].powf(s.penal) * (1.0 - emin_ratio));
             k.add_element(en, &units[mesh.elem_mat[e] as usize].k, ee * h);

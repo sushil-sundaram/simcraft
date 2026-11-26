@@ -369,6 +369,37 @@ impl StepData {
         });
         best
     }
+
+    /// Curved or small B-rep faces with `(patch_idx, char_radius_mm, lo, hi)` for feature refinement.
+    pub fn feature_patches(&self) -> Vec<(usize, f64, V3, V3)> {
+        let pbs = self.mesh.patch_bounds();
+        let mut out = Vec::new();
+        for (pi, face) in self.faces.iter().enumerate() {
+            if pi >= pbs.len() {
+                continue;
+            }
+            let (lo, hi) = pbs[pi];
+            if !(0..3).all(|k| lo[k].is_finite() && hi[k].is_finite() && hi[k] >= lo[k]) {
+                continue;
+            }
+            let r_opt = match &face.analytic {
+                StepSurfaceAnalytic::Cylinder { radius, .. } | StepSurfaceAnalytic::Sphere { radius, .. } => Some(*radius),
+                StepSurfaceAnalytic::Torus { minor_r, .. } => Some(*minor_r),
+                StepSurfaceAnalytic::Cone { .. } | StepSurfaceAnalytic::Parametric(_) | StepSurfaceAnalytic::Mesh => {
+                    let sp = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+                    let nz: Vec<f64> = sp.iter().copied().filter(|&v| v > 1e-4).collect();
+                    nz.into_iter().reduce(f64::min).map(|m| 0.5 * m)
+                }
+                StepSurfaceAnalytic::Plane { .. } => None,
+            };
+            if let Some(r) = r_opt {
+                if r.is_finite() && r > 1e-4 {
+                    out.push((pi, r, lo, hi));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Detect the STEP length unit multiplier into millimetres (`mm_per_unit`) and its label.

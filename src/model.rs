@@ -94,6 +94,10 @@ impl AnalysisType {
     pub fn transient(self) -> bool {
         matches!(self, AnalysisType::TransientStructural | AnalysisType::TransientThermal | AnalysisType::MicrowaveHeating)
     }
+    /// Finite-element analyses that support 2:1-balanced octree local refinement (CFD and FDTD stay uniform).
+    pub fn supports_octree(self) -> bool {
+        !matches!(self, AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer | AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -654,6 +658,60 @@ pub struct LoadItem {
     pub load: Load,
 }
 
+/// Per-body or per-face local octree mesh size rule.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MeshRefinement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub faces: Vec<String>,
+    /// Target local element size [mm].
+    pub size_mm: f64,
+}
+
+fn def_max_levels() -> u8 {
+    3
+}
+fn def_adaptive_error_pct() -> f64 {
+    2.0
+}
+
+/// Octree local mesh refinement and adaptive ZZ error control settings.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MeshSettings {
+    /// Enable 2:1-balanced octree refinement for FE analyses.
+    #[serde(default)]
+    pub local_refinement: bool,
+    /// Auto-refine near small holes, thin walls, and high curvature.
+    #[serde(default)]
+    pub feature_refinement: bool,
+    /// Maximum octree subdivision depth below base `element_size` (1..=5).
+    #[serde(default = "def_max_levels")]
+    pub max_levels: u8,
+    /// User sizing rules per body and/or face selector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refinements: Vec<MeshRefinement>,
+    /// Adaptive ZZ error loop iterations (0 = off, 1..=8).
+    #[serde(default)]
+    pub adaptive_passes: u8,
+    /// Target relative Zienkiewicz–Zhu energy-norm error [%].
+    #[serde(default = "def_adaptive_error_pct")]
+    pub adaptive_error_pct: f64,
+}
+
+impl Default for MeshSettings {
+    fn default() -> Self {
+        Self {
+            local_refinement: false,
+            feature_refinement: false,
+            max_levels: def_max_levels(),
+            refinements: Vec::new(),
+            adaptive_passes: 0,
+            adaptive_error_pct: def_adaptive_error_pct(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Model {
     #[serde(default)]
@@ -670,12 +728,23 @@ pub struct Model {
     #[serde(default)]
     pub element_size: Option<f64>,
     #[serde(default)]
+    pub mesh: MeshSettings,
+    #[serde(default)]
     pub next_id: u32,
 }
 
 impl Default for Model {
     fn default() -> Self {
-        Model { bodies: vec![], custom_materials: vec![], analysis: AnalysisSettings::default(), loads: vec![], contacts: vec![], element_size: None, next_id: 1 }
+        Model {
+            bodies: vec![],
+            custom_materials: vec![],
+            analysis: AnalysisSettings::default(),
+            loads: vec![],
+            contacts: vec![],
+            element_size: None,
+            mesh: MeshSettings::default(),
+            next_id: 1,
+        }
     }
 }
 
@@ -708,6 +777,14 @@ impl Model {
     /// Whether the mesh for the current analysis includes the enclosure region.
     pub fn mesh_with_enclosure(&self) -> bool {
         self.analysis.kind.uses_enclosure() && self.has_enclosure()
+    }
+    /// Whether the current model and analysis use a 2:1-balanced octree mesh.
+    pub fn uses_octree(&self) -> bool {
+        self.analysis.kind.supports_octree()
+            && !self.bodies.iter().any(|b| matches!(b.shape, crate::geometry::Shape::Pcb { .. }))
+            && self.contacts.is_empty()
+            && !self.loads.iter().any(|l| matches!(l.load, Load::BoltPretension { .. }))
+            && (self.mesh.local_refinement || self.mesh.feature_refinement || !self.mesh.refinements.is_empty() || self.mesh.adaptive_passes > 0)
     }
 }
 
@@ -933,6 +1010,17 @@ pub fn preflight_check(model: &Model, mesh: Option<&crate::mesh::Mesh>, elem_siz
                 }
             }
         }
+    }
+
+    let has_octree_req = model.mesh.local_refinement || model.mesh.feature_refinement || !model.mesh.refinements.is_empty() || model.mesh.adaptive_passes > 0;
+    if has_octree_req && !kind.supports_octree() {
+        out.push(item(
+            "mesh_octree_uniform",
+            "Uniform Grid Required",
+            format!("{} stays on a uniform voxel grid; octree refinement settings are ignored.", kind.label()),
+            PreflightStatus::Warn,
+            "mesh",
+        ));
     }
 
     if let Some(m) = mesh {

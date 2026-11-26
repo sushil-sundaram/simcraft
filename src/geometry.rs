@@ -812,6 +812,23 @@ impl StlData {
         self.bvh.visit_closest(p, leaf);
     }
 
+    /// Bounding box `(lo, hi)` of each surface segment index `0..n_segments`.
+    pub fn patch_bounds(&self) -> Vec<(V3, V3)> {
+        let mut out = vec![([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]); self.n_segments];
+        for (i, t) in self.tris.iter().enumerate() {
+            let s = self.segment[i] as usize;
+            if let Some((lo, hi)) = out.get_mut(s) {
+                for v in t {
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(v[k]);
+                        hi[k] = hi[k].max(v[k]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Inside test along a +X ray using crossing parity, filling a column of cells.
     /// Returns sorted x positions of surface crossings at (y, z).
     pub fn x_crossings(&self, y: f64, z: f64) -> Vec<f64> {

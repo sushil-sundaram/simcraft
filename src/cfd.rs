@@ -421,7 +421,7 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
         adj.extend_from_slice(&row);
         ptr.push(adj.len());
     }
-    let mut a = NodeSparse { bs: 1, ptr: ptr.clone(), adj: adj.clone(), vals: vec![0.0; adj.len()] };
+    let mut a = NodeSparse { bs: 1, ptr: ptr.clone(), adj: adj.clone(), vals: vec![0.0; adj.len()], hang: None };
     let mut outlet_rhs = vec![0.0; nf];
     for i in 0..nf {
         let row = &adj[ptr[i]..ptr[i + 1]];
@@ -883,7 +883,7 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
             if !has_outlet {
                 mval[dpos[0]] += mval[dpos[0]].max(1e-300);
             }
-            let mm = NodeSparse { bs: 1, ptr: ptr.clone(), adj: adj.clone(), vals: mval.clone() };
+            let mm = NodeSparse { bs: 1, ptr: ptr.clone(), adj: adj.clone(), vals: mval.clone(), hang: None };
             let rhs_c: Vec<f64> = imb.iter().map(|v| -v).collect();
             pc.iter_mut().for_each(|v| *v = 0.0);
             let tp = std::time::Instant::now();

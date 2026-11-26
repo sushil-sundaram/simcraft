@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod mesh;
 pub mod multigrid;
 pub mod model;
+pub mod octree;
 pub mod render;
 pub mod report;
 pub mod radiation;

@@ -114,7 +114,7 @@ impl Multigrid {
                     }
                     lists_ptr.push(adj.len());
                 }
-                let coarse_a = NodeSparse { bs: 1, ptr: lists_ptr, adj, vals };
+                let coarse_a = NodeSparse { bs: 1, ptr: lists_ptr, adj, vals, hang: None };
                 let coarse = Factor::new(&coarse_a, usize::MAX).ok_or_else(|| anyhow!("coarse grid too large"))??;
                 levels.push(Level { ptr, col, val, dinv, agg: vec![] });
                 return Ok(Multigrid { levels, coarse, coarse_a, alpha: 1.6, omega: 0.7 });
@@ -136,7 +136,7 @@ impl Multigrid {
             if nc as f64 > 0.7 * n as f64 {
                 // coarsening stalled (thin geometry): stop here with a direct solve one level up
                 levels.push(Level { ptr: ptr.clone(), col: col.clone(), val: val.clone(), dinv, agg: vec![] });
-                let coarse_a = NodeSparse { bs: 1, ptr: ptr.clone(), adj: col.clone(), vals: val.clone() };
+                let coarse_a = NodeSparse { bs: 1, ptr: ptr.clone(), adj: col.clone(), vals: val.clone(), hang: None };
                 let coarse = Factor::new(&coarse_a, usize::MAX).ok_or_else(|| anyhow!("coarse grid too large"))??;
                 return Ok(Multigrid { levels, coarse, coarse_a, alpha: 1.6, omega: 0.7 });
             }
