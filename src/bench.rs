@@ -183,6 +183,71 @@ pub fn cases() -> Vec<Case> {
             out(vec![field(&r, "max_principal", "max")?], &r)
         }),
     });
+    {
+        let c45 = std::f64::consts::FRAC_1_SQRT_2;
+        let p0 = 10.0 * 100.0 / 300.0;
+        let hoop12 = p0 * (1.0 + 400.0 / 144.0);
+        let rad14 = p0 * (1.0 - 400.0 / 196.0);
+        v.push(Case {
+            id: "lame_path",
+            group: "Structural",
+            title: "Thick cylinder 45° diagonal path: cylindrical hoop (r=12) and radial (r=14) stress",
+            source: "Lamé: σθ = A(1 + ro²/r²), σr = A(1 − ro²/r²) along rotated path",
+            sizes: vec![2.0, 1.5, 1.0],
+            size_unit: "mm",
+            quick: true,
+            metrics: vec![
+                m("lame_path.hoop12", "hoop stress at r = 12 mm (45°)", hoop12, "MPa", 0.02),
+                m("lame_path.rad14", "radial stress at r = 14 mm (45°)", rad14, "MPa", 0.03),
+            ],
+            run: Box::new(move |hh| {
+                let c = new_core();
+                let r = script(&c, &[
+                    ("add_cylinder", json!({"name": "Pipe", "base": [0, 0, 0], "axis": "z", "radius": 20, "height": 4})),
+                    ("add_cylinder", json!({"name": "Bore", "base": [0, 0, 0], "axis": "z", "radius": 10, "height": 4, "operation": "subtract"})),
+                    ("add_box", json!({"name": "CutX", "min": [-30, -30, 0], "size": [30, 60, 4], "operation": "subtract"})),
+                    ("add_box", json!({"name": "CutY", "min": [-30, -30, 0], "size": [60, 30, 4], "operation": "subtract"})),
+                    ("set_mesh", json!({"element_size_mm": hh})),
+                    ("add_symmetry", json!({"faces": ["CutX.xmax", "CutY.ymax", "Pipe.bottom", "Pipe.top"]})),
+                    ("add_pressure", json!({"faces": ["Bore.side"], "value_mpa": 10})),
+                    ("solve", json!({})),
+                ])?;
+                let hoop = call(&c, "plot_path", json!({"field": "hoop_stress", "from": [12.0 * c45, 12.0 * c45, 2.0], "to": [18.0 * c45, 18.0 * c45, 2.0], "samples": 7, "cylindrical_origin": [0, 0, 0], "cylindrical_axis": "z"}))?;
+                let rad = call(&c, "plot_path", json!({"field": "radial_stress", "from": [12.0 * c45, 12.0 * c45, 2.0], "to": [18.0 * c45, 18.0 * c45, 2.0], "samples": 7, "cylindrical_origin": [0, 0, 0], "cylindrical_axis": "z"}))?;
+                let h12 = hoop["points"][0]["value"].as_f64().ok_or_else(|| anyhow!("missing r=12 hoop"))?;
+                let r14 = rad["points"][2]["value"].as_f64().ok_or_else(|| anyhow!("missing r=14 radial"))?;
+                out(vec![h12, r14], &r)
+            }),
+        });
+    }
+    {
+        let (e, nu) = (steel.youngs_modulus_gpa * 1e3, steel.poisson_ratio);
+        let (l, b, h, f) = (240.0f64, 12.0f64, 12.0f64, 200.0f64);
+        let want = f * l.powi(3) / (3.0 * e * b * h.powi(3) / 12.0) + f * l / (5.0 / 6.0 * e / (2.0 * (1.0 + nu)) * b * h);
+        v.push(Case {
+            id: "cantilever_conv",
+            group: "Structural",
+            title: "Mesh-convergence Richardson extrapolation (240 × 12 × 12 mm cantilever from 3 coarse meshes)",
+            source: "Timoshenko beam theory + 3-grid Richardson extrapolation (h, h/1.4, h/2)",
+            sizes: vec![6.0, 4.0],
+            size_unit: "mm",
+            quick: true,
+            metrics: vec![m("cantilever_conv.ext", "extrapolated tip deflection", want, "mm", 0.005)],
+            run: Box::new(|hh| {
+                let c = new_core();
+                let rep = script(&c, &[
+                    ("add_box", json!({"name": "Beam", "size": [240, 12, 12], "material": "Structural Steel"})),
+                    ("set_mesh", json!({"element_size_mm": hh})),
+                    ("add_fixed_support", json!({"faces": ["Beam.xmin"]})),
+                    ("add_force", json!({"faces": ["Beam.xmax"], "vector": [0, 0, -200]})),
+                    ("mesh_convergence", json!({"responses": ["min:deformation_z"], "base_element_size_mm": hh, "target_error_pct": 0.5})),
+                ])?;
+                let ext = -rep["convergence"][0]["extrapolated"].as_f64().ok_or_else(|| anyhow!("missing extrapolated deflection"))?;
+                let fine = &rep["convergence_steps"][2];
+                Ok(Outcome { values: vec![ext], info: json!({"dofs": fine["dofs"], "elements": fine["elements"], "solver": "Richardson extrapolation (3 coarse meshes)"}) })
+            }),
+        });
+    }
     v.push(Case {
         id: "nafems_le1",
         group: "Structural",

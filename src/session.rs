@@ -740,7 +740,7 @@ impl Core {
         if tool == "screenshot_gui" {
             return self.screenshot_gui();
         }
-        if matches!(tool, "run_parameter_study" | "optimize_design" | "topology_optimize" | "surrogate_optimize") {
+        if matches!(tool, "run_parameter_study" | "optimize_design" | "topology_optimize" | "surrogate_optimize" | "mesh_convergence") {
             return self.study_job(tool, a);
         }
         if tool == "plan_simulation" {
@@ -750,7 +750,7 @@ impl Core {
             let models = crate::assistant::list_models()?;
             return Ok(Output::json(json!({"server": crate::assistant::base_url(), "models": models, "default": crate::assistant::default_model(&models)})));
         }
-        if self.is_busy() && !matches!(tool, "get_model" | "get_help" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets") {
+        if self.is_busy() && !matches!(tool, "get_model" | "get_help" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "plot_path" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets") {
             bail!("a solve is running; wait for it to finish (use get_status)");
         }
         let ws = self.workspace_dir();
@@ -1444,7 +1444,7 @@ impl Core {
             "get_results" => {
                 let r = s.results.clone().ok_or_else(|| anyhow!("no results yet; run solve"))?;
                 let m = s.mesh.clone().unwrap();
-                let mut v = r.summary(&m);
+                let mut v = r.summary_with(&m, s.display.cylindrical);
                 if s.results_stale {
                     v["stale"] = json!("setup changed after this solve; run solve again");
                 }
@@ -1454,15 +1454,43 @@ impl Core {
                 let r = s.results.clone().ok_or_else(|| anyhow!("no results yet; run solve"))?;
                 let m = s.mesh.clone().unwrap();
                 let p = v3(a, "point")?;
+                let mut cyl = s.display.cylindrical;
+                apply_cylindrical(&mut cyl, a)?;
                 let n = m.nearest_node(p);
                 let mut vals = serde_json::Map::new();
                 let mode = opt_num(a, "mode").map(|x| (x as usize).saturating_sub(1)).unwrap_or(0);
                 for f in r.available_fields() {
-                    if let Some(v) = r.scalar(f, mode) {
+                    if let Some(v) = r.scalar_at(&m, f, mode, cyl) {
                         vals.insert(f.key(), json!(crate::results::float(v[n])));
                     }
                 }
                 Ok(Output::json(json!({"requested_point_mm": p, "nearest_node_mm": m.nodes[n], "values": vals})))
+            }
+            "plot_path" => {
+                let r = s.results.clone().ok_or_else(|| anyhow!("no results yet; run solve"))?;
+                let m = s.mesh.clone().unwrap();
+                let from = v3(a, "from")?;
+                let to = v3(a, "to")?;
+                let samples = opt_num(a, "samples").unwrap_or(50.0).clamp(2.0, 500.0) as usize;
+                let mode = opt_num(a, "mode").map(|x| (x as usize).saturating_sub(1)).unwrap_or(s.display.mode);
+                let mut cyl = s.display.cylindrical;
+                apply_cylindrical(&mut cyl, a)?;
+                let field = field_arg(a)?.unwrap_or_else(|| if r.has(s.display.field) { s.display.field } else { r.available_fields()[0] });
+                let pp = r.path_plot(&m, field, mode, cyl, from, to, samples)?;
+                let csv = pp.to_csv();
+                let saved = if let Some(p) = opt_str(a, "csv_path") {
+                    let resolved = resolve_io_path(p, ws_ref, true, &["csv"])?;
+                    std::fs::write(&resolved, &csv).with_context(|| format!("writing path CSV {}", resolved.display()))?;
+                    Some(resolved.to_string_lossy().to_string())
+                } else {
+                    None
+                };
+                let mut out = serde_json::to_value(&pp)?;
+                out["csv"] = json!(csv);
+                if let Some(p) = saved {
+                    out["csv_path"] = json!(p);
+                }
+                Ok(Output::json(out))
             }
             "set_display" => {
                 if let Some(f) = field_arg(a)? {
@@ -1487,6 +1515,7 @@ impl Core {
                     s.display.dark = b;
                 }
                 apply_section(&mut s.display, a)?;
+                apply_cylindrical(&mut s.display.cylindrical, a)?;
                 if let Some(v) = opt_str(a, "view") {
                     if !render::VIEWS.contains(&v) && v != "fit" {
                         bail!("view must be one of {:?} or fit", render::VIEWS);
@@ -1513,6 +1542,7 @@ impl Core {
                     d.deformation_scale = Some(x);
                 }
                 apply_section(&mut d, a)?;
+                apply_cylindrical(&mut d.cylindrical, a)?;
                 let w = opt_num(a, "width").unwrap_or(900.0).clamp(200.0, 2000.0) as usize;
                 let h = opt_num(a, "height").unwrap_or(620.0).clamp(150.0, 2000.0) as usize;
                 let view = opt_str(a, "view").unwrap_or("iso");
@@ -1727,6 +1757,21 @@ impl Core {
                 if st.kind == "topology" {
                     bail!("for topology results use the exported STL (import_stl {:?})", st.stl_path);
                 }
+                if st.kind == "convergence" {
+                    let h = a
+                        .get("values")
+                        .and_then(|v| v.get("element_size_mm").or_else(|| v.get("element_size")))
+                        .and_then(|v| v.as_f64())
+                        .or(st.recommended_size_mm)
+                        .ok_or_else(|| anyhow!("convergence study has no recommended element size"))?;
+                    if !h.is_finite() || h <= 0.0 {
+                        bail!("element_size_mm must be positive");
+                    }
+                    s.model.element_size = Some(h);
+                    s.touch_geometry();
+                    s.log(format!("Applied recommended mesh size {h} mm"));
+                    return Ok(Output::text(format!("Set element_size_mm = {h}. Solve to compute on the refined mesh.")));
+                }
                 if let Some(Value::Object(vals)) = a.get("values") {
                     let mut v = Vec::new();
                     for p in &st.parameters {
@@ -1834,6 +1879,12 @@ impl Core {
                 let constraints: Vec<crate::study::Constraint> = serde_json::from_value(a.get("constraints").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'constraints': {e}"))?;
                 let budget = opt_num(a, "max_evaluations").unwrap_or(30.0) as usize;
                 crate::study::optimize(&model, parse_params()?, objective, constraints, budget, prog)?
+            }
+            "mesh_convergence" => {
+                let responses: Vec<String> = serde_json::from_value(a.get("responses").cloned().unwrap_or(json!([]))).map_err(|e| anyhow!("bad 'responses': {e}"))?;
+                let base_h = opt_num(a, "base_element_size_mm");
+                let target = opt_num(a, "target_error_pct").unwrap_or(1.0);
+                crate::study::mesh_convergence(&model, responses, base_h, target, prog)?
             }
             _ => {
                 let mesh = mesh.unwrap();
@@ -2131,15 +2182,17 @@ pub fn tool_defs() -> Vec<Value> {
         t("set_mesh", "Set the element size in mm (omit for automatic) and generate the mesh.", json!({"element_size_mm": {"type": "number"}}), &[]),
         t("solve", "Mesh (if needed) and solve the current analysis. Returns min/max of every result, reactions and modal frequencies.", json!({}), &[]),
         t("get_results", "Summary of the last solution: min/max with locations, reaction forces / heat flows, natural frequencies.", json!({}), &[]),
-        t("probe", "Result values at the node nearest to a point (mm).", json!({"point": v3s("[x,y,z] mm"), "mode": {"type": "integer", "description": "1-based mode number for modal"}}), &["point"]),
-        t("set_display", "Change what the GUI viewport shows.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean"}, "mode": {"type": "integer"}, "deformation_scale": {"description": "number, or \"auto\"; 0 = undeformed, 1 = true scale"}, "show_mesh": {"type": "boolean"}, "dark_mode": {"type": "boolean", "description": "Dark UI and viewport theme"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"], "description": "Cut-plane view through the domain (great for fields in air and fluid flow)"}, "section_position": {"type": "number", "description": "0..1 across the domain (default 0.5)"}, "view": {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top", "bottom", "iso_back", "fit"]}}), &[]),
-        t("render_image", "Render a PNG picture of the model or of a result contour so you can see it.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean", "description": "false = show geometry with supports/loads"}, "mode": {"type": "integer"}, "view": {"type": "string", "enum": render::VIEWS}, "deformation_scale": {"type": "number"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"]}, "section_position": {"type": "number"}, "width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
+        t("probe", "Result values at the node nearest to a point (mm), including radial/hoop/axial stresses around the cylindrical axis.", json!({"point": v3s("[x,y,z] mm"), "mode": {"type": "integer", "description": "1-based mode number for modal"}, "cylindrical_origin": v3s("Origin on cylindrical axis mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}}), &["point"]),
+        t("plot_path", "Sample any result field along a straight line segment from 'from' to 'to' [x,y,z] mm, returning sample points, min/max/mean and CSV (optionally written to csv_path).", json!({"from": v3s("Start [x,y,z] mm"), "to": v3s("End [x,y,z] mm"), "field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "samples": {"type": "integer", "description": "2..=500 points (default 50)"}, "mode": {"type": "integer"}, "cylindrical_origin": v3s("Cylindrical origin mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}, "csv_path": {"type": "string", "description": "optional .csv output file path"}}), &["from", "to"]),
+        t("set_display", "Change what the GUI viewport shows (including cylindrical coordinate origin/axis for radial/hoop/axial stress).", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean"}, "mode": {"type": "integer"}, "deformation_scale": {"description": "number, or \"auto\"; 0 = undeformed, 1 = true scale"}, "show_mesh": {"type": "boolean"}, "dark_mode": {"type": "boolean", "description": "Dark UI and viewport theme"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"], "description": "Cut-plane view through the domain (great for fields in air and fluid flow)"}, "section_position": {"type": "number", "description": "0..1 across the domain (default 0.5)"}, "cylindrical_origin": v3s("Origin [x,y,z] mm for radial/hoop/axial stresses (default [0,0,0])"), "cylindrical_axis": {"description": "'x', 'y', 'z' or direction [dx,dy,dz] for cylindrical stresses (default 'z')"}, "view": {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top", "bottom", "iso_back", "fit"]}}), &[]),
+        t("render_image", "Render a PNG picture of the model or of a result contour so you can see it.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean", "description": "false = show geometry with supports/loads"}, "mode": {"type": "integer"}, "view": {"type": "string", "enum": render::VIEWS}, "deformation_scale": {"type": "number"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"]}, "section_position": {"type": "number"}, "cylindrical_origin": v3s("Cylindrical origin mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}, "width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
         t("export_vtk", "Write mesh + results to a legacy .vtk file for ParaView.", json!({"path": {"type": "string"}}), &["path"]),
         t("save_project", "Save the project (.simcraft JSON).", json!({"path": {"type": "string"}}), &[]),
         t("open_project", "Open a .simcraft project.", json!({"path": {"type": "string"}}), &["path"]),
         t("screenshot_gui", "Screenshot of the whole SimCraft window (ribbon, browser, viewport) when the GUI is open.", json!({}), &[]),
         t("list_parameter_targets", "Numbers in the current model that studies can vary (e.g. Bracket.size.z, Hole.radius, load2.vector.z, element_size) with current values, plus suggested responses.", json!({}), &[]),
         t("run_parameter_study", "Sweep parameters (full grid, or Latin hypercube with 'samples') and tabulate responses such as mass, max:von_mises, min:safety_factor, frequency:1.", json!({"parameters": {"type": "array", "items": {"type": "object", "properties": {"target": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}, "steps": {"type": "integer"}}, "required": ["target", "min", "max"]}}, "responses": {"type": "array", "items": {"type": "string"}}, "samples": {"type": "integer", "description": "Latin-hypercube sample count instead of a grid"}}), &["parameters", "responses"]),
+        t("mesh_convergence", "Mesh-convergence assistant: solve at h, h/1.4 and h/2, Richardson-extrapolate chosen responses, report discretisation error and element size needed for target accuracy.", json!({"responses": {"type": "array", "items": {"type": "string"}, "description": "responses to check (default suggested physics responses)"}, "base_element_size_mm": {"type": "number", "description": "coarsest element size h mm (default current mesh size)"}, "target_error_pct": {"type": "number", "description": "target discretisation error % (default 1.0)"}}), &[]),
         t("surrogate_optimize", "Bayesian optimisation with surrogates: Gaussian-process response surfaces of the objective and constraints choose each next design (expected improvement × probability of meeting the constraints), and every proposal is verified with a real solve — usually finds the optimum in far fewer solves than optimize_design. Reuses the current study's designs when the parameters match.", json!({"parameters": {"type": "array", "items": {"type": "object", "properties": {"target": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}}, "required": ["target", "min", "max"]}}, "objective": {"type": "object", "properties": {"response": {"type": "string"}, "goal": {"type": "string", "enum": ["minimize", "maximize"]}}, "required": ["response"]}, "constraints": {"type": "array", "items": {"type": "object", "properties": {"response": {"type": "string"}, "op": {"type": "string", "enum": ["<=", ">="]}, "value": {"type": "number"}}, "required": ["response", "op", "value"]}}, "max_solves": {"type": "integer", "description": "real solves allowed (default 12)"}, "reuse": {"type": "boolean", "description": "reuse matching designs of the current study (default true)"}}), &["parameters", "objective"]),
         t("fit_surrogate", "Fit Gaussian-process response surfaces to the current study's designs and report their quality (leave-one-out RMSE and Q²) and which parameters drive each response.", json!({}), &[]),
         t("predict_surrogate", "Instant what-if: estimate every study response at new parameter values from the surrogate (with ±2σ uncertainty), without solving. Labelled 'not verified'; confirm with apply_design {values} + solve.", json!({"values": {"type": "object", "additionalProperties": {"type": "number"}, "description": "{parameter target: value}; missing parameters use the middle of their range"}}), &["values"]),
@@ -2169,6 +2222,29 @@ fn apply_section(d: &mut Display, a: &Value) -> Result<()> {
     }
     if let (Some(p), Some(sec)) = (opt_num(a, "section_position"), d.section.as_mut()) {
         sec.position = p.clamp(0.0, 1.0);
+    }
+    Ok(())
+}
+
+fn apply_cylindrical(cyl: &mut crate::results::CylindricalAxis, a: &Value) -> Result<()> {
+    if a.get("cylindrical_origin").is_some() {
+        cyl.origin = v3(a, "cylindrical_origin")?;
+    }
+    if let Some(v) = a.get("cylindrical_axis") {
+        cyl.direction = if let Some(s) = v.as_str() {
+            match s.to_lowercase().as_str() {
+                "x" => [1.0, 0.0, 0.0],
+                "y" => [0.0, 1.0, 0.0],
+                "z" => [0.0, 0.0, 1.0],
+                o => bail!("cylindrical_axis must be x, y, z or [dx,dy,dz] (got '{o}')"),
+            }
+        } else {
+            let dir = v3(a, "cylindrical_axis")?;
+            if !(norm(dir) > 1e-12) {
+                bail!("cylindrical_axis direction must be non-zero");
+            }
+            dir
+        };
     }
     Ok(())
 }
@@ -2207,6 +2283,12 @@ fn study_json(st: &crate::study::Study) -> Value {
         v["stl_path"] = json!(p);
         let stride = (st.history.len() / 12).max(1);
         v["history"] = json!(st.history.iter().step_by(stride).map(|(i, c, f)| json!({"iteration": i, "compliance_j": crate::results::float(*c), "volume_fraction": crate::results::float(*f)})).collect::<Vec<_>>());
+    }
+    if !st.convergence.is_empty() {
+        v["convergence_steps"] = json!(st.convergence_steps);
+        v["convergence"] = json!(st.convergence);
+        v["target_error_pct"] = json!(st.target_error_pct);
+        v["recommended_size_mm"] = json!(st.recommended_size_mm);
     }
     v
 }

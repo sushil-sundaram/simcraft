@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use crate::geometry::*;
 use crate::mesh::Mesh;
 use crate::model::{Load, Model};
-use crate::results::{Field, Results};
+use crate::results::{CylindricalAxis, Field, Results};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -97,6 +97,9 @@ pub struct Display {
     /// Cut-plane view through the domain.
     #[serde(default)]
     pub section: Option<Section>,
+    /// Axis used when displaying Cylindrical stress fields (radial, hoop, axial).
+    #[serde(default)]
+    pub cylindrical: CylindricalAxis,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -108,7 +111,7 @@ pub struct Section {
 }
 impl Default for Display {
     fn default() -> Self {
-        Display { show_results: false, field: Field::TotalDeformation, mode: 0, deformation_scale: None, show_mesh: true, show_undeformed: false, dark: false, section: None }
+        Display { show_results: false, field: Field::TotalDeformation, mode: 0, deformation_scale: None, show_mesh: true, show_undeformed: false, dark: false, section: None, cylindrical: CylindricalAxis::default() }
     }
 }
 
@@ -199,7 +202,7 @@ pub fn build_scene(
     if use_res {
         let r = results.unwrap();
         let field = if r.has(disp.field) { disp.field } else { r.available_fields().first().copied().unwrap_or(Field::TotalDeformation) };
-        if let Some(v) = r.scalar(field, disp.mode) {
+        if let Some(v) = r.scalar_at(mesh, field, disp.mode, disp.cylindrical) {
             let mn = v.iter().cloned().fold(f64::INFINITY, f64::min);
             let mx = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             range = Some((mn, mx));

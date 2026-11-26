@@ -1,11 +1,61 @@
 //! Solution fields and summaries.
 
-use crate::geometry::V3;
+use crate::geometry::{V3, cross, dot, norm, normalize, scale, sub};
 use crate::mesh::Mesh;
 use crate::model::AnalysisType;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+
+fn default_z_axis() -> V3 {
+    [0.0, 0.0, 1.0]
+}
+
+/// Cylindrical coordinate axis for decomposing stress into radial, hoop and axial components.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CylindricalAxis {
+    #[serde(default)]
+    pub origin: V3,
+    #[serde(default = "default_z_axis")]
+    pub direction: V3,
+}
+
+impl Default for CylindricalAxis {
+    fn default() -> Self {
+        Self { origin: [0.0; 3], direction: [0.0, 0.0, 1.0] }
+    }
+}
+
+impl CylindricalAxis {
+    /// Orthonormal cylindrical basis `(e_r, e_theta, e_axial)` at position `p`.
+    pub fn basis(self, p: V3) -> (V3, V3, V3) {
+        let l = norm(self.direction);
+        let ea = if l > 1e-12 && l.is_finite() { scale(self.direction, 1.0 / l) } else { [0.0, 0.0, 1.0] };
+        let d = sub(p, self.origin);
+        let rp = sub(d, scale(ea, dot(d, ea)));
+        let er = if norm(rp) > 1e-12 {
+            normalize(rp)
+        } else {
+            let refv = if ea[0].abs() < 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 1.0, 0.0] };
+            normalize(cross(refv, ea))
+        };
+        let et = cross(ea, er);
+        (er, et, ea)
+    }
+}
+
+/// Project symmetric stress `[xx, yy, zz, xy, yz, xz]` into `[sigma_r, sigma_theta, sigma_axial]`.
+pub fn cylindrical_stress(p: V3, s: &[f64; 6], axis: CylindricalAxis) -> [f64; 3] {
+    let (er, et, ea) = axis.basis(p);
+    let proj = |v: V3| {
+        s[0] * v[0] * v[0]
+            + s[1] * v[1] * v[1]
+            + s[2] * v[2] * v[2]
+            + 2.0 * (s[3] * v[0] * v[1] + s[4] * v[1] * v[2] + s[5] * v[0] * v[2])
+    };
+    [proj(er), proj(et), proj(ea)]
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -18,6 +68,9 @@ pub enum Field {
     VonMises,
     MaxPrincipal,
     MinPrincipal,
+    RadialStress,
+    HoopStress,
+    AxialStress,
     SafetyFactor,
     PlasticStrain,
     Temperature,
@@ -42,7 +95,7 @@ pub enum Field {
 }
 
 impl Field {
-    pub fn all() -> [Field; 28] {
+    pub fn all() -> [Field; 31] {
         use Field::*;
         [
             TotalDeformation,
@@ -52,6 +105,9 @@ impl Field {
             VonMises,
             MaxPrincipal,
             MinPrincipal,
+            RadialStress,
+            HoopStress,
+            AxialStress,
             SafetyFactor,
             PlasticStrain,
             Temperature,
@@ -85,6 +141,9 @@ impl Field {
             VonMises => "Equivalent (von Mises) Stress",
             MaxPrincipal => "Maximum Principal Stress",
             MinPrincipal => "Minimum Principal Stress",
+            RadialStress => "Radial Stress",
+            HoopStress => "Hoop Stress",
+            AxialStress => "Axial Stress",
             SafetyFactor => "Safety Factor",
             PlasticStrain => "Equivalent Plastic Strain",
             Temperature => "Temperature",
@@ -112,7 +171,7 @@ impl Field {
         use Field::*;
         match self {
             TotalDeformation | DeformationX | DeformationY | DeformationZ => "mm",
-            VonMises | MaxPrincipal | MinPrincipal => "MPa",
+            VonMises | MaxPrincipal | MinPrincipal | RadialStress | HoopStress | AxialStress => "MPa",
             SafetyFactor => "",
             PlasticStrain => "mm/mm",
             Temperature => "°C",
@@ -144,6 +203,15 @@ impl Field {
 
     pub fn is_deformation(self) -> bool {
         matches!(self, Field::TotalDeformation | Field::DeformationX | Field::DeformationY | Field::DeformationZ)
+    }
+
+    pub(crate) fn cyl_comp(self) -> Option<usize> {
+        match self {
+            Field::RadialStress => Some(0),
+            Field::HoopStress => Some(1),
+            Field::AxialStress => Some(2),
+            _ => None,
+        }
     }
 }
 
@@ -296,7 +364,7 @@ impl Results {
         }
         match f {
             TotalDeformation | DeformationX | DeformationY | DeformationZ => self.disp.is_some() || !self.modes.is_empty(),
-            VonMises | MaxPrincipal | MinPrincipal | SafetyFactor => self.vm.is_some(),
+            VonMises | MaxPrincipal | MinPrincipal | RadialStress | HoopStress | AxialStress | SafetyFactor => self.vm.is_some(),
             Temperature => self.temp.is_some(),
             HeatFlux => self.flux.is_some(),
             _ => false,
@@ -341,14 +409,27 @@ impl Results {
         }
     }
 
+    /// Nodal scalar array including cylindrical stress transforms (evaluated around `cyl`).
+    pub fn scalar_at(&self, mesh: &Mesh, f: Field, step: usize, cyl: CylindricalAxis) -> Option<Vec<f64>> {
+        if let Some(k) = f.cyl_comp() {
+            let st = self.stress.as_ref()?;
+            return Some(mesh.nodes.iter().zip(st).map(|(p, s)| cylindrical_stress(*p, s, cyl)[k]).collect());
+        }
+        self.scalar(f, step)
+    }
+
     pub fn summary(&self, mesh: &Mesh) -> Value {
+        self.summary_with(mesh, CylindricalAxis::default())
+    }
+
+    pub fn summary_with(&self, mesh: &Mesh, cyl: CylindricalAxis) -> Value {
         let mut fields = serde_json::Map::new();
         let last = self.n_steps().saturating_sub(1);
         for f in self.available_fields() {
             if !self.modes.is_empty() && f.is_deformation() {
                 continue;
             }
-            let Some(v) = self.scalar(f, last) else { continue };
+            let Some(v) = self.scalar_at(mesh, f, last, cyl) else { continue };
             if v.is_empty() {
                 continue;
             }
@@ -406,6 +487,107 @@ impl Results {
             let stride = (self.history.len() / 25).max(1);
             let h: Vec<[f64; 2]> = self.history.iter().step_by(stride).map(|(t, v)| [float(*t), float(*v)]).collect();
             out["history"] = json!({"quantity": self.history_label, "x": self.history_x, "samples": h});
+        }
+        out
+    }
+
+    /// Sample `field` along a straight line from `from` to `to` (`samples` points in `2..=500`).
+    pub fn path_plot(&self, mesh: &Mesh, field: Field, step: usize, cyl: CylindricalAxis, from: V3, to: V3, samples: usize) -> Result<PathPlot> {
+        if !from.iter().all(|v| v.is_finite()) || !to.iter().all(|v| v.is_finite()) {
+            bail!("path endpoints must be finite coordinates");
+        }
+        let d = sub(to, from);
+        let len = norm(d);
+        if !(len > 1e-12) {
+            bail!("path start and end points must be distinct");
+        }
+        if !self.has(field) {
+            bail!("field '{}' is not available in these results", field.label());
+        }
+        let n = samples.clamp(2, 500);
+        let pts: Vec<V3> = (0..n)
+            .map(|i| {
+                let u = i as f64 / (n - 1) as f64;
+                [from[0] + u * d[0], from[1] + u * d[1], from[2] + u * d[2]]
+            })
+            .collect();
+        let sampled: Vec<Option<f64>> = if let Some(ci) = field.cyl_comp() {
+            let st = self.stress.as_ref().ok_or_else(|| anyhow::anyhow!("stress tensor not available"))?;
+            mesh.sample_path_tensor(st, &pts)
+                .into_iter()
+                .zip(&pts)
+                .map(|(s, &p)| s.map(|ten| cylindrical_stress(p, &ten, cyl)[ci]))
+                .collect()
+        } else {
+            let arr = self.scalar(field, step).ok_or_else(|| anyhow::anyhow!("field '{}' has no nodal values", field.label()))?;
+            mesh.sample_path(&arr, &pts)
+        };
+        let mut points = Vec::with_capacity(n);
+        let (mut mn, mut mx, mut sum, mut cnt) = (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0usize);
+        for (i, (&pt, val)) in pts.iter().zip(sampled).enumerate() {
+            let s = len * i as f64 / (n - 1) as f64;
+            if let Some(v) = val {
+                if v.is_finite() {
+                    mn = mn.min(v);
+                    mx = mx.max(v);
+                    sum += v;
+                    cnt += 1;
+                }
+            }
+            points.push(PathPoint {
+                distance_mm: float(s),
+                point_mm: pt.map(float),
+                value: val.filter(|v| v.is_finite()).map(float),
+            });
+        }
+        Ok(PathPlot {
+            field: field.key(),
+            label: field.label().to_string(),
+            unit: field.unit().to_string(),
+            from_mm: from,
+            to_mm: to,
+            length_mm: float(len),
+            valid_samples: cnt,
+            points,
+            min: (cnt > 0).then(|| float(mn)),
+            max: (cnt > 0).then(|| float(mx)),
+            mean: (cnt > 0).then(|| float(sum / cnt as f64)),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PathPoint {
+    pub distance_mm: f64,
+    pub point_mm: V3,
+    pub value: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PathPlot {
+    pub field: String,
+    pub label: String,
+    pub unit: String,
+    pub from_mm: V3,
+    pub to_mm: V3,
+    pub length_mm: f64,
+    pub valid_samples: usize,
+    pub points: Vec<PathPoint>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub mean: Option<f64>,
+}
+
+impl PathPlot {
+    pub fn to_csv(&self) -> String {
+        let mut out = if self.unit.is_empty() {
+            format!("distance_mm,x_mm,y_mm,z_mm,{}\n", self.field)
+        } else {
+            format!("distance_mm,x_mm,y_mm,z_mm,{} [{}]\n", self.field, self.unit)
+        };
+        for pt in &self.points {
+            let v = pt.value.map(|x| x.to_string()).unwrap_or_default();
+            out.push_str(&format!("{},{},{},{},{}\n", pt.distance_mm, pt.point_mm[0], pt.point_mm[1], pt.point_mm[2], v));
         }
         out
     }

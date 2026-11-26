@@ -1191,4 +1191,170 @@ impl Mesh {
         let c = self.elem_cell[e];
         [self.origin[0] + (c[0] as f64 + 0.5) * self.h, self.origin[1] + (c[1] as f64 + 0.5) * self.h, self.origin[2] + (c[2] as f64 + 0.5) * self.h]
     }
+
+    /// Trilinear shape-function weights for the 8 nodes of a hexahedron at reference `xi in [-1, 1]^3`.
+    fn trilin_weights(xi: V3) -> [f64; 8] {
+        let mut w = [0.0; 8];
+        for (a, c) in CORNER.iter().enumerate() {
+            let s = [2.0 * c[0] as f64 - 1.0, 2.0 * c[1] as f64 - 1.0, 2.0 * c[2] as f64 - 1.0];
+            w[a] = 0.125 * (1.0 + s[0] * xi[0]) * (1.0 + s[1] * xi[1]) * (1.0 + s[2] * xi[2]);
+        }
+        w
+    }
+
+    /// Invert the trilinear map `x(xi) = p` via damped Newton iterations; returns `xi` when within `tol`.
+    fn inv_hex(&self, e: usize, p: V3, tol: f64) -> Option<V3> {
+        let en = self.elems[e];
+        let x: [V3; 8] = en.map(|n| self.nodes[n as usize]);
+        let mut xi = [0.0f64; 3];
+        let h2 = (self.h * 1e-8).powi(2);
+        let det_min = (self.h.max(1e-6) * 1e-4).powi(3);
+        for _ in 0..8 {
+            let w = Self::trilin_weights(xi);
+            let mut pos = [0.0; 3];
+            for a in 0..8 {
+                for k in 0..3 {
+                    pos[k] += w[a] * x[a][k];
+                }
+            }
+            let r = sub(p, pos);
+            if dot(r, r) <= h2 {
+                break;
+            }
+            // Jacobian J[row][col] = d pos[row] / d xi[col]
+            let mut j = [[0.0f64; 3]; 3];
+            for (a, c) in CORNER.iter().enumerate() {
+                let s = [2.0 * c[0] as f64 - 1.0, 2.0 * c[1] as f64 - 1.0, 2.0 * c[2] as f64 - 1.0];
+                let f = [1.0 + s[0] * xi[0], 1.0 + s[1] * xi[1], 1.0 + s[2] * xi[2]];
+                let dn = [0.125 * s[0] * f[1] * f[2], 0.125 * f[0] * s[1] * f[2], 0.125 * f[0] * f[1] * s[2]];
+                for row in 0..3 {
+                    for col in 0..3 {
+                        j[row][col] += dn[col] * x[a][row];
+                    }
+                }
+            }
+            let det = j[0][0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1])
+                - j[0][1] * (j[1][0] * j[2][2] - j[1][2] * j[2][0])
+                + j[0][2] * (j[1][0] * j[2][1] - j[1][1] * j[2][0]);
+            if !det.is_finite() || det.abs() < det_min {
+                return None;
+            }
+            let inv = 1.0 / det;
+            let dxi = [
+                inv * (r[0] * (j[1][1] * j[2][2] - j[1][2] * j[2][1])
+                    - j[0][1] * (r[1] * j[2][2] - j[1][2] * r[2])
+                    + j[0][2] * (r[1] * j[2][1] - j[1][1] * r[2])),
+                inv * (j[0][0] * (r[1] * j[2][2] - j[1][2] * r[2])
+                    - r[0] * (j[1][0] * j[2][2] - j[1][2] * j[2][0])
+                    + j[0][2] * (j[1][0] * r[2] - r[1] * j[2][0])),
+                inv * (j[0][0] * (j[1][1] * r[2] - r[1] * j[2][1])
+                    - j[0][1] * (j[1][0] * r[2] - r[1] * j[2][0])
+                    + r[0] * (j[1][0] * j[2][1] - j[1][1] * j[2][0])),
+            ];
+            let step = dxi.iter().map(|v| v.abs()).fold(0.0, f64::max);
+            let clamp = if step > 0.5 { 0.5 / step } else { 1.0 };
+            for k in 0..3 {
+                xi[k] += dxi[k] * clamp;
+            }
+            if xi.iter().any(|v| !v.is_finite() || v.abs() > 4.0) {
+                return None;
+            }
+        }
+        let max_xi = xi.iter().map(|v| v.abs()).fold(0.0, f64::max);
+        (max_xi <= tol).then_some(xi)
+    }
+
+    /// Locate each query point inside the mesh, returning `(elem_idx, trilinear_node_weights)`.
+    pub fn locate_points(&self, pts: &[V3]) -> Vec<Option<(usize, [f64; 8])>> {
+        if pts.is_empty() || self.elems.is_empty() {
+            return vec![None; pts.len()];
+        }
+        let mut qlo = [f64::INFINITY; 3];
+        let mut qhi = [f64::NEG_INFINITY; 3];
+        for p in pts {
+            for k in 0..3 {
+                qlo[k] = qlo[k].min(p[k]);
+                qhi[k] = qhi[k].max(p[k]);
+            }
+        }
+        let pad = 0.08 * self.h;
+        let cands: Vec<(usize, V3, V3)> = (0..self.elems.len())
+            .filter_map(|e| {
+                let mut lo = [f64::INFINITY; 3];
+                let mut hi = [f64::NEG_INFINITY; 3];
+                for &n in &self.elems[e] {
+                    let pt = self.nodes[n as usize];
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(pt[k]);
+                        hi[k] = hi[k].max(pt[k]);
+                    }
+                }
+                if (0..3).all(|k| hi[k] >= qlo[k] - pad && lo[k] <= qhi[k] + pad) {
+                    Some((e, lo, hi))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let eps_in = 1e-4 * self.h;
+        pts.iter()
+            .map(|&p| {
+                let mut near: Option<(f64, usize, [f64; 8])> = None;
+                for &(e, lo, hi) in &cands {
+                    if (0..3).any(|k| p[k] < lo[k] - pad || p[k] > hi[k] + pad) {
+                        continue;
+                    }
+                    let strict_box = (0..3).all(|k| p[k] >= lo[k] - eps_in && p[k] <= hi[k] + eps_in);
+                    if let Some(xi) = self.inv_hex(e, p, if strict_box { 1.0005 } else { 1.04 }) {
+                        let mx = xi.iter().map(|v| v.abs()).fold(0.0, f64::max);
+                        if mx <= 1.0005 {
+                            return Some((e, Self::trilin_weights(xi)));
+                        }
+                        if near.as_ref().is_none_or(|b| mx < b.0) {
+                            near = Some((mx, e, Self::trilin_weights(xi)));
+                        }
+                    }
+                }
+                near.map(|(_, e, w)| (e, w))
+            })
+            .collect()
+    }
+
+    /// Sample a nodal scalar field along a list of 3D query points (None outside the mesh).
+    pub fn sample_path(&self, vals: &[f64], pts: &[V3]) -> Vec<Option<f64>> {
+        self.locate_points(pts)
+            .into_iter()
+            .map(|loc| {
+                let (e, w) = loc?;
+                let en = self.elems[e];
+                if en.iter().any(|&n| n as usize >= vals.len()) {
+                    return None;
+                }
+                Some((0..8).map(|a| w[a] * vals[en[a] as usize]).sum())
+            })
+            .collect()
+    }
+
+    /// Sample a 6-component symmetric nodal tensor field along query points (None outside the mesh).
+    pub fn sample_path_tensor(&self, vals: &[[f64; 6]], pts: &[V3]) -> Vec<Option<[f64; 6]>> {
+        self.locate_points(pts)
+            .into_iter()
+            .map(|loc| {
+                let (e, w) = loc?;
+                let en = self.elems[e];
+                if en.iter().any(|&n| n as usize >= vals.len()) {
+                    return None;
+                }
+                let mut out = [0.0; 6];
+                for a in 0..8 {
+                    let s = vals[en[a] as usize];
+                    for k in 0..6 {
+                        out[k] += w[a] * s[k];
+                    }
+                }
+                Some(out)
+            })
+            .collect()
+    }
 }

@@ -567,9 +567,9 @@ are ignored — that exchange is computed; use them on the enclosure's outer fac
 
 ## 9. Reading results
 
-- **RESULTS** tab buttons switch the field (deformation, stresses, safety, plastic strain,
+- **RESULTS** tab buttons switch the field (deformation, stresses — including cylindrical **Radial**, **Hoop**, and **Axial** stresses — safety, plastic strain,
   fatigue safety / life / damage, temperature, heat flux, potential, E-field, current density, Joule heat, absorbed power, SAR, B, H,
-  velocity, pressure).
+  velocity, pressure). When a cylindrical stress is selected, a contextual **CYLINDRICAL AXIS** group appears to pick the axis (`X`, `Y`, `Z` or `cylindrical_axis` vector) and origin (`cylindrical_origin` in `set_display` / `probe` / `plot_path`).
 - The **legend** (top-left) shows the 9 colour bands with min/max. For safety factors and fatigue life the
   scale is reversed so that red is always the critical end.
 - **Deformation scale**: Auto (≈ 5 % of the model size), True scale, or Undeformed.
@@ -579,6 +579,7 @@ are ignored — that exchange is computed; use them on the enclosure's outer fac
   and fluid flow.
 - **🎯 Probe** (RESULTS ▸ TOOLS) — click the model to pin the value of the shown field at the nearest
   node; up to 8 markers, cleared with **✖ Clear** or when you solve again. MCP: `probe`.
+- **📏 Path** (RESULTS ▸ TOOLS) — plot any result field along a straight segment between two points **A** and **B** (type coordinates, click **🎯 Pick 2 points** in 3D, or **Use last 2 probes**); export via **💾 Export CSV…** or **📋 Copy CSV**. Points outside the mesh or across holes are omitted cleanly without interpolating over voids. MCP: `plot_path` (with optional `csv_path`).
 - **📈 History** (RESULTS ▸ TOOLS) — chart of the result's history: transient response over time,
   harmonic frequency response, load–displacement steps, heating curves; hover for values. Studies
   with one parameter show each response against it in the study window (**📈 Chart**).
@@ -656,8 +657,11 @@ shape is exported as an STL (next to your project, or in `~/SimCraft/`). **Open 
 starts a new model from it so you can re-apply loads and verify the stresses, or import the STL into
 your CAD as a starting point.
 
+### Mesh convergence (**OPTIMIZE ▸ Convergence**)
+Solves the current model at three mesh sizes ($h$, $h / 1.4$, $h / 2$), computes 3-grid **Richardson extrapolation** for each chosen response (e.g. `min:deformation_z`, `max:von_mises`, `max:hoop_stress`), reports the observed convergence order, estimated fine-mesh discretisation error, GCI, and recommends the element size needed to meet your target error (%). Press **Apply** (or MCP `apply_design`) to adopt the recommended element size in one click (and undo with `Ctrl+Z` / `undo`).
+
 MCP tools: `list_parameter_targets`, `run_parameter_study`, `optimize_design`, `surrogate_optimize`,
-`fit_surrogate`, `predict_surrogate`, `topology_optimize`, `get_study`, `apply_design`; for boards,
+`fit_surrogate`, `predict_surrogate`, `mesh_convergence`, `topology_optimize`, `get_study`, `apply_design`; for boards,
 `pcb_dc` (DC drop and current density in a net).
 
 ---
@@ -825,17 +829,17 @@ spectrum vs. static 1 g, random-vibration RMS (Miles), Basquin/Goodman fatigue l
 WR-340 guide wavelength, closed-cavity power balance, microwave-heating energy balance, plastic yielding, conduction, transient heating,
 thermal expansion, parallel-plate capacitance, resistance and Joule heating, ring-coil field,
 laminar channel flow, plate-with-hole stress concentration, Lamé thick cylinder, pipe-wall conduction and rod bending frequency (boundary-fitted), lid-driven cavity (Ghia), natural convection (de Vahl Davis), LVEL turbulent
-channel friction (Dean), conjugate-heat energy balance, contact reactions) and the GPU solver against the CPU. See the README for the
+channel friction (Dean), conjugate-heat energy balance, contact reactions, cylindrical stress paths and Richardson mesh-convergence extrapolation) and the GPU solver against the CPU. See the README for the
 numbers.
 
 ### Benchmark suite (`simcraft bench`)
 
-`simcraft bench` runs 24 reference cases — NAFEMS LE1 and T4, closed-form structural, thermal and
-electromagnetic problems, Ghia / de Vahl Davis / Dean flows, waveguide and dipole fields, KiCad copper
-— each at several element sizes, and writes `bench-out/bench.json` and a self-contained
+`simcraft bench` runs 33 reference cases — NAFEMS LE1 and T4, closed-form structural, thermal and
+electromagnetic problems, Ghia / de Vahl Davis / Dean flows, waveguide and dipole fields, KiCad copper,
+cylindrical paths and convergence checks — each at several element sizes, and writes `bench-out/bench.json` and a self-contained
 `bench-out/bench.html`: per case the reference and its source, value, error, unknowns and time per
 mesh, the observed convergence order, and a log-log plot of error against unknowns with the pass
-tolerance. `--quick` runs the 19 cheap cases at one size (≈ 20 s; CI runs it on every change and
+tolerance. `--quick` runs the 23 cheap cases at one size (≈ 21 s; CI runs it on every change and
 fails if a case leaves its tolerance), `--filter thermal` selects by id or group.
 
 **Comparing with another solver** (Ansys, COMSOL, Abaqus …): `simcraft bench --template > ansys.json`

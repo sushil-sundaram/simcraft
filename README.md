@@ -134,11 +134,13 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | Short dipole far field (FDTD + NTFF): directivity, radiated/input | 1.516, 96.1 % (41 cells/λ) → 99.8 % (82) | 1.5, 100 % |
 | KiCad board, copper plane in-plane conduction | 0.034817 W | 0.034861 W (Σkt) |
 | KiCad board, through-plane with 40 thermal vias | 3.0395 W | 3.0333 W (series ∥ via copper) |
+| Lamé 45° diagonal path: hoop (r = 12 mm) / radial (r = 14 mm) | 12.67 / −3.39 MPa | 12.59 / −3.47 MPa |
+| Cantilever Richardson extrapolation (3 coarse meshes, 4 → 2 mm) | 2.6617 mm | 2.6719 mm (Timoshenko, 0.38 %) |
 
 ### Benchmarks (`simcraft bench`)
-24 reference cases (NAFEMS LE1 and T4, closed forms, Ghia, de Vahl Davis, Dean, waveguide and dipole
-fields, KiCad copper), each at several mesh sizes → `bench-out/bench.html` with error-vs-unknowns
-plots and convergence order. `--quick` (19 cases, ≈ 20 s) gates every CI run; `--template` /
+33 reference cases (NAFEMS LE1 and T4, closed forms, Ghia, de Vahl Davis, Dean, waveguide and dipole
+fields, KiCad copper, cylindrical paths and Richardson convergence), each at several mesh sizes → `bench-out/bench.html` with error-vs-unknowns
+plots and convergence order. `--quick` (23 cases, ≈ 21 s) gates every CI run; `--template` /
 `--compare FILE` put another solver's results (e.g. Ansys) next to SimCraft's in the same report.
 
 ### Limitations
