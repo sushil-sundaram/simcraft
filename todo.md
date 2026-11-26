@@ -86,40 +86,31 @@ Today SimCraft runs as a single-user local desktop binary where `docs/ROADMAP.md
 ### Friction Points Found & UX To-Do
 
 #### 3D Viewport & Direct Manipulation
-- [x] **Upgrade from CPU software rasterization (`0.6×` drag blur) to hardware 3D rendering** *(P2.A2: `src/ui/gl_viewport.rs`, `src/render.rs`; still remaining in `P2.U`: interactive ViewCube alongside axis triad)*
+- [x] **Upgrade from CPU software rasterization (`0.6×` drag blur) to hardware 3D rendering** *(P2.A2 + P2.U: `src/ui/gl_viewport.rs`, `src/ui/overlays.rs`, `src/render.rs`)*
   - **Context:** `render::rasterize` (`src/render.rs`) drew flat-shaded quads on the CPU, dropped to `0.6×` scale during drag/animation, had no MSAA or perspective toggle, disabled deformation whenever a section cut was active, and lacked translucent body rendering.
-  - **Action (P2.A2 done):** Added `eframe::egui_glow` hardware 3D viewport (`QuadPicker` BVH, MSAA + 24-bit depth FBO), perspective camera toggle, translucent enclosure option, and deformed section cuts (`tests/viewport_p2_a2.rs`). Interactive **ViewCube** moves to `P2.U`.
-- [ ] **Render 3D load & boundary condition glyphs**
-  - **Context:** Currently loads only tint whole faces (`render::load_color`, `src/render.rs:133-153, 216-225`). Users cannot visually verify force vector direction/sign, pressure direction, fluid inlet flow direction, or coil axis in 3D.
-  - **Action:** Draw directional 3D arrows, constraint pins, flow streamlines/arrows, and heat/radiation glyphs on scoped faces/bodies.
-- [ ] **Add viewport body selection, hover highlighting, and per-body visibility toggles**
-  - **Context:** Clicking in the viewport only selects faces (`src/gui.rs:3954`) and hovering only shows a text tooltip (`line 3979`). Bodies can only be selected for editing from the left Browser (`line 3263`), and cannot be hidden, isolated, or made wireframe/transparent.
-  - **Action:** Highlight hovered faces/bodies directly in 3D, add a face/body selection mode toggle (plus right-click depth-cycle / "select behind" for inner faces), and add eye/ghost icons per body in the Browser.
-- [ ] **Add live ghost previews & 3D gizmos for geometry creation and transforms**
-  - **Context:** Box, Cylinder/Hole, Pocket, Sphere, and Enclosure forms (`src/gui.rs:3426-3540`) require blind numeric XYZ entry before clicking `Create` to see placement.
-  - **Action:** Render a translucent ghost preview in 3D as values change, and add 3D drag handles + snap-to-face/center controls.
+  - **Action:** `P2.A2` added `eframe::egui_glow` hardware 3D viewport, MSAA, perspective toggle, translucent enclosures, and deformed section cuts (`tests/viewport_p2_a2.rs`). `P2.U` added the interactive **ViewCube** alongside the axis triad (`src/ui/overlays.rs`).
+- [x] **Render 3D load & boundary condition glyphs** *(P2.U: `src/ui/overlays.rs::draw_load_glyphs`)*
+  - **Action:** Draws directional 3D force/pressure/gravity arrows, fixed/displacement/compression/symmetry markers, thermal markers/flux/convection/radiation vectors, EM coil winding rings / magnet B vectors / RF port polarization arrows, and CFD inlet/outlet/moving-wall arrows with toolbar toggle.
+- [x] **Add viewport body selection, hover highlighting, and per-body visibility toggles** *(P2.U: `src/ui/overlays.rs`, `src/ui/viewport.rs`, `src/ui/browser.rs`, `src/render.rs`)*
+  - **Action:** Added cached perimeter hover highlighting, Face/Body selection mode toggle + multi-body selection, right-click **Select Behind (Depth Peel)** (`QuadPicker::pick_all`), and per-body Visible / Ghost (`kind = 3` translucent) / Hidden / Isolate controls (`tests/ux_p2_u.rs`).
+- [x] **Add live ghost previews & 3D gizmos for geometry creation and transforms** *(P2.U: `src/ui/overlays.rs::draw_ghost_and_gizmo`, `src/ui/properties.rs`)*
+  - **Action:** Renders live 3D wireframe/translucent ghost previews on Box/Cylinder/Sphere/Enclosure/Transform, interactive X/Y/Z axis drag handles, and `"Snap to selected face center"`.
 
 #### Forms, Workflows & Diagnostics
-- [ ] **Replace `json_editor` in `item_editor` with the rich creation forms (`src/gui.rs:390-498, 2934-3067`)**
-  - **Context:** Creating a load shows unit suffixes, hints, and click-to-pick face chips (`load_form`, `line 3550`), whereas clicking an existing body or load in the Browser falls back to `json_editor`, turning `faces` into a raw comma-separated string (`line 446`) and dropping unit labels.
-  - **Action:** Share one unified, unit-aware form component with interactive viewport face-picking and inline validation for both creation and editing.
-- [ ] **Add a live pre-solve readiness checklist**
-  - **Context:** Missing fixed supports, missing fluid outlets, missing enclosures, or overly coarse mesh/FDTD wavelength cells are only discovered after pressing `Solve`.
-  - **Action:** Display a live compact checklist in `SETUP` / `SOLVE` (e.g., `✓ Geometry · ✓ Material · ✗ Needs Support / Constraint · ⚠ Mesh > λ/10`) with one-click jump/fix links.
-- [ ] **Scale the Browser for large PCB / assembly models (`src/gui.rs:3222-3380`)**
-  - **Context:** KiCad boards create dozens of component bodies listed flatly in `Geometry` without grouping, search, or multi-select.
-  - **Action:** Group PCB components under their parent board node (collapsible), add Browser search/filter, and support multi-select for batch material assignment or deletion.
+- [x] **Replace `json_editor` in `item_editor` with the rich creation forms** *(P2.U: `src/ui/properties.rs`)*
+  - **Action:** Shared unit-aware forms (`load_definition_ui`, `BodyDraft`/`LoadDraft`) with interactive removable face chips and viewport face sync for both Create and Edit across all shapes and all 20 load variants.
+- [x] **Add a live pre-solve readiness checklist** *(P2.U: `src/model.rs::preflight_check`, `src/ui/ribbon.rs`, MCP `preflight`)*
+  - **Action:** Displays live clickable `✓` / `⚠` / `✗` readiness chips in `SETUP` & `SOLVE` (checking geometry, materials, enclosures/fluids, BCs, and FDTD λ/10 wavelength criteria; tested in `tests/ux_p2_u.rs`).
+- [x] **Scale the Browser for large PCB / assembly models** *(P2.U: `src/ui/browser.rs`)*
+  - **Action:** Groups KiCad component bodies under their parent board (`🧩 N components`), adds live Browser search filter, multi-body checkboxes, and batch material/hide/delete controls.
 
 #### Screen Ergonomics, Navigation & AI UX
-- [x] **Replace overlapping floating `egui::Window` modals with dockable/bottom drawers** *(P2.A2: docked bottom **🗂 Workbench** drawer in `src/ui/charts.rs` hosting `Charts & Path`, `Studies`, `PCB DC`, `Planner`, and `Guide` with `↗ Pop out` / `⬇ Dock`; still remaining in `P2.U`: collapsible Browser/Properties side panels + click-to-highlight in 3D for hot tracks/optimization rows)*
-  - **Context:** `study_window`, `help_window`, `planner_window`, `pcb_window`, and `chart_window` previously floated over the 3D viewport on 13–14" laptop displays.
-  - **Action (P2.A2 done):** Moved those workflows into a resizable docked bottom Workbench drawer (`src/ui/charts.rs`), keeping `Material` and `Fatigue` dialogs focused and pop-out tabs optional.
-- [ ] **Improve laptop trackpad navigation & keyboard shortcuts**
-  - **Context:** Viewport panning currently requires right-drag or middle-drag (`src/gui.rs:3856`), which is awkward on laptop trackpads without a middle button.
-  - **Action:** Support `Space+drag` / `Shift+middle` / two-finger trackpad pan, pinch-to-zoom (`zoom_delta()`), keyboard shortcuts (`F` fit, `1–6` standard views, `Del` delete selected, `Esc` close active form/clear selection), a right-click viewport context menu, and a unit-system preference (`mm/N/MPa`, `m/N/Pa`, `in/lbf/psi`).
-- [ ] **Unify `✨ Planner` and `Connect AI` into an in-app executable Copilot**
-  - **Context:** `Planner` (`src/assistant.rs`, `src/gui.rs:1609`) only outputs a static Ollama checklist (unable to execute steps beyond `Set up this analysis`), isolated from `Connect AI` (external MCP).
-  - **Action:** Merge them into one AI Assistant drawer that inspects live selection/model state, runs or proposes step-by-step tool calls with preview/undo, and explains solver errors.
+- [x] **Replace overlapping floating `egui::Window` modals with dockable/bottom drawers** *(P2.A2 + P2.U: `src/ui/charts.rs`, `src/ui/mod.rs`, `src/ui/browser.rs`, `src/ui/properties.rs`)*
+  - **Action:** Docked bottom **🗂 Workbench** drawer (`↗ Pop out` / `⬇ Dock`), collapsible left Browser & right Properties panels (`«`/`»` + header toggles), and `📍` 3D track-midpoint pinpoint in PCB DC drop (`tests/ux_p2_u.rs`).
+- [x] **Improve laptop trackpad navigation & keyboard shortcuts** *(P2.U: `src/ui/viewport.rs`, `src/ui/mod.rs`, `src/ui/theme.rs`)*
+  - **Action:** Added `Space+drag` / `Shift+scroll` / **🖱 Pan** two-finger pan, pinch `zoom_delta()`, shortcuts (`F`, `1–6`, `P`, `H`/`Shift+H`, `Delete`, `Escape`), right-click context menu, and persistent `UnitSystem` preference (`mm·N·MPa`, `m·N·Pa`, `in·lbf·psi`).
+- [x] **Unify `✨ Planner` and `Connect AI` into an in-app executable Copilot** *(P2.U: `src/assistant.rs`, `src/ui/charts.rs`, `src/ui/dialogs.rs`)*
+  - **Action:** Unified `✨ Copilot` drawer combining offline preflight quick-fixes (`assistant::quick_fixes`), solver error diagnosis (`assistant::explain_issue`), live-grounded Ollama tool proposals with **▶ Run** / **▶▶ Run all** / **↶ Undo**, and embedded MCP Connect setup.
 
 ---
 

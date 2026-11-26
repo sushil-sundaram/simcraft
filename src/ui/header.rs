@@ -1,6 +1,6 @@
 //! Top header bar, File/Edit/Examples menus, theme switcher, and Workbench toggle.
 
-use super::theme::logo;
+use super::theme::{UnitSystem, logo};
 use super::{DrawerTab, Pending, SimApp};
 use eframe::egui::{self, RichText, Sense};
 use serde_json::json;
@@ -78,11 +78,30 @@ impl SimApp {
                 if ui.button("Connect AI").on_hover_text("Control SimCraft from Claude Code, Antigravity or any MCP client").clicked() {
                     self.show_mcp = true;
                 }
-                if ui.button("✨ Planner").on_hover_text("Describe what you want to simulate and get a to-do list from a local AI model").clicked() {
+                if ui.button("✨ Copilot").on_hover_text("Unified AI simulation copilot, quick-fixes, tool runner, and MCP setup").clicked() {
                     self.open_drawer(DrawerTab::Planner);
                 }
-                if ui.selectable_label(self.drawer.open, "🗂 Workbench").on_hover_text("Toggle docked bottom drawer (Charts, Studies, PCB DC, Planner, Guide)").clicked() {
+                if ui.selectable_label(self.drawer.open, "🗂 Workbench").on_hover_text("Toggle docked bottom drawer (Charts, Studies, PCB DC, Copilot, Guide)").clicked() {
                     self.drawer.open = !self.drawer.open;
+                }
+                ui.separator();
+                if ui.selectable_label(self.browser_open, "📦").on_hover_text("Show / hide left Browser panel").clicked() {
+                    self.browser_open = !self.browser_open;
+                }
+                if ui.selectable_label(self.props_open, "⚙").on_hover_text("Show / hide right Properties panel").clicked() {
+                    self.props_open = !self.props_open;
+                }
+                egui::ComboBox::from_id_salt("hdr-units").width(96.0).selected_text(self.units.label()).show_ui(ui, |ui| {
+                    for u in UnitSystem::ALL {
+                        if ui.selectable_label(self.units == u, u.label()).clicked() {
+                            self.units = u;
+                            self.persist_prefs();
+                        }
+                    }
+                }).response.on_hover_text("Display & input unit system preference (model solves cleanly in SI)");
+                if ui.selectable_label(self.trackpad_pan, "🖱 Pan").on_hover_text("Trackpad mode: two-finger scroll pans; pinch or Ctrl+scroll zooms (also Space+drag anywhere)").clicked() {
+                    self.trackpad_pan = !self.trackpad_pan;
+                    self.persist_prefs();
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

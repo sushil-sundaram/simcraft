@@ -62,38 +62,42 @@ Command-line options:
 ## 2. A tour of the window
 
 ```
-┌ SimCraft  File  Examples  Connect AI  ✨ Planner ───────────── ● MCP ready  ☀/🌙 ┐
+┌ SimCraft  File  Examples  Connect AI  ✨ Copilot  🗂 Workbench ──────── ● MCP ready  ☀/🌙 ┐
 │ GEOMETRY  MATERIAL  SETUP  MESH  SOLVE  RESULTS          ← ribbon tabs           │
-│ [tools for the selected tab, grouped CREATE · MODIFY · INSERT …]                 │
+│ [tools for the selected tab, grouped CREATE · MODIFY · READINESS …]              │
 ├──────────────┬───────────────────────────────────────────────┬──────────────────┤
 │ BROWSER      │                 3D VIEWPORT                   │ PROPERTIES       │
-│ Geometry     │  legend · title             [view toolbar]    │ forms for the    │
-│ Analysis +   │                                               │ current tool,    │
-│  loads       │                                               │ selected faces   │
-│ Mesh         │  axis triad                                   │                  │
-│ Solution     │                                               │                  │
+│ 🔍 Filter    │  legend · title             [view toolbar]    │ unit-aware forms │
+│ Geometry     │                                               │ (Create & Edit), │
+│  (👁/👻/🚫)  │  3D glyphs · ghost gizmos                     │ Transform,       │
+│ Analysis +   │                                               │ face chips       │
+│ Mesh · Sol.  │  axis triad · ViewCube                        │                  │
 ├──────────────┴───────────────────────────────────────────────┴──────────────────┤
 │ status bar: progress, messages, errors                                          │
 └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Ribbon** — the workflow from left to right: build geometry, assign material, set up the analysis
-  and its loads, mesh, solve, look at results. Each tab shows only the tools that make sense.
-- **Browser** (left) — everything in the model: bodies (🗑 to delete), the analysis with its supports
-  and loads (coloured dots match the colours in the viewport), mesh statistics and a solution summary
-  (key maxima, reactions, frequencies, derived quantities such as capacitance or drag).
-- **Properties** (right) — the form for the tool you picked (e.g. Box size, Force vector) and the
-  faces you have selected.
+  and its loads, mesh, solve, look at results. **SETUP** and **SOLVE** also show a live
+  **READINESS** pre-flight checklist (`✓` / `⚠` / `✗`, click any chip to jump to the step or fix it).
+- **Browser** (left, collapsible) — everything in the model, with a live search filter, KiCad PCB
+  component grouping under the parent board, multi-select batch actions (material assign, hide,
+  delete), per-body visibility toggle (`👁` visible / `👻` translucent ghost / `🚫` hidden),
+  loads/supports, mesh statistics and solution summary.
+- **Properties** (right, collapsible) — unit-aware forms used identically for creating **and**
+  editing shapes, materials, transformations, and all 20 load/BC types (with interactive face chips).
 - **Viewport** — hardware OpenGL (iGPU) 3D viewport with MSAA and 24-bit depth buffer (falling back
   to the software rasterizer if GLSL 1.40 / ES 3.00 is unavailable). Left-drag to orbit,
-  right/middle-drag to pan, scroll to zoom (towards the cursor). Click a face to select it,
-  Shift+click to add more. Hovering shows the face name. The toolbar (top-right, or bottom-right in
-  narrow windows) has Fit, Iso, Front, Top, Right, Left, **Persp** (orthographic / perspective
-  camera toggle), and **Glass** (translucent enclosure toggle when an enclosure is present).
-- **Header** — **Connect AI** (MCP setup), **✨ Planner** (local AI to-do lists), **🗂 Workbench**
-  (toggle the docked bottom drawer for Charts & Path, Studies, PCB DC, Planner, and User Guide;
-  every tab supports **↗ Pop out** / **⬇ Dock**), the MCP status dot and the light/dark switch
-  (remembered between runs).
+  right/middle/`Space`-drag to pan, scroll/pinch to zoom (or toggle **🖱 Pan** in the header for
+  two-finger trackpad panning). Toggle **Face / Body** selection mode, **Glyphs** (3D force/pressure/pin/flow/coil vectors),
+  **Persp**, and **Glass**; right-click to open the **Select Behind (Depth Peel)** & body visibility menu;
+  click faces/corners of the bottom-left **ViewCube** to reorient; and drag 3D X/Y/Z axis handles on
+  live ghost previews while creating or editing shapes.
+- **Header** — **Connect AI** (MCP setup), **✨ Copilot** (unified offline quick-fixes, local Ollama
+  plan & undoable tool actions, plus embedded MCP setup), **🗂 Workbench** (docked bottom drawer for
+  Charts & Path, Studies, PCB DC, Copilot, and User Guide; every tab supports **↗ Pop out** / **⬇ Dock**),
+  collapsible side-panel toggles (`📦`, `⚙`), **Unit system** (`mm·N·MPa`, `m·N·Pa`, `in·lbf·psi`),
+  trackpad pan toggle, MCP status dot, and light/dark theme switch.
 - **OPTIMIZE** tab — parameter studies, design optimization and topology optimization (§10).
 - **Examples** menu — ready-made models for every kind of analysis; open one and press Solve.
 - **Status bar** — progress of the running solve or study with **■ Stop** (the SOLVE tab's Solve
@@ -114,14 +118,15 @@ highlight = your current selection.
 
 | Action | How |
 |---|---|
-| Orbit / pan / zoom | left drag / right or middle drag / wheel |
-| Select a face / add to the selection | click / Shift+click |
-| Edit a body or load | click it in the Browser |
+| Orbit / pan / zoom | left drag / right, middle, or Space+drag (or 2-finger pan in **🖱 Pan** mode) / wheel or pinch |
+| Select a face or body / multi-select | click / Shift+click (switch Face / Body in toolbar) |
+| Select behind / hide / ghost a body | right-click viewport (Depth Peel menu) or click 👁/👻/🚫 in Browser |
+| Edit a body or load | click it in the Browser (or Body mode click in 3D) |
 | Read a value on the model | RESULTS ▸ 🎯 Probe, then click |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z or Ctrl+Y |
 | Help for what you are doing | F1 (or the ⓘ next to the analysis name) |
 | Stop a running solve or study | ■ Stop in the status bar |
-| Views & camera | toolbar at the viewport corner: Fit, Iso, Front, Top, Right, Left, Persp, Glass (also under RESULTS ▸ DISPLAY: *Perspective camera*, *Translucent enclosure*) |
+| Views & shortcuts | toolbar (`Fit`, `Iso`, `Front`, `Top`, `Right`, `Left`, `Face/Body`, `Glyphs`, `Persp/Ortho`, `Glass`) · **ViewCube** · `F` fit, `1–6` views, `P` persp, `H`/`Shift+H` hide/show all, `Del` delete selected, `Esc` cancel/clear |
 
 The **HELP** tab opens this guide inside the app, with a table of contents and search, and seven
 step-by-step **tutorials** (HELP ▸ TUTORIALS: bracket stress, heat sink, vibration and fatigue, KiCad

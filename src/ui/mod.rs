@@ -5,11 +5,13 @@ mod charts;
 mod dialogs;
 mod gl_viewport;
 mod header;
+mod overlays;
 mod properties;
 mod ribbon;
 mod theme;
 mod viewport;
 
+use crate::geometry::V3;
 use crate::mesh::Mesh;
 use crate::model::*;
 use crate::render::{self, Camera, GpuScene};
@@ -33,7 +35,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use theme::{Pal, install_style, load_dark_pref, pal, save_dark_pref};
+use theme::{Pal, UnitSystem, install_style, load_prefs, pal, save_dark_pref, save_prefs};
 
 #[derive(PartialEq, Clone, Copy)]
 pub(super) enum Tab {
@@ -186,6 +188,7 @@ pub(super) enum Form {
     Load(LoadKind),
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Forms {
     pub name: String,
     pub subtract: bool,
@@ -306,7 +309,7 @@ impl DrawerTab {
             DrawerTab::Charts => "📈 Charts & Path",
             DrawerTab::Study => "📊 Studies",
             DrawerTab::Pcb => "🔌 PCB DC",
-            DrawerTab::Planner => "✨ Planner",
+            DrawerTab::Planner => "✨ Copilot",
             DrawerTab::Help => "📖 Guide",
         }
     }
@@ -420,15 +423,52 @@ pub(super) struct OptUi {
     pub seen: String,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
+pub(super) enum SelectMode {
+    #[default]
+    Face,
+    Body,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BodyDraft {
+    pub orig_name: String,
+    pub name: String,
+    pub op: crate::geometry::Op,
+    pub role: crate::geometry::Role,
+    pub material: String,
+    pub shape: crate::geometry::Shape,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct LoadDraft {
+    pub id: u32,
+    pub kind: LoadKind,
+    pub f: Forms,
+    pub faces: Vec<String>,
+    pub body: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum EditTarget {
+    Body(BodyDraft),
+    Load(LoadDraft),
+}
+
+pub(super) type ModelsJobSlot = Arc<std::sync::Mutex<Option<Result<Vec<String>, String>>>>;
+
 #[derive(Default)]
 pub(super) struct Planner {
     pub open: bool,
+    pub mode: usize,
     pub goal: String,
     pub models: Option<Result<Vec<String>, String>>,
+    pub models_job: Option<ModelsJobSlot>,
     pub model: String,
     pub job: Option<Arc<std::sync::Mutex<Option<Result<(), String>>>>>,
     pub error: Option<String>,
     pub copied_at: f64,
+    pub executed_actions: HashSet<usize>,
 }
 
 pub struct SimApp {
@@ -444,8 +484,10 @@ pub struct SimApp {
     pub(super) confirm: Option<Pending>,
     pub(super) confirm_external: Option<(String, Vec<String>)>,
     pub(super) sel_body: Option<String>,
+    pub(super) sel_bodies: HashSet<String>,
+    pub(super) batch_material: String,
     pub(super) sel_load: Option<u32>,
-    pub(super) edit_val: Option<(String, Value)>,
+    pub(super) edit_target: Option<(String, EditTarget)>,
     pub(super) xform: (String, [f64; 3], usize, usize, f64, bool),
     pub(super) mat_edit: Option<(String, Value)>,
     pub(super) show_chart: bool,
@@ -472,6 +514,19 @@ pub struct SimApp {
     pub(super) legend: Option<((f64, f64), f64)>,
     pub(super) dark: bool,
     pub(super) p: Pal,
+    pub(super) units: UnitSystem,
+    pub(super) trackpad_pan: bool,
+    pub(super) show_glyphs: bool,
+    pub(super) select_mode: SelectMode,
+    pub(super) browser_open: bool,
+    pub(super) props_open: bool,
+    pub(super) browser_filter: String,
+    pub(super) hover_cache: Option<((usize, bool, u32), Vec<[V3; 2]>)>,
+    pub(super) ctx_menu_pos: Option<egui::Pos2>,
+    pub(super) ctx_hits: Vec<(u32, f64, V3)>,
+    pub(super) gizmo_busy: bool,
+    pub(super) gizmo_drag: Option<(usize, f64, V3)>,
+    pub(super) highlight_point: Option<(V3, String)>,
     pub(super) show_mcp: bool,
     pub(super) planner: Planner,
     pub(super) opt: OptUi,
@@ -483,7 +538,8 @@ pub struct SimApp {
 impl SimApp {
     pub fn new(cc: &eframe::CreationContext<'_>, core: Shared, bridge: String) -> Self {
         install_style(&cc.egui_ctx);
-        let dark = load_dark_pref().unwrap_or_else(|| cc.egui_ctx.system_theme() == Some(egui::Theme::Dark));
+        let prefs = load_prefs();
+        let dark = prefs.dark_mode.unwrap_or_else(|| cc.egui_ctx.system_theme() == Some(egui::Theme::Dark));
         cc.egui_ctx.set_theme(if dark { egui::ThemePreference::Dark } else { egui::ThemePreference::Light });
         core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).display.dark = dark;
         *core.gui_ctx.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cc.egui_ctx.clone());
@@ -509,8 +565,10 @@ impl SimApp {
             confirm: None,
             confirm_external: None,
             sel_body: None,
+            sel_bodies: HashSet::new(),
+            batch_material: "Aluminum 6061-T6".into(),
             sel_load: None,
-            edit_val: None,
+            edit_target: None,
             xform: ("move".into(), [10.0, 0.0, 0.0], 3, 0, 0.0, true),
             mat_edit: None,
             show_chart: false,
@@ -537,6 +595,19 @@ impl SimApp {
             legend: None,
             dark,
             p: pal(dark),
+            units: prefs.unit_system,
+            trackpad_pan: prefs.trackpad_pan,
+            show_glyphs: true,
+            select_mode: SelectMode::Face,
+            browser_open: true,
+            props_open: true,
+            browser_filter: String::new(),
+            hover_cache: None,
+            ctx_menu_pos: None,
+            ctx_hits: Vec::new(),
+            gizmo_busy: false,
+            gizmo_drag: None,
+            highlight_point: None,
             show_mcp: std::env::var_os("SIMCRAFT_OPEN_CONNECT").is_some(),
             opt: OptUi { max_evals: 12, bayes: true, vf: 0.4, iters: 40, conv_base_h: 4.0, conv_target_err: 1.0, objective: "mass".into(), ..Default::default() },
             path: PathUi { samples: 50, to: [100.0, 0.0, 0.0], ..Default::default() },
@@ -546,7 +617,66 @@ impl SimApp {
         }
     }
 
+    pub(super) fn persist_prefs(&self) {
+        save_prefs(&theme::UiPrefs {
+            dark_mode: Some(self.dark),
+            unit_system: self.units,
+            trackpad_pan: self.trackpad_pan,
+        });
+    }
+
+    pub(super) fn set_body_vis(&mut self, name: &str, mode: u8) {
+        let (mut hidden, mut ghost) = {
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (s.display.hidden_bodies.iter().cloned().collect::<Vec<_>>(), s.display.ghost_bodies.iter().cloned().collect::<Vec<_>>())
+        };
+        hidden.retain(|x| x != name);
+        ghost.retain(|x| x != name);
+        match mode {
+            1 => ghost.push(name.to_string()),
+            2 => hidden.push(name.to_string()),
+            _ => {}
+        }
+        self.run("set_display", json!({"hidden_bodies": hidden, "ghost_bodies": ghost}));
+    }
+
+    pub(super) fn cycle_body_vis(&mut self, name: &str) {
+        let mode = {
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if s.display.hidden_bodies.contains(name) {
+                0 // Hidden -> Visible
+            } else if s.display.ghost_bodies.contains(name) {
+                2 // Ghost -> Hidden
+            } else {
+                1 // Visible -> Ghost
+            }
+        };
+        self.set_body_vis(name, mode);
+    }
+
+    pub(super) fn isolate_body(&mut self, name: &str) {
+        let names: Vec<String> = {
+            let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.model.bodies.iter().filter(|b| b.name != name).map(|b| b.name.clone()).collect()
+        };
+        self.run("set_display", json!({"hidden_bodies": names, "ghost_bodies": []}));
+    }
+
+    pub(super) fn show_all_bodies(&mut self) {
+        self.run("set_display", json!({"show_all_bodies": true}));
+    }
+
     pub(super) fn run(&mut self, tool: &str, args: Value) -> bool {
+        if matches!(tool, "new_model" | "open_project") {
+            self.edit_target = None;
+            self.sel_body = None;
+            self.sel_bodies.clear();
+            self.sel_load = None;
+            self.highlight_point = None;
+            self.ctx_menu_pos = None;
+            self.gizmo_drag = None;
+            self.planner.executed_actions.clear();
+        }
         match self.core.call(tool, &args) {
             Ok(o) => {
                 let short: String = o.text.lines().next().unwrap_or("").chars().take(140).collect();
@@ -878,10 +1008,14 @@ impl eframe::App for SimApp {
         egui::Panel::top("header").frame(bar(p.ribbon)).show(ui, |ui| self.header(ui));
         egui::Panel::top("ribbon").frame(bar(p.ribbon).inner_margin(egui::Margin { left: 12, right: 12, top: 8, bottom: 6 })).show(ui, |ui| self.ribbon(ui));
         egui::Panel::bottom("status").frame(bar(p.panel).inner_margin(egui::Margin::symmetric(12, 4))).show(ui, |ui| self.status(ui));
-        egui::Panel::left("browser").frame(bar(p.panel).inner_margin(10)).resizable(true).default_size(260.0).show(ui, |ui| self.browser(ui));
-        egui::Panel::right("props").frame(bar(p.panel).inner_margin(10)).resizable(true).default_size(290.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.properties(ui));
-        });
+        if self.browser_open {
+            egui::Panel::left("browser").frame(bar(p.panel).inner_margin(10)).resizable(true).default_size(260.0).show(ui, |ui| self.browser(ui));
+        }
+        if self.props_open {
+            egui::Panel::right("props").frame(bar(p.panel).inner_margin(10)).resizable(true).default_size(290.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.properties(ui));
+            });
+        }
 
         let req = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ui_request.take();
         if let Some(q) = req {
@@ -964,16 +1098,85 @@ impl eframe::App for SimApp {
         }
         self.material_window(&ctx);
         if !ctx.egui_wants_keyboard_input() {
-            let (undo, redo) = ctx.input_mut(|i| {
+            let (undo, redo, key_fit, key_persp, key_del, key_esc, key_hide, key_show_all, view_key) = ctx.input_mut(|i| {
                 let redo = i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)) || i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y));
                 let undo = i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z));
-                (undo, redo)
+                let fit = i.consume_key(egui::Modifiers::NONE, egui::Key::F);
+                let persp = i.consume_key(egui::Modifiers::NONE, egui::Key::P);
+                let del = i.consume_key(egui::Modifiers::NONE, egui::Key::Delete) || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace);
+                let esc = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                let show_all = i.consume_key(egui::Modifiers::SHIFT, egui::Key::H);
+                let hide = i.consume_key(egui::Modifiers::NONE, egui::Key::H);
+                let mut vk = None;
+                for (k, v) in [
+                    (egui::Key::Num1, "iso"),
+                    (egui::Key::Num2, "front"),
+                    (egui::Key::Num3, "back"),
+                    (egui::Key::Num4, "top"),
+                    (egui::Key::Num5, "right"),
+                    (egui::Key::Num6, "left"),
+                ] {
+                    if i.consume_key(egui::Modifiers::NONE, k) {
+                        vk = Some(v);
+                    }
+                }
+                (undo, redo, fit, persp, del, esc, hide, show_all, vk)
             });
             if undo {
                 self.run("undo", json!({}));
             }
             if redo {
                 self.run("redo", json!({}));
+            }
+            if key_fit {
+                self.need_fit = true;
+            }
+            if let Some(v) = view_key {
+                self.cam.set_view(v);
+                self.need_fit = true;
+            }
+            if key_persp {
+                let next = !self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).display.perspective;
+                self.run("set_display", json!({"perspective": next}));
+            }
+            if key_show_all {
+                self.show_all_bodies();
+            } else if key_hide {
+                if let Some(b) = self.sel_body.clone() {
+                    self.set_body_vis(&b, 2);
+                }
+            }
+            if key_del {
+                if let Some(id) = self.sel_load.take() {
+                    self.edit_target = None;
+                    self.run("remove_load", json!({"id": id}));
+                } else if !self.sel_bodies.is_empty() {
+                    let names: Vec<String> = self.sel_bodies.drain().collect();
+                    self.sel_body = None;
+                    self.edit_target = None;
+                    for n in names {
+                        self.run("remove_body", json!({"name": n}));
+                    }
+                } else if let Some(b) = self.sel_body.take() {
+                    self.edit_target = None;
+                    self.run("remove_body", json!({"name": b}));
+                }
+            }
+            if key_esc {
+                self.ctx_menu_pos = None;
+                self.probe_mode = false;
+                self.path.picking = 0;
+                if self.form != Form::None {
+                    self.form = Form::None;
+                } else if self.sel_body.is_some() || self.sel_load.is_some() {
+                    self.sel_body = None;
+                    self.sel_load = None;
+                    self.edit_target = None;
+                } else if !self.selected.is_empty() || !self.sel_bodies.is_empty() {
+                    self.selected.clear();
+                    self.sel_bodies.clear();
+                    self.sel_version += 1;
+                }
             }
         }
         self.fatigue_window(&ctx);

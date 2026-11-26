@@ -6,19 +6,81 @@ use crate::model::AnalysisType;
 use eframe::egui::{self, Align2, Color32, RichText, Stroke, vec2};
 use serde_json::json;
 
+pub(super) fn mcp_connect_panel(app: &mut SimApp, ctx: &egui::Context, ui: &mut egui::Ui) {
+    let p = app.p;
+    let exe = std::env::current_exe().map(|x| x.to_string_lossy().to_string()).unwrap_or("simcraft".into());
+    let cmd = format!("claude mcp add --scope user simcraft -- {exe} mcp");
+    let js = format!("{{\n  \"mcpServers\": {{\n    \"simcraft\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"mcp\"]\n    }}\n  }}\n}}");
+    let ok = app.bridge.starts_with("MCP bridge listening");
+    let now = ctx.input(|i| i.time);
+    let mut copy: Option<(&'static str, String)> = None;
+
+    ui.label(RichText::new("Let Claude Code, Antigravity or any MCP client build models, run solves and inspect results live.").color(p.weak));
+    ui.add_space(8.0);
+    egui::Frame::new()
+        .fill(if ok { p.ok.gamma_multiply(0.12) } else { p.warn.gamma_multiply(0.12) })
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(if ok { "●" } else { "○" }).color(if ok { p.ok } else { p.warn }));
+                ui.label(RichText::new(if ok { "Ready — agents connected to SimCraft drive this window live" } else { "Bridge offline — another SimCraft window may already be using the port" }).strong());
+            });
+            ui.label(RichText::new(&app.bridge).small().color(p.weak));
+        });
+    ui.add_space(10.0);
+    let mut block = |ui: &mut egui::Ui, step: &str, title: &str, hint: &str, text: &str, key: &'static str| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(step).strong().color(p.accent));
+            ui.label(RichText::new(title).strong());
+        });
+        ui.label(RichText::new(hint).small().color(p.weak));
+        ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(if p.dark { Color32::from_rgb(22, 24, 28) } else { Color32::from_rgb(244, 245, 248) })
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_top(|ui| {
+                    let copied = app.copied.is_some_and(|(k, t)| k == key && now - t < 1.8);
+                    let label = if copied { "✔ Copied" } else { "📋 Copy" };
+                    let btn = ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        let b = ui.add(egui::Button::new(RichText::new(label).small()).min_size(vec2(78.0, 24.0)));
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                            egui::ScrollArea::horizontal().id_salt(key).show(ui, |ui| {
+                                ui.add(egui::Label::new(RichText::new(text).monospace().size(12.0)).extend());
+                            });
+                        });
+                        b
+                    });
+                    if btn.inner.clicked() {
+                        copy = Some((key, text.to_string()));
+                    }
+                });
+            });
+        ui.add_space(10.0);
+    };
+    block(ui, "1", "Claude Code", "Run once in a terminal; SimCraft is then available in every Claude Code session.", &cmd, "claude");
+    block(ui, "2", "Antigravity, Cursor and other MCP clients", "Paste into the client's MCP config (Antigravity: Agent panel ▸ ⋯ ▸ MCP Servers ▸ Manage ▸ View raw config).", &js, "json");
+    ui.label(RichText::new("Try asking: “In SimCraft, make an aluminium bracket with a hole, fix one end, load the other and show me the stress.”").small().italics().color(p.weak));
+
+    if let Some((k, t)) = copy {
+        ctx.copy_text(t);
+        app.copied = Some((k, now));
+        ctx.request_repaint_after(std::time::Duration::from_millis(1900));
+    }
+}
+
 impl SimApp {
     pub(super) fn mcp_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_mcp {
             return;
         }
         let p = self.p;
-        let exe = std::env::current_exe().map(|x| x.to_string_lossy().to_string()).unwrap_or("simcraft".into());
-        let cmd = format!("claude mcp add --scope user simcraft -- {exe} mcp");
-        let js = format!("{{\n  \"mcpServers\": {{\n    \"simcraft\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"mcp\"]\n    }}\n  }}\n}}");
-        let ok = self.bridge.starts_with("MCP bridge listening");
-        let now = ctx.input(|i| i.time);
         let mut open = true;
-        let mut copy: Option<(&'static str, String)> = None;
         egui::Window::new(RichText::new("Connect an AI agent").strong())
             .open(&mut open)
             .collapsible(false)
@@ -28,54 +90,8 @@ impl SimApp {
             .frame(egui::Frame::window(&ctx.global_style()).fill(p.card).inner_margin(18))
             .show(ctx, |ui| {
                 ui.set_width(560.0);
-                ui.label(RichText::new("Let Claude Code, Antigravity or any MCP client build models, run solves and look at results in this window.").color(p.weak));
-                ui.add_space(10.0);
-                egui::Frame::new().fill(if ok { p.ok.gamma_multiply(0.12) } else { p.warn.gamma_multiply(0.12) }).corner_radius(8).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(if ok { "●" } else { "○" }).color(if ok { p.ok } else { p.warn }));
-                        ui.label(RichText::new(if ok { "Ready — agents connected to SimCraft drive this window live" } else { "Bridge offline — another SimCraft window may already be using the port" }).strong());
-                    });
-                    ui.label(RichText::new(&self.bridge).small().color(p.weak));
-                });
-                ui.add_space(14.0);
-                let mut block = |ui: &mut egui::Ui, step: &str, title: &str, hint: &str, text: &str, key: &'static str| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(step).strong().color(p.accent));
-                        ui.label(RichText::new(title).strong());
-                    });
-                    ui.label(RichText::new(hint).small().color(p.weak));
-                    ui.add_space(4.0);
-                    egui::Frame::new().fill(if p.dark { Color32::from_rgb(22, 24, 28) } else { Color32::from_rgb(244, 245, 248) }).stroke(Stroke::new(1.0, p.border)).corner_radius(8).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal_top(|ui| {
-                            let copied = self.copied.is_some_and(|(k, t)| k == key && now - t < 1.8);
-                            let label = if copied { "✔ Copied" } else { "📋 Copy" };
-                            let btn = ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                let b = ui.add(egui::Button::new(RichText::new(label).small()).min_size(vec2(78.0, 24.0)));
-                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                                    egui::ScrollArea::horizontal().id_salt(key).show(ui, |ui| {
-                                        ui.add(egui::Label::new(RichText::new(text).monospace().size(12.0)).extend());
-                                    });
-                                });
-                                b
-                            });
-                            if btn.inner.clicked() {
-                                copy = Some((key, text.to_string()));
-                            }
-                        });
-                    });
-                    ui.add_space(14.0);
-                };
-                block(ui, "1", "Claude Code", "Run once in a terminal; SimCraft is then available in every Claude Code session.", &cmd, "claude");
-                block(ui, "2", "Antigravity, Cursor and other MCP clients", "Paste into the client's MCP config (Antigravity: Agent panel ▸ ⋯ ▸ MCP Servers ▸ Manage ▸ View raw config).", &js, "json");
-                ui.label(RichText::new("Try asking: “In SimCraft, make an aluminium bracket with a hole, fix one end, load the other and show me the stress.”").small().italics().color(p.weak));
+                mcp_connect_panel(self, ctx, ui);
             });
-        if let Some((k, t)) = copy {
-            ctx.copy_text(t);
-            self.copied = Some((k, now));
-            ctx.request_repaint_after(std::time::Duration::from_millis(1900));
-        }
         if !open {
             self.show_mcp = false;
         }

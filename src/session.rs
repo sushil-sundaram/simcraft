@@ -750,7 +750,7 @@ impl Core {
             let models = crate::assistant::list_models()?;
             return Ok(Output::json(json!({"server": crate::assistant::base_url(), "models": models, "default": crate::assistant::default_model(&models)})));
         }
-        if self.is_busy() && !matches!(tool, "get_model" | "get_help" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "plot_path" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets") {
+        if self.is_busy() && !matches!(tool, "get_model" | "get_help" | "get_results" | "list_faces" | "list_materials" | "list_tools" | "render_image" | "probe" | "plot_path" | "get_status" | "set_display" | "get_selection" | "get_plan" | "set_plan_step" | "get_study" | "list_parameter_targets" | "preflight") {
             bail!("a solve is running; wait for it to finish (use get_status)");
         }
         let ws = self.workspace_dir();
@@ -763,6 +763,12 @@ impl Core {
             "get_status" => {
                 let p = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                 Ok(Output::json(json!({"solving": p.running, "progress": p.fraction, "message": p.message, "last_error": s.last_error, "unsaved_changes": s.is_dirty(), "project": s.project_path, "recent_log": s.log.iter().rev().take(8).rev().collect::<Vec<_>>()})))
+            }
+            "preflight" => {
+                let mesh_opt = if s.mesh_valid() { s.mesh.as_deref() } else { None };
+                let items = crate::model::preflight_check(&s.model, mesh_opt, s.element_size());
+                let ready = !items.iter().any(|x| x.status == crate::model::PreflightStatus::Fail);
+                Ok(Output::json(json!({"ready": ready, "items": items})))
             }
             "new_model" => {
                 let rev = s.revision;
@@ -900,6 +906,8 @@ impl Core {
                 if s.model.bodies.len() == before {
                     bail!("no body named '{name}'");
                 }
+                s.display.hidden_bodies.retain(|x| !x.eq_ignore_ascii_case(name));
+                s.display.ghost_bodies.retain(|x| !x.eq_ignore_ascii_case(name));
                 s.touch_geometry();
                 s.log(format!("Removed body '{name}'"));
                 Ok(Output::text(format!("Removed body '{name}'. Note: loads that referenced its faces may now fail; check get_model.")))
@@ -1520,6 +1528,22 @@ impl Core {
                 if let Some(b) = a.get("translucent_enclosure").and_then(|v| v.as_bool()) {
                     s.display.translucent_enclosure = b;
                 }
+                if a.get("show_all_bodies").and_then(|v| v.as_bool()) == Some(true) {
+                    s.display.hidden_bodies.clear();
+                    s.display.ghost_bodies.clear();
+                }
+                if let Some(arr) = a.get("hidden_bodies").and_then(|v| v.as_array()) {
+                    s.display.hidden_bodies = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    for n in &s.display.hidden_bodies {
+                        s.display.ghost_bodies.remove(n);
+                    }
+                }
+                if let Some(arr) = a.get("ghost_bodies").and_then(|v| v.as_array()) {
+                    s.display.ghost_bodies = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    for n in &s.display.ghost_bodies {
+                        s.display.hidden_bodies.remove(n);
+                    }
+                }
                 apply_section(&mut s.display, a)?;
                 apply_cylindrical(&mut s.display.cylindrical, a)?;
                 if let Some(v) = opt_str(a, "view") {
@@ -1975,7 +1999,12 @@ impl Core {
         };
         *self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Progress { running: true, fraction: 0.0, message: format!("Planning with {model}…") };
         self.changed();
-        let r = crate::assistant::plan(&goal, &model);
+        let live_ctx = {
+            let s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let m = if s.mesh_valid() { s.mesh.as_deref() } else { None };
+            crate::assistant::model_context_json(&s.model, m, &s.selection, s.element_size(), s.last_error.as_deref())
+        };
+        let r = crate::assistant::plan_with_context(&goal, &model, Some(&live_ctx));
         self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).running = false;
         let p = r?;
         let md = crate::assistant::to_markdown(&p);
@@ -2149,6 +2178,7 @@ pub fn tool_defs() -> Vec<Value> {
         t("get_model", "Get the whole model: bodies, materials, analysis type, supports/loads, mesh status, display state and faces the user has selected in the GUI.", json!({}), &[]),
         t("cancel", "Stop the running solve or study (it stops at its next progress step; results of a cancelled solve are discarded).", json!({}), &[]),
         t("get_status", "Solver progress, last error and recent log lines.", json!({}), &[]),
+        t("preflight", "Pre-solve readiness check against physics solver requirements (supports, loads, enclosures, mesh wavelength).", json!({}), &[]),
         t("new_model", "Discard everything and start an empty model.", json!({}), &[]),
         t("add_box", "Add a rectangular block (mm). Faces: <name>.xmin/xmax/ymin/ymax/zmin/zmax.", json!({"name": name, "min": v3s("Min corner [x,y,z] mm (default origin)"), "size": v3s("Size [dx,dy,dz] mm"), "operation": op, "material": mat}), &["size"]),
         t("add_cylinder", "Add a cylinder (mm) or, with operation=subtract, drill a hole. Faces: <name>.side/bottom/top.", json!({"name": name, "base": v3s("Centre of the bottom cap [x,y,z] mm"), "axis": {"type": "string", "enum": ["x", "y", "z"]}, "radius": {"type": "number"}, "height": {"type": "number", "description": "Length along the axis from base"}, "operation": op, "material": mat}), &["radius", "height"]),
@@ -2197,8 +2227,8 @@ pub fn tool_defs() -> Vec<Value> {
         t("get_results", "Summary of the last solution: min/max with locations, reaction forces / heat flows, natural frequencies.", json!({}), &[]),
         t("probe", "Result values at the node nearest to a point (mm), including radial/hoop/axial stresses around the cylindrical axis.", json!({"point": v3s("[x,y,z] mm"), "mode": {"type": "integer", "description": "1-based mode number for modal"}, "cylindrical_origin": v3s("Origin on cylindrical axis mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}}), &["point"]),
         t("plot_path", "Sample any result field along a straight line segment from 'from' to 'to' [x,y,z] mm, returning sample points, min/max/mean and CSV (optionally written to csv_path).", json!({"from": v3s("Start [x,y,z] mm"), "to": v3s("End [x,y,z] mm"), "field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "samples": {"type": "integer", "description": "2..=500 points (default 50)"}, "mode": {"type": "integer"}, "cylindrical_origin": v3s("Cylindrical origin mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}, "csv_path": {"type": "string", "description": "optional .csv output file path"}}), &["from", "to"]),
-        t("set_display", "Change what the GUI viewport shows (including cylindrical coordinate origin/axis, perspective projection, and translucent enclosure walls).", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean"}, "mode": {"type": "integer"}, "deformation_scale": {"description": "number, or \"auto\"; 0 = undeformed, 1 = true scale"}, "show_mesh": {"type": "boolean"}, "dark_mode": {"type": "boolean", "description": "Dark UI and viewport theme"}, "perspective": {"type": "boolean", "description": "Use 3D perspective camera (false = orthographic)"}, "translucent_enclosure": {"type": "boolean", "description": "Render enclosure walls as translucent glass"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"], "description": "Cut-plane view through the domain (great for fields in air and fluid flow)"}, "section_position": {"type": "number", "description": "0..1 across the domain (default 0.5)"}, "cylindrical_origin": v3s("Origin [x,y,z] mm for radial/hoop/axial stresses (default [0,0,0])"), "cylindrical_axis": {"description": "'x', 'y', 'z' or direction [dx,dy,dz] for cylindrical stresses (default 'z')"}, "view": {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top", "bottom", "iso_back", "fit"]}}), &[]),
-        t("render_image", "Render a PNG picture of the model or of a result contour so you can see it.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean", "description": "false = show geometry with supports/loads"}, "mode": {"type": "integer"}, "view": {"type": "string", "enum": render::VIEWS}, "deformation_scale": {"type": "number"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"]}, "section_position": {"type": "number"}, "cylindrical_origin": v3s("Cylindrical origin mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}, "width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
+        t("set_display", "Change what the GUI viewport shows (including cylindrical coordinate origin/axis, perspective projection, translucent enclosure walls, and per-body hidden/ghost visibility).", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean"}, "mode": {"type": "integer"}, "deformation_scale": {"description": "number, or \"auto\"; 0 = undeformed, 1 = true scale"}, "show_mesh": {"type": "boolean"}, "dark_mode": {"type": "boolean", "description": "Dark UI and viewport theme"}, "perspective": {"type": "boolean", "description": "Use 3D perspective camera (false = orthographic)"}, "translucent_enclosure": {"type": "boolean", "description": "Render enclosure walls as translucent glass"}, "hidden_bodies": {"type": "array", "items": {"type": "string"}, "description": "Body names to hide in the viewport"}, "ghost_bodies": {"type": "array", "items": {"type": "string"}, "description": "Body names to render as translucent click-through ghost"}, "show_all_bodies": {"type": "boolean", "description": "Clear all hidden and ghost body overrides"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"], "description": "Cut-plane view through the domain (great for fields in air and fluid flow)"}, "section_position": {"type": "number", "description": "0..1 across the domain (default 0.5)"}, "cylindrical_origin": v3s("Origin [x,y,z] mm for radial/hoop/axial stresses (default [0,0,0])"), "cylindrical_axis": {"description": "'x', 'y', 'z' or direction [dx,dy,dz] for cylindrical stresses (default 'z')"}, "view": {"type": "string", "enum": ["iso", "front", "back", "left", "right", "top", "bottom", "iso_back", "fit"]}}), &[]),
+        t("render_image", "Render a PNG picture of the model or of a result contour so you can see it.", json!({"field": {"type": "string", "enum": Field::all().iter().map(|f| f.key()).collect::<Vec<_>>()}, "show_results": {"type": "boolean", "description": "false = show geometry with supports/loads"}, "mode": {"type": "integer"}, "view": {"type": "string", "enum": render::VIEWS}, "deformation_scale": {"type": "number"}, "perspective": {"type": "boolean"}, "translucent_enclosure": {"type": "boolean"}, "section": {"type": "string", "enum": ["off", "x", "y", "z"]}, "section_position": {"type": "number"}, "cylindrical_origin": v3s("Cylindrical origin mm (optional)"), "cylindrical_axis": {"description": "'x', 'y', 'z' or [dx,dy,dz] (optional)"}, "width": {"type": "integer"}, "height": {"type": "integer"}}), &[]),
         t("export_vtk", "Write mesh + results to a legacy .vtk file for ParaView.", json!({"path": {"type": "string"}}), &["path"]),
         t("save_project", "Save the project (.simcraft JSON).", json!({"path": {"type": "string"}}), &[]),
         t("open_project", "Open a .simcraft project.", json!({"path": {"type": "string"}}), &["path"]),

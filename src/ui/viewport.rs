@@ -2,7 +2,8 @@
 //! software rasterizer fallback), BVH face picking, probes/path overlay, legend, and view toolbar.
 
 use super::gl_viewport::{DrawParams, UploadKey};
-use super::{DrawerTab, MeshJob, RenderKey, SimApp};
+use super::overlays::{draw_context_menu, draw_ghost_and_gizmo, draw_hover_highlight, draw_load_glyphs, draw_view_cube};
+use super::{DrawerTab, Form, MeshJob, RenderKey, SelectMode, SimApp};
 use crate::geometry::{add, dot, scale};
 use crate::render;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
@@ -84,6 +85,7 @@ impl SimApp {
 
         let (_, bb) = render::background(self.dark);
         let c32 = |c: [f32; 3]| Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
+        let ghost_form = matches!(self.form, Form::Box | Form::Cylinder | Form::Sphere | Form::Enclosure);
         let Some(mesh) = mesh else {
             painter.rect_filled(rect, 0.0, c32(bb));
             if self.mesh_job.is_some() {
@@ -96,6 +98,17 @@ impl SimApp {
                         self.mesh_err = Some((j.key, "Meshing cancelled.".into()));
                     }
                 }
+            } else if ghost_form {
+                if resp.dragged_by(egui::PointerButton::Primary) && !ui.input(|i| i.key_down(egui::Key::Space)) {
+                    let d = resp.drag_delta();
+                    self.cam.orbit(d.x as f64, d.y as f64);
+                } else if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) || (resp.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.key_down(egui::Key::Space))) {
+                    let d = resp.drag_delta();
+                    self.cam.pan(d.x as f64, d.y as f64);
+                }
+                draw_ghost_and_gizmo(self, ui, &self.cam.clone(), rect, &painter, None);
+                draw_view_cube(self, ui, rect, &painter);
+                painter.text(rect.left_top() + vec2(14.0, 14.0), Align2::LEFT_TOP, "Live ghost preview — drag X/Y/Z handles or click Create", FontId::proportional(13.0), p.weak);
             } else {
                 let (title, sub) = match &self.mesh_err {
                     Some((_, e)) => ("⚠  Geometry / mesh notice".to_string(), e.clone()),
@@ -140,28 +153,45 @@ impl SimApp {
             self.need_fit = false;
         }
 
-        // ---- input
-        let dragging = resp.dragged();
-        if resp.dragged_by(egui::PointerButton::Primary) {
+        // ---- input (orbit / pan / zoom + trackpad Space+drag & pinch gestures)
+        let dragging = resp.dragged() && !self.gizmo_busy;
+        let space_down = ui.input(|i| i.key_down(egui::Key::Space));
+        if resp.dragged_by(egui::PointerButton::Primary) && !self.gizmo_busy {
             let d = resp.drag_delta();
-            self.cam.orbit(d.x as f64, d.y as f64);
+            if space_down {
+                self.cam.pan(d.x as f64, d.y as f64);
+            } else {
+                self.cam.orbit(d.x as f64, d.y as f64);
+            }
         } else if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
             let d = resp.drag_delta();
             self.cam.pan(d.x as f64, d.y as f64);
         }
         if resp.hovered() {
-            let dy = ui.input(|i| i.smooth_scroll_delta.y);
-            if dy != 0.0 {
-                let old = self.cam.zoom;
-                let new = (old * (dy as f64 * 0.003).exp()).clamp(1e-4, 1e6);
-                if let Some(hp) = resp.hover_pos() {
-                    let (r, u, _) = self.cam.basis();
+            let (scroll, mods, zoom_pinch, hover_pos) = ui.input(|i| (i.smooth_scroll_delta, i.modifiers, i.zoom_delta(), i.pointer.hover_pos()));
+            let zoom_around = |cam: &mut render::Camera, factor: f64| {
+                let old = cam.zoom;
+                let new = (old * factor).clamp(1e-4, 1e6);
+                if let Some(hp) = hover_pos.or(resp.hover_pos()) {
+                    let (r, u, _) = cam.basis();
                     let k = 1.0 / old - 1.0 / new;
                     let ox = (hp.x - rect.center().x) as f64 * k;
                     let oy = (rect.center().y - hp.y) as f64 * k;
-                    self.cam.target = add(self.cam.target, add(scale(r, ox), scale(u, oy)));
+                    cam.target = add(cam.target, add(scale(r, ox), scale(u, oy)));
                 }
-                self.cam.zoom = new;
+                cam.zoom = new;
+            };
+            if (zoom_pinch - 1.0).abs() > 1e-4 {
+                zoom_around(&mut self.cam, zoom_pinch as f64);
+            }
+            if scroll.x != 0.0 || scroll.y != 0.0 {
+                if self.trackpad_pan && !(mods.ctrl || mods.command) {
+                    self.cam.pan(scroll.x as f64, scroll.y as f64);
+                } else if !self.trackpad_pan && mods.shift {
+                    self.cam.pan(scroll.x as f64, scroll.y as f64);
+                } else if scroll.y != 0.0 {
+                    zoom_around(&mut self.cam, (scroll.y as f64 * 0.003).exp());
+                }
             }
         }
 
@@ -236,9 +266,19 @@ impl SimApp {
             }
         }
 
-        // ---- picking + hover (evaluated upfront before mutating UI drawer state)
+        // ---- picking + hover + right-click depth peel
         let clicked_pos = resp.clicked().then(|| resp.interact_pointer_pos()).flatten();
+        let right_clicked_pos = resp.secondary_clicked().then(|| resp.interact_pointer_pos()).flatten();
         let hover_pos = (!dragging).then(|| resp.hover_pos()).flatten();
+        if let Some(rc_pos) = right_clicked_pos {
+            self.ctx_menu_pos = Some(rc_pos);
+            self.ctx_hits = if let Some(gs) = &gpu_scene_opt {
+                gs.picker.pick_all(&self.cam, (rc_pos.x - rect.min.x) as f64, (rc_pos.y - rect.min.y) as f64, rect.width() as f64, rect.height() as f64, anim, false)
+            } else {
+                let gs = render::build_gpu_scene(&mesh, &model, results.as_deref(), &display, &self.selected);
+                gs.picker.pick_all(&self.cam, (rc_pos.x - rect.min.x) as f64, (rc_pos.y - rect.min.y) as f64, rect.width() as f64, rect.height() as f64, anim, false)
+            };
+        }
         let (clicked_fid, hover_fid) = {
             let pick = |pos: Pos2| -> Option<u32> {
                 if let Some(gs) = &gpu_scene_opt {
@@ -301,6 +341,33 @@ impl SimApp {
         } else if clicked_pos.is_some() {
             let shift = ui.input(|i| i.modifiers.shift || i.modifiers.command);
             match clicked_fid {
+                Some(fid) if self.select_mode == SelectMode::Body => {
+                    let face = &mesh.faces[fid as usize];
+                    let bi = mesh.elem_body.get(face.elem as usize).copied().unwrap_or(0) as usize;
+                    if let Some(bname) = mesh.body_names.get(bi).cloned() {
+                        if shift {
+                            if !self.sel_bodies.remove(&bname) {
+                                self.sel_bodies.insert(bname.clone());
+                            }
+                            self.sel_body = self.sel_bodies.iter().next().cloned();
+                        } else {
+                            self.sel_bodies.clear();
+                            self.sel_bodies.insert(bname.clone());
+                            self.sel_body = Some(bname.clone());
+                            self.sel_load = None;
+                            self.form = Form::None;
+                            self.props_open = true;
+                        }
+                        self.selected.clear();
+                        let active_bodies: std::collections::HashSet<&str> = self.sel_bodies.iter().map(String::as_str).collect();
+                        for f2 in &mesh.faces {
+                            let b2 = mesh.elem_body.get(f2.elem as usize).copied().unwrap_or(0) as usize;
+                            if mesh.body_names.get(b2).is_some_and(|n| active_bodies.contains(n.as_str())) {
+                                self.selected.insert(f2.patch);
+                            }
+                        }
+                    }
+                }
                 Some(fid) => {
                     let patch = mesh.faces[fid as usize].patch;
                     if shift {
@@ -314,16 +381,31 @@ impl SimApp {
                         self.selected.insert(patch);
                     }
                 }
-                None if !shift => self.selected.clear(),
+                None if !shift => {
+                    self.selected.clear();
+                    self.sel_bodies.clear();
+                }
                 None => {}
             }
             self.sel_version += 1;
         }
+        let cam_copy = self.cam;
+        draw_hover_highlight(self, &cam_copy, rect, &painter, &mesh, hover_fid);
+        if self.show_glyphs && !display.show_results {
+            draw_load_glyphs(&cam_copy, rect, &painter, &model, &mesh, self.sel_load, &display.hidden_bodies);
+        }
+        draw_ghost_and_gizmo(self, ui, &cam_copy, rect, &painter, Some(&mesh));
         let text_col = if self.dark { Color32::from_gray(235) } else { Color32::from_gray(25) };
         let card_fill = p.card.gamma_multiply(0.92);
         if let (Some(hp), Some(fid)) = (hover_pos, hover_fid) {
             if let Some(pi) = mesh.patches.get(mesh.faces[fid as usize].patch as usize) {
-                let galley = painter.layout_no_wrap(pi.name.clone(), FontId::proportional(12.0), text_col);
+                let bi = mesh.elem_body.get(mesh.faces[fid as usize].elem as usize).copied().unwrap_or(0) as usize;
+                let tip = if self.select_mode == SelectMode::Body {
+                    format!("Body: {}  ({})", mesh.body_names.get(bi).map(String::as_str).unwrap_or(""), pi.name)
+                } else {
+                    pi.name.clone()
+                };
+                let galley = painter.layout_no_wrap(tip, FontId::proportional(12.0), text_col);
                 let r = Rect::from_min_size(hp + vec2(14.0, 12.0), galley.size() + vec2(12.0, 6.0));
                 painter.rect(r, 5.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
                 painter.galley(r.min + vec2(6.0, 3.0), galley, text_col);
@@ -420,7 +502,7 @@ impl SimApp {
             painter.galley(r.min + vec2(10.0, 6.0), galley, text_col);
         }
 
-        // ---- axis triad
+        // ---- axis triad + interactive ViewCube + right-click context menu
         let (r, u, _) = self.cam.basis();
         let c0 = Pos2::new(rect.left() + 52.0, rect.bottom() - 52.0);
         painter.circle(c0, 40.0, card_fill, Stroke::new(1.0, p.border));
@@ -431,13 +513,14 @@ impl SimApp {
             painter.line_segment([c0, c0 + d], Stroke::new(2.5, *col));
             painter.text(c0 + d * 1.28, Align2::CENTER_CENTER, *name, FontId::proportional(11.0), *col);
         }
+        draw_view_cube(self, ui, rect, &painter);
 
-        // ---- view toolbar (top right)
+        // ---- view & selection toolbar (top right)
         let has_enc = mesh.with_enclosure;
-        let views = [("⛶", "fit", "Fit all"), ("◩", "iso", "Isometric"), ("▣", "front", "Front"), ("⬒", "top", "Top"), ("◨", "right", "Right"), ("◧", "left", "Left")];
-        let extra = if has_enc { 2 } else { 1 };
-        let tbw = views.len() as f32 * 30.0 + extra as f32 * 52.0 + 10.0;
-        let tby = if rect.width() < 640.0 { rect.bottom() - 48.0 } else { rect.top() + 14.0 };
+        let views = [("⛶", "fit", "Fit all (F)"), ("◩", "iso", "Isometric (1)"), ("▣", "front", "Front (2)"), ("⬒", "top", "Top (4)"), ("◨", "right", "Right (5)"), ("◧", "left", "Left (6)")];
+        let extra_pills = 2 + if has_enc { 1 } else { 0 } + 1; // Face/Body, Persp, Glyphs, (Glass)
+        let tbw = views.len() as f32 * 30.0 + extra_pills as f32 * 52.0 + 12.0;
+        let tby = if rect.width() < 760.0 { rect.bottom() - 48.0 } else { rect.top() + 14.0 };
         let tb = Rect::from_min_size(pos2(rect.right() - 14.0 - tbw, tby), vec2(tbw, 34.0));
         painter.rect(tb, 10.0, card_fill, Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
         for (i, (icon, view, tip)) in views.iter().enumerate() {
@@ -456,31 +539,34 @@ impl SimApp {
             }
         }
         let mut ex = tb.min.x + 6.0 + views.len() as f32 * 30.0;
-        let p_rect = Rect::from_min_size(pos2(ex, tb.min.y + 4.0), vec2(48.0, 26.0));
-        let pr = ui.interact(p_rect, ui.scope_id().with("persp"), Sense::click()).on_hover_text("Toggle Orthographic / Perspective projection");
-        if display.perspective {
-            painter.rect_filled(p_rect, 6.0, p.accent.gamma_multiply(0.22));
-        } else if pr.hovered() {
-            painter.rect_filled(p_rect, 6.0, p.hover);
+        let pill = |ex: &mut f32, id: &str, lbl: &str, active: bool, tip: &str| -> bool {
+            let pr = Rect::from_min_size(pos2(*ex, tb.min.y + 4.0), vec2(48.0, 26.0));
+            let r = ui.interact(pr, ui.scope_id().with(id), Sense::click()).on_hover_text(tip);
+            if active {
+                painter.rect_filled(pr, 6.0, p.accent.gamma_multiply(0.22));
+            } else if r.hovered() {
+                painter.rect_filled(pr, 6.0, p.hover);
+            }
+            painter.text(pr.center(), Align2::CENTER_CENTER, lbl, FontId::proportional(11.5), if active { p.accent } else { text_col });
+            *ex += 50.0;
+            r.clicked()
+        };
+        if pill(&mut ex, "selmode", if self.select_mode == SelectMode::Body { "Body" } else { "Face" }, self.select_mode == SelectMode::Body, "Toggle Face / Body viewport selection") {
+            self.select_mode = match self.select_mode {
+                SelectMode::Face => SelectMode::Body,
+                SelectMode::Body => SelectMode::Face,
+            };
         }
-        painter.text(p_rect.center(), Align2::CENTER_CENTER, if display.perspective { "Persp" } else { "Ortho" }, FontId::proportional(11.5), if display.perspective { p.accent } else { text_col });
-        if pr.clicked() {
+        if pill(&mut ex, "glyphs", "Glyphs", self.show_glyphs, "Show / hide 3D load & BC glyphs") {
+            self.show_glyphs = !self.show_glyphs;
+        }
+        if pill(&mut ex, "persp", if display.perspective { "Persp" } else { "Ortho" }, display.perspective, "Toggle Orthographic / Perspective projection (P)") {
             self.run("set_display", json!({"perspective": !display.perspective}));
         }
-        ex += 50.0;
-        if has_enc {
-            let g_rect = Rect::from_min_size(pos2(ex, tb.min.y + 4.0), vec2(48.0, 26.0));
-            let gr = ui.interact(g_rect, ui.scope_id().with("glass"), Sense::click()).on_hover_text("Toggle translucent glass enclosure");
-            if display.translucent_enclosure {
-                painter.rect_filled(g_rect, 6.0, p.accent.gamma_multiply(0.22));
-            } else if gr.hovered() {
-                painter.rect_filled(g_rect, 6.0, p.hover);
-            }
-            painter.text(g_rect.center(), Align2::CENTER_CENTER, "Glass", FontId::proportional(11.5), if display.translucent_enclosure { p.accent } else { text_col });
-            if gr.clicked() {
-                self.run("set_display", json!({"translucent_enclosure": !display.translucent_enclosure}));
-            }
+        if has_enc && pill(&mut ex, "glass", "Glass", display.translucent_enclosure, "Toggle translucent glass enclosure") {
+            self.run("set_display", json!({"translucent_enclosure": !display.translucent_enclosure}));
         }
+        draw_context_menu(self, ui, &mesh, &model);
 
         if self.mesh_job.is_some() {
             let pill = Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 24.0), vec2(210.0, 28.0));

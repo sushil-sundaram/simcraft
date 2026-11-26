@@ -86,7 +86,7 @@ varying_in float v_nrm_fwd;
 out vec4 o_color;
 
 void main() {
-    if (v_kind < 0.5 && v_nrm_fwd > 0.05) {
+    if ((v_kind < 0.5 || v_kind > 2.5) && v_nrm_fwd > 0.05) {
         discard;
     }
     if (u_enclosure_alpha > 0.99 && v_kind > 0.5 && v_kind < 1.5 && v_nrm_fwd < -0.05) {
@@ -107,7 +107,7 @@ void main() {
         float line = 1.0 - smoothstep(0.0, 1.15, dist);
         col *= mix(1.0, 0.55, line * show);
     }
-    float alpha = (v_kind > 0.5 && v_kind < 1.5) ? u_enclosure_alpha : 1.0;
+    float alpha = (v_kind > 2.5) ? 0.22 : ((v_kind > 0.5 && v_kind < 1.5) ? u_enclosure_alpha : 1.0);
     o_color = vec4(col, alpha);
 }
 "#;
@@ -293,8 +293,10 @@ struct Inner {
     vbo_mesh: glow::Buffer,
     ebo_solid: glow::Buffer,
     ebo_enc: glow::Buffer,
+    ebo_ghost: glow::Buffer,
     solid_len: i32,
     enc_len: i32,
+    ghost_len: i32,
     vao_line: glow::VertexArray,
     vbo_line: glow::Buffer,
     line_len: i32,
@@ -331,6 +333,7 @@ impl GlViewport {
         let vbo_mesh = unsafe { gl.create_buffer()? };
         let ebo_solid = unsafe { gl.create_buffer()? };
         let ebo_enc = unsafe { gl.create_buffer()? };
+        let ebo_ghost = unsafe { gl.create_buffer()? };
         let stride = std::mem::size_of::<GpuVertex>() as i32;
         unsafe {
             gl.bind_vertex_array(Some(vao_mesh));
@@ -395,8 +398,10 @@ impl GlViewport {
                 vbo_mesh,
                 ebo_solid,
                 ebo_enc,
+                ebo_ghost,
                 solid_len: 0,
                 enc_len: 0,
+                ghost_len: 0,
                 vao_line,
                 vbo_line,
                 line_len: 0,
@@ -553,6 +558,8 @@ impl Inner {
             gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, bytemuck::cast_slice(&scene.solid_indices), glow::STATIC_DRAW);
             gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.ebo_enc));
             gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, bytemuck::cast_slice(&scene.enclosure_indices), glow::STATIC_DRAW);
+            gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.ebo_ghost));
+            gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, bytemuck::cast_slice(&scene.ghost_indices), glow::STATIC_DRAW);
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo_line));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck::cast_slice(&scene.undeformed_lines), glow::STATIC_DRAW);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
@@ -560,6 +567,7 @@ impl Inner {
         }
         self.solid_len = scene.solid_indices.len() as i32;
         self.enc_len = scene.enclosure_indices.len() as i32;
+        self.ghost_len = scene.ghost_indices.len() as i32;
         self.line_len = scene.undeformed_lines.len() as i32;
         self.lo = scene.lo;
         self.hi = scene.hi;
@@ -713,6 +721,16 @@ impl Inner {
                     gl.draw_elements(glow::TRIANGLES, self.enc_len, glow::UNSIGNED_INT, 0);
                 }
             }
+            if self.ghost_len > 0 {
+                gl.enable(glow::BLEND);
+                gl.blend_func_separate(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA, glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+                u1("u_enclosure_alpha", 0.22);
+                gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(self.ebo_ghost));
+                gl.draw_elements(glow::TRIANGLES, self.ghost_len, glow::UNSIGNED_INT, 0);
+                gl.depth_mask(true);
+                gl.disable(glow::BLEND);
+            }
 
             if t.fbo_msaa.is_some() {
                 gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(draw_fbo));
@@ -756,6 +774,7 @@ impl Inner {
             self.gl.delete_buffer(self.vbo_mesh);
             self.gl.delete_buffer(self.ebo_solid);
             self.gl.delete_buffer(self.ebo_enc);
+            self.gl.delete_buffer(self.ebo_ghost);
             self.gl.delete_vertex_array(self.vao_line);
             self.gl.delete_buffer(self.vbo_line);
             self.gl.delete_vertex_array(self.vao_quad);

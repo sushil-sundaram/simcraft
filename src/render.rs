@@ -137,6 +137,12 @@ pub struct Display {
     /// Draw enclosure walls as translucent glass instead of backface-culling only near walls.
     #[serde(default)]
     pub translucent_enclosure: bool,
+    /// Names of bodies hidden from viewport rendering and picking.
+    #[serde(default)]
+    pub hidden_bodies: HashSet<String>,
+    /// Names of solid bodies rendered as translucent ghost overlays (click-through).
+    #[serde(default)]
+    pub ghost_bodies: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -160,6 +166,8 @@ impl Default for Display {
             cylindrical: CylindricalAxis::default(),
             perspective: false,
             translucent_enclosure: false,
+            hidden_bodies: HashSet::new(),
+            ghost_bodies: HashSet::new(),
         }
     }
 }
@@ -340,6 +348,28 @@ impl QuadPicker {
         (t > 1e-6).then_some(t)
     }
 
+    fn quad_hit(q: &PickQuad, orig: V3, dir: V3, anim: f64, skip_enclosure: bool, skip_ghost: bool) -> Option<(f64, V3)> {
+        if (skip_enclosure && q.kind == 1) || (skip_ghost && q.kind == 3) {
+            return None;
+        }
+        let p = [
+            add(q.p0[0], scale(q.disp[0], anim)),
+            add(q.p0[1], scale(q.disp[1], anim)),
+            add(q.p0[2], scale(q.disp[2], anim)),
+            add(q.p0[3], scale(q.disp[3], anim)),
+        ];
+        let nrm = normalize(cross(sub(p[1], p[0]), sub(p[3], p[0])));
+        match q.kind {
+            0 if dot(nrm, dir) > 0.05 => return None,
+            1 if dot(nrm, dir) < -0.05 => return None,
+            3 if skip_ghost => return None,
+            3 if dot(nrm, dir) > 0.05 && !skip_ghost => {} // allow depth-peeling front & back ghost faces when not skipped
+            _ => {}
+        }
+        let t = Self::ray_tri(orig, dir, p[0], p[1], p[2]).or_else(|| Self::ray_tri(orig, dir, p[0], p[2], p[3]))?;
+        Some((t, add(orig, scale(dir, t))))
+    }
+
     /// Pick the closest visible face along camera ray at viewport coordinates `(sx, sy)` in points.
     pub fn pick(&self, cam: &Camera, sx: f64, sy: f64, w: f64, h: f64, anim: f64, skip_enclosure: bool) -> Option<(u32, V3)> {
         if self.nodes.is_empty() || w <= 0.0 || h <= 0.0 {
@@ -367,27 +397,10 @@ impl QuadPicker {
             }
             if nd.left == usize::MAX {
                 for &qi in &self.indices[nd.start..nd.start + nd.len] {
-                    let q = &self.quads[qi];
-                    if skip_enclosure && q.kind == 1 {
-                        continue;
-                    }
-                    let p = [
-                        add(q.p0[0], scale(q.disp[0], anim)),
-                        add(q.p0[1], scale(q.disp[1], anim)),
-                        add(q.p0[2], scale(q.disp[2], anim)),
-                        add(q.p0[3], scale(q.disp[3], anim)),
-                    ];
-                    let nrm = normalize(cross(sub(p[1], p[0]), sub(p[3], p[0])));
-                    match q.kind {
-                        0 if dot(nrm, dir) > 0.05 => continue,
-                        1 if dot(nrm, dir) < -0.05 => continue,
-                        _ => {}
-                    }
-                    let hit = Self::ray_tri(orig, dir, p[0], p[1], p[2]).or_else(|| Self::ray_tri(orig, dir, p[0], p[2], p[3]));
-                    if let Some(t) = hit {
+                    if let Some((t, pt)) = Self::quad_hit(&self.quads[qi], orig, dir, anim, skip_enclosure, true) {
                         if t < best_t {
                             best_t = t;
-                            best_face = Some((q.face, add(orig, scale(dir, t))));
+                            best_face = Some((self.quads[qi].face, pt));
                         }
                     }
                 }
@@ -411,12 +424,60 @@ impl QuadPicker {
         }
         best_face
     }
+
+    /// Return all faces hit along the ray sorted front-to-back (`(face_id, ray_t, world_point)`)
+    /// for right-click depth-peeling ("select behind").
+    pub fn pick_all(&self, cam: &Camera, sx: f64, sy: f64, w: f64, h: f64, anim: f64, skip_enclosure: bool) -> Vec<(u32, f64, V3)> {
+        if self.nodes.is_empty() || w <= 0.0 || h <= 0.0 {
+            return Vec::new();
+        }
+        let root = &self.nodes[0];
+        let half_depth = (norm(sub(root.hi, root.lo)) + root.max_d * anim.abs()).max(10.0) * 2.0;
+        let (orig, dir) = cam.ray(sx, sy, w, h, half_depth);
+        let inv_d = [
+            if dir[0].abs() > 1e-12 { 1.0 / dir[0] } else { 1e12_f64.copysign(dir[0]) },
+            if dir[1].abs() > 1e-12 { 1.0 / dir[1] } else { 1e12_f64.copysign(dir[1]) },
+            if dir[2].abs() > 1e-12 { 1.0 / dir[2] } else { 1e12_f64.copysign(dir[2]) },
+        ];
+        let mut hits = Vec::new();
+        let mut stack = vec![0usize];
+        let anim_scale = if anim.abs() < 1e-6 { 0.0 } else { anim.abs() };
+        while let Some(ni) = stack.pop() {
+            let nd = &self.nodes[ni];
+            if Self::ray_aabb(orig, inv_d, nd.lo, nd.hi, nd.max_d * anim_scale + 1e-4, f64::INFINITY).is_none() {
+                continue;
+            }
+            if nd.left == usize::MAX {
+                for &qi in &self.indices[nd.start..nd.start + nd.len] {
+                    let q = &self.quads[qi];
+                    if skip_enclosure && q.kind == 1 {
+                        continue;
+                    }
+                    let p = [
+                        add(q.p0[0], scale(q.disp[0], anim)),
+                        add(q.p0[1], scale(q.disp[1], anim)),
+                        add(q.p0[2], scale(q.disp[2], anim)),
+                        add(q.p0[3], scale(q.disp[3], anim)),
+                    ];
+                    if let Some(t) = Self::ray_tri(orig, dir, p[0], p[1], p[2]).or_else(|| Self::ray_tri(orig, dir, p[0], p[2], p[3])) {
+                        hits.push((q.face, t, add(orig, scale(dir, t))));
+                    }
+                }
+            } else {
+                stack.push(nd.left);
+                stack.push(nd.right);
+            }
+        }
+        hits.sort_by(|a, b| a.1.total_cmp(&b.1));
+        hits
+    }
 }
 
 pub struct GpuScene {
     pub vertices: Vec<GpuVertex>,
     pub solid_indices: Vec<u32>,
     pub enclosure_indices: Vec<u32>,
+    pub ghost_indices: Vec<u32>,
     pub undeformed_lines: Vec<[f32; 3]>,
     pub picker: QuadPicker,
     pub range: Option<(f64, f64)>,
@@ -503,10 +564,15 @@ fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &D
         if rev { 1.0 - t } else { t }
     };
 
+    let body_of_elem = |e: usize| mesh.elem_body.get(e).and_then(|&bi| mesh.body_names.get(bi as usize)).map(String::as_str);
     let mut quads = Vec::with_capacity(mesh.faces.len());
     let mut undeformed = Vec::new();
     let mut has_enclosure = false;
     for (fi, f) in mesh.faces.iter().enumerate() {
+        let bname = body_of_elem(f.elem as usize);
+        if bname.is_some_and(|n| disp.hidden_bodies.contains(n)) {
+            continue;
+        }
         if let Some((a, pc)) = section {
             if !f.outer && mesh.elem_center(f.elem as usize)[a] < pc {
                 continue;
@@ -516,6 +582,7 @@ fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &D
             has_enclosure = true;
         }
         let hl = highlight.contains(&f.patch);
+        let ghosted = !f.outer && bname.is_some_and(|n| disp.ghost_bodies.contains(n));
         let mut p0 = [[0.0; 3]; 4];
         let mut dv = [[0.0; 3]; 4];
         let mut tv = [f64::NAN; 4];
@@ -527,7 +594,7 @@ fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &D
                 Some(d) => scale(d[nid as usize], scale_used),
                 None => [0.0; 3],
             };
-            if disp.show_undeformed && defl.is_some() {
+            if disp.show_undeformed && defl.is_some() && !ghosted {
                 undeformed.push(base);
             }
             let (t, col) = match (&values, range) {
@@ -540,12 +607,16 @@ fn prepare_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, disp: &D
             tv[vi] = t;
             cv[vi] = col;
         }
-        quads.push(RawQuad { p0, disp: dv, t: tv, color: cv, face: fi as u32, kind: if f.outer { 1 } else { 0 } });
+        let kind = if f.outer { 1 } else if ghosted { 3 } else { 0 };
+        quads.push(RawQuad { p0, disp: dv, t: tv, color: cv, face: fi as u32, kind });
     }
     if let Some((a, pc)) = section {
         let (b, c) = ((a + 1) % 3, (a + 2) % 3);
         let h = mesh.h;
         for (e, en) in mesh.elems.iter().enumerate() {
+            if body_of_elem(e).is_some_and(|n| disp.hidden_bodies.contains(n)) {
+                continue;
+            }
             let lower = mesh.origin[a] + mesh.elem_cell[e][a] as f64 * h;
             if !(pc >= lower && pc < lower + h) {
                 continue;
@@ -656,6 +727,7 @@ pub fn build_gpu_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, di
     let mut vertices = Vec::with_capacity(prep.quads.len() * 4);
     let mut solid_indices = Vec::with_capacity(prep.quads.len() * 6);
     let mut enclosure_indices = Vec::new();
+    let mut ghost_indices = Vec::new();
     let mut pick_quads = Vec::with_capacity(prep.quads.len());
     let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
 
@@ -679,7 +751,11 @@ pub fn build_gpu_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, di
                 kind: q.kind as f32,
             });
         }
-        let target_idx = if q.kind == 1 { &mut enclosure_indices } else { &mut solid_indices };
+        let target_idx = match q.kind {
+            1 => &mut enclosure_indices,
+            3 => &mut ghost_indices,
+            _ => &mut solid_indices,
+        };
         target_idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         if q.face != u32::MAX {
             pick_quads.push(PickQuad { p0: q.p0, disp: q.disp, face: q.face, kind: q.kind });
@@ -698,6 +774,7 @@ pub fn build_gpu_scene(mesh: &Mesh, model: &Model, results: Option<&Results>, di
         vertices,
         solid_indices,
         enclosure_indices,
+        ghost_indices,
         undeformed_lines,
         picker: QuadPicker::build(pick_quads),
         range: prep.range,
@@ -766,7 +843,7 @@ pub fn rasterize(scene: &Scene, cam: &Camera, w: usize, h: usize, show_mesh: boo
             let nrm = normalize(cross(sub(p[1], p[0]), sub(p[3], p[0])));
             match scene.kind.get(qi).copied().unwrap_or(0) {
                 0 if dot(nrm, fwd) > 0.05 => return None,  // back face of a solid
-                1 if dot(nrm, fwd) < -0.05 => return None, // near enclosure wall: see through it
+                1 | 3 if dot(nrm, fwd) < -0.05 => return None, // near enclosure / ghosted wall: see through it
                 _ => {}
             }
             let shade = 0.38 + 0.62 * dot(nrm, light).abs();

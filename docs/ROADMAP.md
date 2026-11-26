@@ -239,7 +239,7 @@ Full line-by-line checklists live in `todo.md`. Two deployment targets were audi
 | P2.S | Security, path sandboxing & parser DoS hardening | S–M | blocks untrusted `.simcraft`/`.stl`/`.kicad_pcb`/MCP risk; prerequisite for web/STEP | done |
 | P2.A1 | Non-blocking meshing, STL BVH, `f32`/`f64` GPU split, undo & cancel cleanup | M | prevents UI freezes and panic-unwind hazards before `P2.3` (STEP) and `P2.5` (octree) | done |
 | P2.A2 | Hardware iGPU 3D viewport (`eframe::egui_glow`) + modular `src/ui/` & Workbench drawer | M–L | replaces 0.6× CPU `render.rs` drag rasterizer; unlocks smooth animations, perspective & translucent enclosures | done |
-| P2.U | CAE UX overhaul (3D glyphs, body pick/hide, unified edit forms, pre-flight, trackpad, Copilot) | M–L | best after `P2.A2` (hardware viewport + docked drawers) | planned |
+| P2.U | CAE UX overhaul (3D glyphs, body pick/hide, unified edit forms, pre-flight, trackpad, Copilot) | M–L | best after `P2.A2` (hardware viewport + docked drawers) | done |
 | P2.W | Web / Tauri split architecture (DOM + WebGL2/WebGPU UI + `axum` Rust backend / demo WASM) | L–XL | required for browser laptop/desktop delivery; depends on `P2.S` and `P2.A1` | planned |
 
 ### P2.S Security, path sandboxing & parser hardening (S–M) — done
@@ -303,20 +303,25 @@ Full line-by-line checklists live in `todo.md`. Two deployment targets were audi
   `Studies`, `PCB DC`, `Planner`, `Guide`) with a docked collapsible/resizable **🗂 Workbench** bottom drawer
   (with `↗ Pop out` / `⬇ Dock` per tab).
 
-### P2.U CAE UX overhaul (M–L)
+### P2.U CAE UX overhaul (M–L) — done
 
-- **3D clarity & direct manipulation**: Instanced 3D load/BC glyphs (force vectors, pressure normals,
-  constraint pins, fluid inlet arrows, coil axes); hover face/body highlight + body selection mode +
-  right-click depth-peeling for hidden faces; per-body hide/ghost/isolate toggles in the Browser
-  (essential for enclosures and `P2.3` assemblies); live ghost previews + 3D transform gizmos before
-  `Create` on primitives/enclosures; ViewCube alongside axis triad.
-- **Unified forms & pre-flight diagnostics**: Replace the raw `json_editor` fallback in `item_editor`
-  (`gui.rs:390, 2934`) with the same unit-aware, face-picker forms used during creation; add a live
-  pre-solve readiness checklist (`✓ Solid · ✓ Material · ✗ Needs Support · ⚠ Mesh > λ/10`); group
-  KiCad component bodies under their board in a searchable Browser.
-- **Laptop trackpad ergonomics & unified AI Copilot**: Support `Space+drag` / two-finger pan,
-  pinch-to-zoom, view/tool shortcuts (`F`, `1–6`, `Del`, `Esc`), unit-system switcher, and unify
-  `✨ Planner` + `Connect AI` into an in-app Copilot drawer proposing undoable tool actions.
+- **3D clarity & direct manipulation (`src/ui/overlays.rs`, `src/ui/viewport.rs`, `src/render.rs`)**:
+  3D projected load/BC glyphs across all load types (`draw_load_glyphs`), cached perimeter hover
+  highlighting + Face/Body selection mode, right-click **Select Behind (Depth Peel)** (`QuadPicker::pick_all`)
+  and body visibility menu, per-body hide/ghost (`kind = 3` translucent glass in GL + software
+  renderer)/isolate controls, live shape/transform ghost previews with interactive X/Y/Z 3D drag
+  handles + face-center snapping, and an interactive **ViewCube** alongside the axis triad.
+- **Unified forms & pre-flight diagnostics (`src/ui/properties.rs`, `src/ui/browser.rs`, `src/model.rs`, `src/ui/ribbon.rs`)**:
+  Replaced the raw `json_editor` fallback in `item_editor` with shared unit-aware forms + interactive
+  face chips for every body shape and all 20 load variants; added live `preflight_check` readiness
+  checklists (`✓`/`⚠`/`✗` chips + MCP `preflight` tool); added searchable, collapsible Browser with
+  KiCad PCB component grouping, multi-body batch actions, collapsible side panels, and PCB hot-track 3D
+  pinpointing (`tests/ux_p2_u.rs`).
+- **Laptop trackpad ergonomics & unified AI Copilot (`src/assistant.rs`, `src/ui/charts.rs`, `src/ui/header.rs`)**:
+  Added `Space+drag` / two-finger pan (`🖱 Pan`), pinch `zoom_delta()`, keyboard shortcuts (`F`, `1–6`,
+  `P`, `H`/`Shift+H`, `Delete`, `Escape`), persistent `UnitSystem` switcher (`mm·N·MPa`, `m·N·Pa`,
+  `in·lbf·psi`), and unified `✨ Copilot` (offline quick-fixes, solver issue diagnosis, live-grounded
+  Ollama plan with undoable tool execution, and embedded MCP setup).
 
 ### P2.W Web / Tauri split architecture (L–XL)
 
