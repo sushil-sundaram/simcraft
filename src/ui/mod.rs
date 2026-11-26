@@ -71,10 +71,28 @@ pub(super) enum LoadKind {
     Outlet,
     Port,
     MovingWall,
+    BoltPretension,
+    Spring,
+    RemoteForce,
+    RemoteDisplacement,
+    PointMass,
 }
 
 impl LoadKind {
-    pub(super) const STRUCTURAL: [LoadKind; 7] = [LoadKind::Fixed, LoadKind::Displacement, LoadKind::CompressionOnly, LoadKind::Symmetry, LoadKind::Force, LoadKind::Pressure, LoadKind::Gravity];
+    pub(super) const STRUCTURAL: [LoadKind; 12] = [
+        LoadKind::Fixed,
+        LoadKind::Displacement,
+        LoadKind::CompressionOnly,
+        LoadKind::Symmetry,
+        LoadKind::Force,
+        LoadKind::Pressure,
+        LoadKind::Gravity,
+        LoadKind::BoltPretension,
+        LoadKind::Spring,
+        LoadKind::RemoteForce,
+        LoadKind::RemoteDisplacement,
+        LoadKind::PointMass,
+    ];
     pub(super) const THERMAL: [LoadKind; 5] = [LoadKind::Temperature, LoadKind::HeatFlux, LoadKind::Convection, LoadKind::Radiation, LoadKind::HeatGen];
     pub(super) const ELECTRO: [LoadKind; 5] = [LoadKind::Voltage, LoadKind::Current, LoadKind::Coil, LoadKind::Magnet, LoadKind::Port];
     pub(super) const FLUID: [LoadKind; 5] = [LoadKind::Inlet, LoadKind::Outlet, LoadKind::Symmetry, LoadKind::MovingWall, LoadKind::Gravity];
@@ -101,6 +119,11 @@ impl LoadKind {
             LoadKind::Outlet => "Outlet",
             LoadKind::Port => "RF Port",
             LoadKind::MovingWall => "Moving Wall",
+            LoadKind::BoltPretension => "Bolt Pretension",
+            LoadKind::Spring => "Spring",
+            LoadKind::RemoteForce => "Remote Force",
+            LoadKind::RemoteDisplacement => "Remote Disp.",
+            LoadKind::PointMass => "Point Mass",
         }
     }
     pub(super) fn title(self) -> &'static str {
@@ -128,6 +151,11 @@ impl LoadKind {
             LoadKind::Outlet => "⇤",
             LoadKind::Port => "📡",
             LoadKind::MovingWall => "⏩",
+            LoadKind::BoltPretension => "🔩",
+            LoadKind::Spring => "➰",
+            LoadKind::RemoteForce => "↗",
+            LoadKind::RemoteDisplacement => "🎯",
+            LoadKind::PointMass => "⚖",
         }
     }
     pub(super) fn sample(self) -> Load {
@@ -153,6 +181,11 @@ impl LoadKind {
             LoadKind::Outlet => Load::Outlet { faces: f, pressure: 0.0 },
             LoadKind::MovingWall => Load::MovingWall { faces: f, velocity: [0.0; 3] },
             LoadKind::Port => Load::Port { faces: f, power: 0.0, polarization: Default::default(), profile: "te10".into() },
+            LoadKind::BoltPretension => Load::BoltPretension { body: String::new(), force_n: Some(1000.0), adjustment_mm: None, axis: None, cut_mm: None },
+            LoadKind::Spring => Load::Spring { faces: f, to_faces: None, stiffness_n_per_mm: 100.0, anchor: None, preload_n: 0.0 },
+            LoadKind::RemoteForce => Load::RemoteForce { faces: f, point: [0.0; 3], force: [0.0; 3], moment: [0.0; 3] },
+            LoadKind::RemoteDisplacement => Load::RemoteDisplacement { faces: f, point: [0.0; 3], x: None, y: None, z: None, rx: None, ry: None, rz: None, rigid: false },
+            LoadKind::PointMass => Load::PointMass { faces: f, mass_kg: 1.0, point: None },
         }
     }
     pub(super) fn color(self) -> Color32 {
@@ -164,10 +197,10 @@ impl LoadKind {
         Color32::from_rgb(c[0], c[1], c[2])
     }
     pub(super) fn needs_faces(self) -> bool {
-        !matches!(self, LoadKind::Gravity | LoadKind::HeatGen | LoadKind::Coil | LoadKind::Magnet)
+        !matches!(self, LoadKind::Gravity | LoadKind::HeatGen | LoadKind::Coil | LoadKind::Magnet | LoadKind::BoltPretension)
     }
     pub(super) fn needs_body(self) -> bool {
-        matches!(self, LoadKind::Coil | LoadKind::Magnet)
+        matches!(self, LoadKind::Coil | LoadKind::Magnet | LoadKind::BoltPretension)
     }
     pub(super) fn applies(self, kind: AnalysisType) -> bool {
         self.sample().applies_to(kind)
@@ -181,6 +214,7 @@ pub(super) enum Form {
     Cylinder,
     Sphere,
     Enclosure,
+    Contact,
     Study,
     Optimize,
     Convergence,
@@ -237,6 +271,22 @@ pub(super) struct Forms {
     pub wall_v: [f64; 3],
     pub port_pol: usize,
     pub port_te10: bool,
+    pub contact_a: String,
+    pub contact_b: String,
+    pub contact_kind: usize,
+    pub contact_mu: f64,
+    pub contact_off: f64,
+    pub bolt_by_force: bool,
+    pub bolt_force: f64,
+    pub bolt_adj: f64,
+    pub spring_k: f64,
+    pub spring_pre: f64,
+    pub spring_to: String,
+    pub remote_pt: [f64; 3],
+    pub remote_moment: [f64; 3],
+    pub remote_rot: [(bool, f64); 3],
+    pub remote_rigid: bool,
+    pub mass_offset: bool,
 }
 
 impl Default for Forms {
@@ -289,6 +339,22 @@ impl Default for Forms {
             wall_v: [0.1, 0.0, 0.0],
             port_pol: 2,
             port_te10: true,
+            contact_a: String::new(),
+            contact_b: String::new(),
+            contact_kind: 2,
+            contact_mu: 0.2,
+            contact_off: 0.0,
+            bolt_by_force: true,
+            bolt_force: 1000.0,
+            bolt_adj: 0.05,
+            spring_k: 100.0,
+            spring_pre: 0.0,
+            spring_to: String::new(),
+            remote_pt: [0.0; 3],
+            remote_moment: [0.0; 3],
+            remote_rot: [(false, 0.0); 3],
+            remote_rigid: false,
+            mass_offset: false,
         }
     }
 }

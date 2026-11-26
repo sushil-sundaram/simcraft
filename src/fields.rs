@@ -79,9 +79,14 @@ fn voltage_bcs(model: &Model, mesh: &Mesh) -> Result<ScalarBc> {
 fn solve_scalar(mesh: &Mesh, coef: &[f64], fixed: &[Option<f64>], f: &[f64], prog: Prog, res: &mut Results) -> Result<(Vec<f64>, NodeSparse)> {
     let h = mesh.h * 1e-3;
     let ku = hex_conduction_unit();
-    let mut k = NodeSparse::new(mesh.nodes.len(), &mesh.elems, 1);
+    let ties = mesh.interface_ties();
+    let mut k = NodeSparse::new_with_edges(mesh.nodes.len(), &mesh.elems, &ties, 1);
     for (e, en) in mesh.elems.iter().enumerate() {
         k.add_element(en, &ku, coef[e] * h);
+    }
+    if !ties.is_empty() {
+        let avg = coef.iter().sum::<f64>() / coef.len().max(1) as f64;
+        crate::fem::add_scalar_ties(mesh, &mut k, avg.max(1e-18) * h * 1e4);
     }
     let k0 = k.clone();
     let mut rhs = f.to_vec();
@@ -248,9 +253,14 @@ pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
     prog.report(0.0, "assembling magnetic system")?;
     let nu: Vec<f64> = mesh.elem_mat.iter().map(|&m| 1.0 / (MU0 * mesh.materials[m as usize].relative_permeability.max(1e-6))).collect();
     let ku = curl_div_unit();
-    let mut k = NodeSparse::new(nn, &mesh.elems, 3);
+    let ties = mesh.interface_ties();
+    let mut k = NodeSparse::new_with_edges(nn, &mesh.elems, &ties, 3);
     for (e, en) in mesh.elems.iter().enumerate() {
         k.add_element(en, &ku, nu[e] * h);
+    }
+    if !ties.is_empty() {
+        let avg = nu.iter().sum::<f64>() / nu.len().max(1) as f64;
+        crate::fem::add_vec3_ties(mesh, &mut k, avg.max(1.0) * h * 1e4);
     }
     let k0 = k.clone();
     let gi = grad_integrals();

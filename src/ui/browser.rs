@@ -261,6 +261,28 @@ impl SimApp {
                         });
                     });
                 }
+                if !model.contacts.is_empty() {
+                    ui.separator();
+                    ui.label(RichText::new("Contacts").small().strong().color(p.weak));
+                    for c in &model.contacts {
+                        if !q.is_empty() && !c.summary().to_lowercase().contains(&q) {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(9.0, 9.0), Sense::hover());
+                            ui.painter().circle_filled(r.center(), 4.5, Color32::from_rgb(55, 175, 225));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if del_load(ui) {
+                                    self.run("remove_contact", json!({"id": c.id}));
+                                }
+                                ui.label(RichText::new(format!("#{}", c.id)).small().color(p.weak));
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    ui.add(egui::Label::new(RichText::new(c.summary()).small()).truncate()).on_hover_text(c.summary());
+                                });
+                            });
+                        });
+                    }
+                }
             });
             egui::CollapsingHeader::new(RichText::new("▦  Mesh").strong()).default_open(true).show(ui, |ui| match &mesh {
                 Some(m) => {

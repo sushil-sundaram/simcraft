@@ -459,26 +459,7 @@ pub fn face_shares(mesh: &Mesh, fi: usize) -> ([V3; 4], [f64; 4]) {
         return ([scale(dir_normal(face.dir), h * h / 4.0); 4], [h * h / 4.0; 4]);
     }
     let q = face.nodes.map(|n| mesh.nodes[n as usize].map(|v| v * 1e-3));
-    let mut sh = [[0.0; 3]; 4];
-    let mut sa = [0.0; 4];
-    for (a, b) in [(-GP, -GP), (GP, -GP), (GP, GP), (-GP, GP)] {
-        let nn = [(1.0 - a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 + b) / 4.0, (1.0 - a) * (1.0 + b) / 4.0];
-        let da = [-(1.0 - b) / 4.0, (1.0 - b) / 4.0, (1.0 + b) / 4.0, -(1.0 + b) / 4.0];
-        let db = [-(1.0 - a) / 4.0, -(1.0 + a) / 4.0, (1.0 + a) / 4.0, (1.0 - a) / 4.0];
-        let mut ta = [0.0; 3];
-        let mut tb = [0.0; 3];
-        for k in 0..4 {
-            ta = add(ta, scale(q[k], da[k]));
-            tb = add(tb, scale(q[k], db[k]));
-        }
-        let dav = cross(ta, tb); // outward area density (nodes CCW from outside)
-        let dan = dot(dav, dav).sqrt();
-        for k in 0..4 {
-            sh[k] = add(sh[k], scale(dav, nn[k]));
-            sa[k] += dan * nn[k];
-        }
-    }
-    (sh, sa)
+    crate::mesh::quad_shares(&q)
 }
 
 pub fn face_nodes(mesh: &Mesh, faces: &[u32]) -> Vec<u32> {
@@ -571,6 +552,639 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog) -> Result<Results> {
     Ok(res)
 }
 
+pub struct SurfaceSpec {
+    pub nodes: Vec<u32>,
+    pub weights: Vec<f64>,
+    pub centroid_m: V3,
+    pub normal: V3,
+    pub r_m: Vec<V3>,
+    pub j_inv: [f64; 9],
+    pub j_trace: f64,
+}
+
+fn mat3_mul(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
+    let mut c = [0.0; 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            c[i * 3 + j] = (0..3).map(|k| a[i * 3 + k] * b[k * 3 + j]).sum();
+        }
+    }
+    c
+}
+
+fn mat3_t_mul(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
+    let mut c = [0.0; 9];
+    for i in 0..3 {
+        for j in 0..3 {
+            c[i * 3 + j] = (0..3).map(|k| a[k * 3 + i] * b[k * 3 + j]).sum();
+        }
+    }
+    c
+}
+
+fn mat3_vec(a: &[f64; 9], v: V3) -> V3 {
+    [a[0] * v[0] + a[1] * v[1] + a[2] * v[2], a[3] * v[0] + a[4] * v[1] + a[5] * v[2], a[6] * v[0] + a[7] * v[1] + a[8] * v[2]]
+}
+
+fn mat3_t_vec(a: &[f64; 9], v: V3) -> V3 {
+    [a[0] * v[0] + a[3] * v[1] + a[6] * v[2], a[1] * v[0] + a[4] * v[1] + a[7] * v[2], a[2] * v[0] + a[5] * v[1] + a[8] * v[2]]
+}
+
+fn skew(r: V3) -> [f64; 9] {
+    [0.0, -r[2], r[1], r[2], 0.0, -r[0], -r[1], r[0], 0.0]
+}
+
+fn outer3(a: V3, s: f64) -> [f64; 9] {
+    [s * a[0] * a[0], s * a[0] * a[1], s * a[0] * a[2], s * a[1] * a[0], s * a[1] * a[1], s * a[1] * a[2], s * a[2] * a[0], s * a[2] * a[1], s * a[2] * a[2]]
+}
+
+pub fn surface_spec(mesh: &Mesh, faces: &[String]) -> Result<SurfaceSpec> {
+    let fs = mesh.resolve_faces(faces)?;
+    let mut map: std::collections::BTreeMap<u32, (f64, V3)> = std::collections::BTreeMap::new();
+    let mut tot_a = 0.0;
+    let mut nsum = [0.0; 3];
+    for &fi in &fs {
+        let (sh, sa) = face_shares(mesh, fi as usize);
+        for (k, &nd) in mesh.faces[fi as usize].nodes.iter().enumerate() {
+            let e = map.entry(nd).or_insert((0.0, [0.0; 3]));
+            e.0 += sa[k];
+            e.1 = add(e.1, sh[k]);
+            tot_a += sa[k];
+            nsum = add(nsum, sh[k]);
+        }
+    }
+    if map.is_empty() || tot_a <= 0.0 {
+        bail!("face selector {faces:?} has zero area");
+    }
+    let mut nodes = Vec::with_capacity(map.len());
+    let mut weights = Vec::with_capacity(map.len());
+    let mut centroid_m = [0.0; 3];
+    for (nd, (a, _)) in map {
+        let w = a / tot_a;
+        let x = mesh.nodes[nd as usize].map(|v| v * 1e-3);
+        centroid_m = add(centroid_m, scale(x, w));
+        nodes.push(nd);
+        weights.push(w);
+    }
+    let normal = if norm(nsum) > 1e-24 { scale(nsum, 1.0 / norm(nsum)) } else { [0.0, 0.0, 1.0] };
+    Ok(finalize_surface_spec(mesh, nodes, weights, centroid_m, normal))
+}
+
+fn finalize_surface_spec(mesh: &Mesh, nodes: Vec<u32>, weights: Vec<f64>, centroid_m: V3, normal: V3) -> SurfaceSpec {
+    let mut r_m = Vec::with_capacity(nodes.len());
+    let mut j = [0.0; 9];
+    for (&nd, &w) in nodes.iter().zip(&weights) {
+        let r = sub(mesh.nodes[nd as usize].map(|v| v * 1e-3), centroid_m);
+        let r2 = dot(r, r);
+        for a in 0..3 {
+            for b in 0..3 {
+                j[a * 3 + b] += w * (if a == b { r2 } else { 0.0 } - r[a] * r[b]);
+            }
+        }
+        r_m.push(r);
+    }
+    let (ev, vecs) = sym_eigen(&j, 3);
+    let tr = (ev[0] + ev[1] + ev[2]).max(0.0);
+    let mut j_inv = [0.0; 9];
+    for k in 0..3 {
+        if ev[k] > 1e-12 * tr {
+            let v = [vecs[k], vecs[3 + k], vecs[6 + k]];
+            let inv = 1.0 / ev[k];
+            for a in 0..3 {
+                for b in 0..3 {
+                    j_inv[a * 3 + b] += inv * v[a] * v[b];
+                }
+            }
+        }
+    }
+    SurfaceSpec { nodes, weights, centroid_m, normal, r_m, j_inv, j_trace: tr }
+}
+
+fn downsample_spec(mesh: &Mesh, spec: &SurfaceSpec, cap: usize) -> SurfaceSpec {
+    if spec.nodes.len() <= cap {
+        return SurfaceSpec {
+            nodes: spec.nodes.clone(),
+            weights: spec.weights.clone(),
+            centroid_m: spec.centroid_m,
+            normal: spec.normal,
+            r_m: spec.r_m.clone(),
+            j_inv: spec.j_inv,
+            j_trace: spec.j_trace,
+        };
+    }
+    let step = spec.nodes.len() as f64 / cap as f64;
+    let mut nodes = Vec::with_capacity(cap);
+    let mut raw_w = Vec::with_capacity(cap);
+    let mut wsum = 0.0;
+    for i in 0..cap {
+        let idx = ((i as f64 + 0.5) * step) as usize;
+        let idx = idx.min(spec.nodes.len() - 1);
+        nodes.push(spec.nodes[idx]);
+        raw_w.push(spec.weights[idx]);
+        wsum += spec.weights[idx];
+    }
+    let weights: Vec<f64> = raw_w.iter().map(|w| w / wsum).collect();
+    let mut centroid_m = [0.0; 3];
+    for (&nd, &w) in nodes.iter().zip(&weights) {
+        centroid_m = add(centroid_m, scale(mesh.nodes[nd as usize].map(|v| v * 1e-3), w));
+    }
+    finalize_surface_spec(mesh, nodes, weights, centroid_m, spec.normal)
+}
+
+/// RBE3 statically equivalent force + moment distribution onto `faces`.
+pub fn distribute_force_moment(mesh: &Mesh, faces: &[String], point_mm: Option<V3>, force: V3, moment: V3, f: &mut [f64]) -> Result<()> {
+    let spec = surface_spec(mesh, faces)?;
+    let pt_m = point_mm.map(|p| p.map(|v| v * 1e-3)).unwrap_or(spec.centroid_m);
+    let m_c = add(moment, cross(sub(pt_m, spec.centroid_m), force));
+    let omega = mat3_vec(&spec.j_inv, m_c);
+    for ((&nd, &w), &r) in spec.nodes.iter().zip(&spec.weights).zip(&spec.r_m) {
+        let fi = scale(add(force, cross(omega, r)), w);
+        for c in 0..3 {
+            f[nd as usize * 3 + c] += fi[c];
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct SpringCoupling {
+    links: Vec<(u32, u32, f64)>, // (a, b, w) when a==b -> ground spring
+    k_mat: [f64; 9],
+}
+
+#[derive(Clone)]
+enum RemoteCoupling {
+    Rigid {
+        pu: u32,
+        pr: u32,
+        nodes: Vec<(u32, V3, f64)>, // (node, r_i, k_i)
+    },
+    Dist {
+        pu: u32,
+        pr: u32,
+        nodes: Vec<(u32, [f64; 9], [f64; 9])>, // (node, A_i = w_i I + s_pc B_i, B_i = -J_inv w_i skew(r_i))
+        k_u: f64,
+        k_theta: f64,
+    },
+    MassOffset {
+        pm: u32,
+        mass_kg: f64,
+        terms: Vec<(u32, [f64; 9])>, // (node, C_i)
+        k_m: f64,
+    },
+}
+
+#[derive(Clone)]
+struct CentroidMass {
+    nodes: Vec<(u32, f64)>,
+}
+
+/// Additional structural couplings (contacts, bolt pretensions, springs, remote points, point masses).
+#[derive(Clone)]
+pub struct StructuralCouplings {
+    pub total_nodes: usize,
+    pub avg_eh: f64,
+    pub extra_edges: Vec<(u32, u32)>,
+    springs: Vec<SpringCoupling>,
+    remotes: Vec<RemoteCoupling>,
+    centroid_masses: Vec<CentroidMass>,
+}
+
+impl StructuralCouplings {
+    pub fn build(model: &Model, mesh: &Mesh) -> Result<(Self, Vec<Option<f64>>, Vec<(u32, String, Vec<u32>)>, Vec<u32>)> {
+        let nn = mesh.nodes.len();
+        let h_m = mesh.h * 1e-3;
+        let solid_es: Vec<f64> = mesh
+            .elem_region
+            .iter()
+            .zip(&mesh.elem_mat)
+            .filter(|(r, _)| **r == crate::mesh::REGION_SOLID)
+            .map(|(_, &m)| mesh.materials[m as usize].youngs_modulus_gpa * 1e9)
+            .filter(|e| *e > 0.0)
+            .collect();
+        let avg_e = if solid_es.is_empty() { 1e9 } else { solid_es.iter().sum::<f64>() / solid_es.len() as f64 };
+        let avg_eh = avg_e * h_m;
+
+        let mut extra_edges: Vec<(u32, u32)> = Vec::new();
+        for c in &mesh.contacts {
+            let nb = (c.n_b as usize).min(4);
+            for i in 0..nb {
+                extra_edges.push((c.node_a, c.nodes_b[i]));
+                for j in (i + 1)..nb {
+                    extra_edges.push((c.nodes_b[i], c.nodes_b[j]));
+                }
+            }
+        }
+        for ps in &mesh.pretensions {
+            for pr in &ps.pairs {
+                extra_edges.push((pr.minus, pr.plus));
+            }
+        }
+
+        let mut springs = Vec::new();
+        let mut remotes = Vec::new();
+        let mut centroid_masses = Vec::new();
+        let mut vnodes = 0usize;
+        let mut remote_bcs: Vec<(u32, String, Vec<(usize, f64)>, Vec<u32>)> = Vec::new();
+        let mut ground_springs: Vec<(u32, String, Vec<u32>)> = Vec::new();
+
+        for it in &model.loads {
+            match &it.load {
+                Load::Spring { faces, to_faces, stiffness_n_per_mm, anchor, preload_n } => {
+                    if !stiffness_n_per_mm.is_finite() || *stiffness_n_per_mm <= 0.0 {
+                        bail!("spring #{}: stiffness must be finite and > 0", it.id);
+                    }
+                    if !preload_n.is_finite() {
+                        bail!("spring #{}: preload must be finite", it.id);
+                    }
+                    let sa = surface_spec(mesh, faces)?;
+                    let k_si = stiffness_n_per_mm * 1e3;
+                    match to_faces {
+                        None => {
+                            let axis = if let Some(p) = anchor {
+                                let d = sub(p.map(|v| v * 1e-3), sa.centroid_m);
+                                if norm(d) > 1e-9 * h_m { scale(d, 1.0 / norm(d)) } else { sa.normal }
+                            } else {
+                                sa.normal
+                            };
+                            ground_springs.push((it.id, it.load.label().to_string(), sa.nodes.clone()));
+                            springs.push(SpringCoupling {
+                                links: sa.nodes.iter().zip(&sa.weights).map(|(&n, &w)| (n, n, w)).collect(),
+                                k_mat: outer3(axis, k_si),
+                            });
+                        }
+                        Some(tb) => {
+                            let sb = surface_spec(mesh, tb)?;
+                            let d = sub(sb.centroid_m, sa.centroid_m);
+                            let axis = if norm(d) > 1e-9 * h_m { scale(d, 1.0 / norm(d)) } else { sa.normal };
+                            let nearest = |nd: u32, targets: &[u32]| -> u32 {
+                                let p = mesh.nodes[nd as usize];
+                                *targets.iter().min_by(|&&x, &&y| {
+                                    let dx = sub(mesh.nodes[x as usize], p);
+                                    let dy = sub(mesh.nodes[y as usize], p);
+                                    dot(dx, dx).total_cmp(&dot(dy, dy))
+                                }).unwrap()
+                            };
+                            let mut v = Vec::with_capacity(sa.nodes.len() + sb.nodes.len());
+                            for (&na, &wa) in sa.nodes.iter().zip(&sa.weights) {
+                                let nb = nearest(na, &sb.nodes);
+                                extra_edges.push((na, nb));
+                                v.push((na, nb, 0.5 * wa));
+                            }
+                            for (&nb, &wb) in sb.nodes.iter().zip(&sb.weights) {
+                                let na = nearest(nb, &sa.nodes);
+                                extra_edges.push((na, nb));
+                                v.push((na, nb, 0.5 * wb));
+                            }
+                            springs.push(SpringCoupling { links: v, k_mat: outer3(axis, k_si) });
+                        }
+                    }
+                }
+                Load::RemoteDisplacement { faces, point, x, y, z, rx, ry, rz, rigid } => {
+                    if !point.iter().all(|v| v.is_finite())
+                        || [x, y, z, rx, ry, rz].iter().any(|c| c.is_some_and(|v| !v.is_finite()))
+                    {
+                        bail!("remote displacement #{}: coordinates and displacements must be finite", it.id);
+                    }
+                    let spec_full = surface_spec(mesh, faces)?;
+                    let pu = (nn + vnodes) as u32;
+                    let pr = (nn + vnodes + 1) as u32;
+                    vnodes += 2;
+                    extra_edges.push((pu, pr));
+                    let point_m = point.map(|v| v * 1e-3);
+                    if *rigid {
+                        let k_tot = 200.0 * avg_eh;
+                        let mut nodes = Vec::with_capacity(spec_full.nodes.len());
+                        for (&nd, &w) in spec_full.nodes.iter().zip(&spec_full.weights) {
+                            extra_edges.push((nd, pu));
+                            extra_edges.push((nd, pr));
+                            nodes.push((nd, sub(mesh.nodes[nd as usize].map(|v| v * 1e-3), point_m), k_tot * w));
+                        }
+                        remotes.push(RemoteCoupling::Rigid { pu, pr, nodes });
+                    } else {
+                        let sp = downsample_spec(mesh, &spec_full, 128);
+                        // For moment transfer to the centroid `(c - point) × F`, note `(u_0 + θ_0 × (p - c))` vs pilot at `point`:
+                        // rewrite r_p = x_i - point_m -> wait: J_p about `centroid` gives θ_0 directly, and
+                        // u(point) = u_c + θ_0 × (point - centroid) = sum w_i u_i - skew(p - c) * sum J_inv w_i skew(r_i) u_i!
+                        let s_pc = skew(sub(point_m, sp.centroid_m));
+                        let k_u = 200.0 * avg_eh;
+                        let k_theta = 200.0 * avg_eh * sp.j_trace.max(h_m * h_m);
+                        let m = sp.nodes.len();
+                        let mut entries = Vec::with_capacity(m);
+                        for i in 0..m {
+                            let ni = sp.nodes[i];
+                            let wi = sp.weights[i];
+                            extra_edges.push((ni, pu));
+                            extra_edges.push((ni, pr));
+                            for j in (i + 1)..m {
+                                extra_edges.push((ni, sp.nodes[j]));
+                            }
+                            let bi = mat3_mul(&sp.j_inv, &skew(sp.r_m[i])).map(|v| -wi * v);
+                            let sc_bi = mat3_mul(&s_pc, &bi);
+                            let mut ai = [0.0; 9];
+                            for idx in 0..9 {
+                                let eye_v = if idx % 4 == 0 { wi } else { 0.0 };
+                                ai[idx] = eye_v + sc_bi[idx];
+                            }
+                            entries.push((ni, ai, bi));
+                        }
+                        remotes.push(RemoteCoupling::Dist { pu, pr, nodes: entries, k_u, k_theta });
+                    }
+                    let mut bcs = Vec::new();
+                    for (c, opt) in [x, y, z].iter().enumerate() {
+                        if let Some(v) = opt {
+                            bcs.push((pu as usize * 3 + c, *v * 1e-3));
+                        }
+                    }
+                    for (c, opt) in [rx, ry, rz].iter().enumerate() {
+                        if let Some(v) = opt {
+                            bcs.push((pr as usize * 3 + c, *v));
+                        }
+                    }
+                    if !bcs.is_empty() {
+                        remote_bcs.push((it.id, it.load.label().to_string(), bcs, spec_full.nodes.clone()));
+                    }
+                }
+                Load::PointMass { faces, mass_kg, point } => {
+                    if !mass_kg.is_finite() || *mass_kg <= 0.0 {
+                        bail!("point mass #{}: mass_kg must be finite and > 0", it.id);
+                    }
+                    let spec_full = surface_spec(mesh, faces)?;
+                    let r_off = point.map(|p| sub(p.map(|v| v * 1e-3), spec_full.centroid_m)).unwrap_or([0.0; 3]);
+                    if norm(r_off) <= 1e-4 * h_m.max(1e-3) {
+                        centroid_masses.push(CentroidMass {
+                            nodes: spec_full.nodes.iter().zip(&spec_full.weights).map(|(&n, &w)| (n, w * *mass_kg)).collect(),
+                        });
+                    } else {
+                        let sp = downsample_spec(mesh, &spec_full, 128);
+                        let pm = (nn + vnodes) as u32;
+                        vnodes += 1;
+                        let k_m = 200.0 * avg_eh;
+                        let sr = skew(r_off);
+                        let mut terms = Vec::with_capacity(sp.nodes.len());
+                        for i in 0..sp.nodes.len() {
+                            let ni = sp.nodes[i];
+                            let wi = sp.weights[i];
+                            extra_edges.push((ni, pm));
+                            for j in (i + 1)..sp.nodes.len() {
+                                extra_edges.push((ni, sp.nodes[j]));
+                            }
+                            let prod = mat3_mul(&sr, &mat3_mul(&sp.j_inv, &skew(sp.r_m[i])));
+                            let mut ci = [0.0; 9];
+                            for k in 0..9 {
+                                let eye = if k % 4 == 0 { 1.0 } else { 0.0 };
+                                ci[k] = -wi * (eye - prod[k]);
+                            }
+                            terms.push((ni, ci));
+                        }
+                        remotes.push(RemoteCoupling::MassOffset { pm, mass_kg: *mass_kg, terms, k_m });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let total_nodes = nn + vnodes;
+        let (mut fixed, mut support_nodes, _contact, mut owner) = structural_bcs_len(model, mesh, total_nodes)?;
+        for (id, label, bcs, nodes) in remote_bcs {
+            for (dof, val) in bcs {
+                fixed[dof] = Some(val);
+                owner.0[dof] = id;
+            }
+            support_nodes.push((id, label, nodes));
+        }
+        support_nodes.extend(ground_springs);
+
+        let plan = StructuralCouplings { total_nodes, avg_eh, extra_edges, springs, remotes, centroid_masses };
+        Ok((plan, fixed, support_nodes, owner.0))
+    }
+
+    pub fn has_nonlocal(&self, mesh: &Mesh) -> bool {
+        !mesh.contacts.is_empty()
+            || !mesh.pretensions.is_empty()
+            || !self.springs.is_empty()
+            || !self.remotes.is_empty()
+            || !self.centroid_masses.is_empty()
+    }
+
+    pub fn apply_elastic_couplings(&self, k: &mut NodeSparse) {
+        let eye = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        for sp in &self.springs {
+            for &(a, b, w) in &sp.links {
+                let km = sp.k_mat.map(|v| v * w);
+                k.add_symmetric_pair(a as usize, b as usize, &km);
+            }
+        }
+        for r in &self.remotes {
+            match r {
+                RemoteCoupling::Rigid { pu, pr, nodes, .. } => {
+                    let (pu, pr) = (*pu as usize, *pr as usize);
+                    for &(ni, r_i, k_i) in nodes {
+                        let ni = ni as usize;
+                        let sk = skew(r_i);
+                        let ks = eye.map(|v| v * k_i);
+                        let ksk = sk.map(|v| v * k_i);
+                        let neg_ksk = sk.map(|v| -v * k_i);
+                        let kskt_sk = mat3_t_mul(&sk, &sk).map(|v| v * k_i);
+                        k.add_symmetric_pair(ni, pu, &ks);
+                        k.add_block(ni, pr, &ksk);
+                        k.add_block(pr, ni, &neg_ksk);
+                        k.add_block(pu, pr, &neg_ksk);
+                        k.add_block(pr, pu, &ksk);
+                        k.add_block(pr, pr, &kskt_sk);
+                    }
+                }
+                RemoteCoupling::Dist { pu, pr, nodes, k_u, k_theta } => {
+                    let (pu, pr) = (*pu as usize, *pr as usize);
+                    // Translation: 0.5 * k_u * ||u_0 - sum A_i u_i||^2
+                    k.add_block(pu, pu, &eye.map(|v| v * *k_u));
+                    for &(ni, ai, _) in nodes {
+                        let neg_ai = ai.map(|v| -v * *k_u);
+                        let neg_ait = mat3_t_mul(&ai, &eye).map(|v| -v * *k_u);
+                        k.add_block(pu, ni as usize, &neg_ai);
+                        k.add_block(ni as usize, pu, &neg_ait);
+                        for &(nj, aj, _) in nodes {
+                            let blk = mat3_t_mul(&ai, &aj).map(|v| v * *k_u);
+                            k.add_block(ni as usize, nj as usize, &blk);
+                        }
+                    }
+                    // Rotation: 0.5 * k_theta * ||theta_0 + sum B_i u_i||^2
+                    k.add_block(pr, pr, &eye.map(|v| v * *k_theta));
+                    for &(ni, _, bi) in nodes {
+                        k.add_block(pr, ni as usize, &bi.map(|v| v * *k_theta));
+                        k.add_block(ni as usize, pr, &mat3_t_mul(&bi, &eye).map(|v| v * *k_theta));
+                        for &(nj, _, bj) in nodes {
+                            let blk = mat3_t_mul(&bi, &bj).map(|v| v * *k_theta);
+                            k.add_block(ni as usize, nj as usize, &blk);
+                        }
+                    }
+                }
+                RemoteCoupling::MassOffset { pm, terms, k_m, .. } => {
+                    let pm = *pm as usize;
+                    k.add_block(pm, pm, &eye.map(|v| v * *k_m));
+                    for &(ni, ci) in terms {
+                        k.add_block(pm, ni as usize, &ci.map(|v| v * *k_m));
+                        k.add_block(ni as usize, pm, &mat3_t_mul(&ci, &eye).map(|v| v * *k_m));
+                        for &(nj, cj) in terms {
+                            k.add_block(ni as usize, nj as usize, &mat3_t_mul(&ci, &cj).map(|v| v * *k_m));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn apply_linear_interface_ties(&self, mesh: &Mesh, k: &mut NodeSparse) {
+        let h_m = mesh.h * 1e-3;
+        let k_tie = 100.0 * self.avg_eh;
+        let eye = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        for ps in &mesh.pretensions {
+            for pr in &ps.pairs {
+                let km = eye.map(|v| v * k_tie * (pr.area_m2 / (h_m * h_m)).max(0.25));
+                k.add_symmetric_pair(pr.minus as usize, pr.plus as usize, &km);
+            }
+        }
+        let tol = 1e-4 * h_m + 1e-9;
+        for c in &mesh.contacts {
+            if c.gap0_m > tol {
+                continue;
+            }
+            let nb = (c.n_b as usize).min(4);
+            let kn = 50.0 * self.avg_eh * (c.area_m2 / (h_m * h_m)).max(0.25);
+            let m = match c.kind {
+                ContactKind::Bonded | ContactKind::Frictional => eye.map(|v| v * kn),
+                ContactKind::NoSeparation | ContactKind::Frictionless => outer3(c.normal, kn),
+            };
+            add_contact_matrix(k, c.node_a, &c.nodes_b[..nb], &c.weights_b[..nb], &m);
+        }
+    }
+
+    pub fn apply_mass_diag(&self, mdiag: &mut [f64]) {
+        for cm in &self.centroid_masses {
+            for &(nd, dm) in &cm.nodes {
+                for c in 0..3 {
+                    mdiag[nd as usize * 3 + c] += dm;
+                }
+            }
+        }
+        for r in &self.remotes {
+            if let RemoteCoupling::MassOffset { pm, mass_kg, .. } = r {
+                for c in 0..3 {
+                    mdiag[*pm as usize * 3 + c] += *mass_kg;
+                }
+            }
+        }
+    }
+
+    pub fn add_internal_forces(&self, u: &[f64], fint: &mut [f64]) {
+        for sp in &self.springs {
+            for &(a, b, w) in &sp.links {
+                let du = if a == b {
+                    [u[a as usize * 3], u[a as usize * 3 + 1], u[a as usize * 3 + 2]]
+                } else {
+                    [u[a as usize * 3] - u[b as usize * 3], u[a as usize * 3 + 1] - u[b as usize * 3 + 1], u[a as usize * 3 + 2] - u[b as usize * 3 + 2]]
+                };
+                let f = scale(mat3_vec(&sp.k_mat, du), w);
+                for c in 0..3 {
+                    fint[a as usize * 3 + c] += f[c];
+                    if a != b {
+                        fint[b as usize * 3 + c] -= f[c];
+                    }
+                }
+            }
+        }
+        for r in &self.remotes {
+            match r {
+                RemoteCoupling::Rigid { pu, pr, nodes, .. } => {
+                    let u0 = [u[*pu as usize * 3], u[*pu as usize * 3 + 1], u[*pu as usize * 3 + 2]];
+                    let t0 = [u[*pr as usize * 3], u[*pr as usize * 3 + 1], u[*pr as usize * 3 + 2]];
+                    for &(ni, r_i, k_i) in nodes {
+                        let ui = [u[ni as usize * 3], u[ni as usize * 3 + 1], u[ni as usize * 3 + 2]];
+                        let res_i = add(sub(ui, u0), cross(r_i, t0));
+                        let f_i = scale(res_i, k_i);
+                        let m_pr = mat3_t_vec(&skew(r_i), f_i);
+                        for c in 0..3 {
+                            fint[ni as usize * 3 + c] += f_i[c];
+                            fint[*pu as usize * 3 + c] -= f_i[c];
+                            fint[*pr as usize * 3 + c] += m_pr[c];
+                        }
+                    }
+                }
+                RemoteCoupling::Dist { pu, pr, nodes, k_u, k_theta } => {
+                    let mut cu = [u[*pu as usize * 3], u[*pu as usize * 3 + 1], u[*pu as usize * 3 + 2]];
+                    let mut cr = [u[*pr as usize * 3], u[*pr as usize * 3 + 1], u[*pr as usize * 3 + 2]];
+                    for &(ni, ai, bi) in nodes {
+                        let ui = [u[ni as usize * 3], u[ni as usize * 3 + 1], u[ni as usize * 3 + 2]];
+                        cu = sub(cu, mat3_vec(&ai, ui));
+                        cr = add(cr, mat3_vec(&bi, ui));
+                    }
+                    let fu = scale(cu, *k_u);
+                    let ft = scale(cr, *k_theta);
+                    for c in 0..3 {
+                        fint[*pu as usize * 3 + c] += fu[c];
+                        fint[*pr as usize * 3 + c] += ft[c];
+                    }
+                    for &(ni, ai, bi) in nodes {
+                        let fn_i = sub(mat3_t_vec(&bi, ft), mat3_t_vec(&ai, fu));
+                        for c in 0..3 {
+                            fint[ni as usize * 3 + c] += fn_i[c];
+                        }
+                    }
+                }
+                RemoteCoupling::MassOffset { pm, terms, k_m, .. } => {
+                    let mut cm = [u[*pm as usize * 3], u[*pm as usize * 3 + 1], u[*pm as usize * 3 + 2]];
+                    for &(ni, ci) in terms {
+                        let ui = [u[ni as usize * 3], u[ni as usize * 3 + 1], u[ni as usize * 3 + 2]];
+                        cm = add(cm, mat3_vec(&ci, ui));
+                    }
+                    let fm = scale(cm, *k_m);
+                    for c in 0..3 {
+                        fint[*pm as usize * 3 + c] += fm[c];
+                    }
+                    for &(ni, ci) in terms {
+                        let fi = mat3_t_vec(&ci, fm);
+                        for c in 0..3 {
+                            fint[ni as usize * 3 + c] += fi[c];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn add_contact_matrix(k: &mut NodeSparse, node_a: u32, nodes_b: &[u32], weights_b: &[f64], m: &[f64; 9]) {
+    let mut terms = [(node_a as usize, 1.0f64); 5];
+    let n = 1 + nodes_b.len();
+    for (idx, (&b, &w)) in nodes_b.iter().zip(weights_b).enumerate() {
+        terms[1 + idx] = (b as usize, -w);
+    }
+    for i in 0..n {
+        for j in 0..n {
+            let s = terms[i].1 * terms[j].1;
+            if s.abs() > 1e-24 {
+                k.add_block(terms[i].0, terms[j].0, &m.map(|v| v * s));
+            }
+        }
+    }
+}
+
+/// Add strong penalty ties for zero-gap split nodes in scalar (thermal/electrostatic/current) systems.
+pub fn add_scalar_ties(mesh: &Mesh, k: &mut NodeSparse, scale_val: f64) {
+    let blk = [scale_val];
+    for (a, b) in mesh.interface_ties() {
+        k.add_symmetric_pair(a as usize, b as usize, &blk);
+    }
+}
+
+/// Add strong isotropic 3×3 penalty ties for zero-gap split nodes in 3-component vector systems.
+pub fn add_vec3_ties(mesh: &Mesh, k: &mut NodeSparse, scale_val: f64) {
+    let blk = [scale_val, 0.0, 0.0, 0.0, scale_val, 0.0, 0.0, 0.0, scale_val];
+    for (a, b) in mesh.interface_ties() {
+        k.add_symmetric_pair(a as usize, b as usize, &blk);
+    }
+}
+
 pub struct Assembled {
     pub k: NodeSparse,
     pub fixed: Vec<Option<f64>>,
@@ -579,14 +1193,16 @@ pub struct Assembled {
     pub contact: Vec<(usize, f64)>,
     /// Load id owning each constrained dof (0 = free) — used for per-support reactions.
     pub owner: Vec<u32>,
+    pub couplings: StructuralCouplings,
 }
 
 pub fn assemble_structural(model: &Model, mesh: &Mesh, prog: Prog) -> Result<(Assembled, Vec<ElemUnit>)> {
     let h = mesh.h * 1e-3;
-    let nn = mesh.nodes.len();
     prog.report(0.0, "assembling stiffness")?;
     let units: Vec<ElemUnit> = mesh.materials.iter().map(|m| hex_elastic_unit(m.poisson_ratio)).collect();
-    let mut k = NodeSparse::new(nn, &mesh.elems, 3);
+    let (couplings, fixed, support_nodes, owner) = StructuralCouplings::build(model, mesh)?;
+    let (_, _, contact, _) = structural_bcs(model, mesh)?;
+    let mut k = NodeSparse::new_with_edges(couplings.total_nodes, &mesh.elems, &couplings.extra_edges, 3);
     let general: Vec<Option<ElemGeneral>> = (0..mesh.elems.len())
         .into_par_iter()
         .map(|e| -> Result<_> {
@@ -603,19 +1219,24 @@ pub fn assemble_structural(model: &Model, mesh: &Mesh, prog: Prog) -> Result<(As
             None => k.add_element(en, &units[mesh.elem_mat[e] as usize].k, m.youngs_modulus_gpa * 1e9 * h),
         }
     }
-    let (fixed, support_nodes, contact, owner) = structural_bcs(model, mesh)?;
-    Ok((Assembled { k, fixed, support_nodes, contact, owner }, units))
+    couplings.apply_elastic_couplings(&mut k);
+    Ok((Assembled { k, fixed, support_nodes, contact, owner, couplings }, units))
 }
 
 /// Supports of a structural model: prescribed dofs, support node sets, compression-only dofs and
 /// the owning load of every constrained dof.
 #[allow(clippy::type_complexity)]
 pub fn structural_bcs(model: &Model, mesh: &Mesh) -> Result<(Vec<Option<f64>>, Vec<(u32, String, Vec<u32>)>, Vec<(usize, f64)>, Vec<u32>)> {
-    let nn = mesh.nodes.len();
-    let mut fixed = vec![None; nn * 3];
+    let (fixed, support_nodes, contact, (owner, _)) = structural_bcs_len(model, mesh, mesh.nodes.len())?;
+    Ok((fixed, support_nodes, contact, owner))
+}
+
+#[allow(clippy::type_complexity)]
+fn structural_bcs_len(model: &Model, mesh: &Mesh, total_nodes: usize) -> Result<(Vec<Option<f64>>, Vec<(u32, String, Vec<u32>)>, Vec<(usize, f64)>, (Vec<u32>, usize))> {
+    let mut fixed = vec![None; total_nodes * 3];
     let mut support_nodes = Vec::new();
     let mut contact = Vec::new();
-    let mut owner = vec![0u32; nn * 3];
+    let mut owner = vec![0u32; total_nodes * 3];
     for it in &model.loads {
         match &it.load {
             Load::FixedSupport { faces } => {
@@ -665,7 +1286,7 @@ pub fn structural_bcs(model: &Model, mesh: &Mesh) -> Result<(Vec<Option<f64>>, V
     }
     contact.sort_unstable_by_key(|c| c.0);
     contact.dedup_by_key(|c| c.0);
-    Ok((fixed, support_nodes, contact, owner))
+    Ok((fixed, support_nodes, contact, (owner, total_nodes)))
 }
 
 /// Smallest structural model (elements) solved with matrix-free multigrid CG instead of the
@@ -673,6 +1294,17 @@ pub fn structural_bcs(model: &Model, mesh: &Mesh) -> Result<(Vec<Option<f64>>, V
 pub const MG_MIN_ELEMENTS: usize = 60_000;
 
 fn use_multigrid(model: &Model, mesh: &Mesh) -> bool {
+    if !mesh.contacts.is_empty()
+        || !mesh.pretensions.is_empty()
+        || model.loads.iter().any(|l| {
+            matches!(
+                l.load,
+                Load::Spring { .. } | Load::RemoteDisplacement { .. } | Load::RemoteForce { .. } | Load::PointMass { .. }
+            )
+        })
+    {
+        return false;
+    }
     match std::env::var("SIMCRAFT_MG").ok().as_deref() {
         Some("1") => return true,
         Some("0") => return false,
@@ -745,7 +1377,7 @@ fn structural_mg(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog, 
     Ok(())
 }
 
-/// External nodal forces [N]: forces, pressure, gravity and thermal-expansion loads.
+/// External nodal forces [N]: forces, pressure, gravity, remote forces, spring preloads, point masses and thermal expansion.
 pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Result<Vec<f64>> {
     let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
@@ -758,6 +1390,7 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
         }
     };
     let mut f = vec![0.0; nn * 3];
+    let mut gravity_acc: Option<V3> = None;
     for it in &model.loads {
         match &it.load {
             Load::Force { faces, vector } => {
@@ -785,6 +1418,7 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
                 }
             }
             Load::Gravity { acceleration } => {
+                gravity_acc = Some(add(gravity_acc.unwrap_or([0.0; 3]), *acceleration));
                 for (e, en) in mesh.elems.iter().enumerate() {
                     let rho = mesh.materials[mesh.elem_mat[e] as usize].density;
                     let nv = node_volumes(mesh, e);
@@ -795,7 +1429,60 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
                     }
                 }
             }
+            Load::RemoteForce { faces, point, force, moment } => {
+                if !point.iter().chain(force).chain(moment).all(|v| v.is_finite()) {
+                    bail!("remote force #{}: vectors must be finite", it.id);
+                }
+                distribute_force_moment(mesh, faces, Some(*point), *force, *moment, &mut f)?;
+            }
+            Load::Spring { faces, to_faces, preload_n, anchor, .. } if *preload_n != 0.0 => {
+                if !preload_n.is_finite() {
+                    bail!("spring #{}: preload must be finite", it.id);
+                }
+                let sa = surface_spec(mesh, faces)?;
+                let h_m = mesh.h * 1e-3;
+                match to_faces {
+                    None => {
+                        let axis = if let Some(p) = anchor {
+                            let d = sub(p.map(|v| v * 1e-3), sa.centroid_m);
+                            if norm(d) > 1e-9 * h_m { scale(d, 1.0 / norm(d)) } else { sa.normal }
+                        } else {
+                            sa.normal
+                        };
+                        for (&nd, &w) in sa.nodes.iter().zip(&sa.weights) {
+                            for c in 0..3 {
+                                f[nd as usize * 3 + c] += w * preload_n * axis[c];
+                            }
+                        }
+                    }
+                    Some(tb) => {
+                        let sb = surface_spec(mesh, tb)?;
+                        let d = sub(sb.centroid_m, sa.centroid_m);
+                        let axis = if norm(d) > 1e-9 * h_m { scale(d, 1.0 / norm(d)) } else { sa.normal };
+                        for (&nd, &w) in sa.nodes.iter().zip(&sa.weights) {
+                            for c in 0..3 {
+                                f[nd as usize * 3 + c] += w * preload_n * axis[c];
+                            }
+                        }
+                        for (&nd, &w) in sb.nodes.iter().zip(&sb.weights) {
+                            for c in 0..3 {
+                                f[nd as usize * 3 + c] -= w * preload_n * axis[c];
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+    if let Some(acc) = gravity_acc {
+        for it in &model.loads {
+            if let Load::PointMass { faces, mass_kg, point } = &it.load {
+                if !mass_kg.is_finite() || *mass_kg <= 0.0 {
+                    bail!("point mass #{}: mass_kg must be finite and > 0", it.id);
+                }
+                distribute_force_moment(mesh, faces, *point, scale(acc, *mass_kg), [0.0; 3], &mut f)?;
+            }
         }
     }
     if temps.is_some() {
@@ -820,60 +1507,489 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
     }
     let nn = mesh.nodes.len();
     let (asm, units) = assemble_structural(model, mesh, prog)?;
-    let Assembled { k: k0, mut fixed, support_nodes, contact, owner } = asm;
-    if support_nodes.is_empty() {
+    let Assembled { k: k0, fixed: full_fixed, support_nodes, contact: comp_contact, owner, couplings } = asm;
+    let n = k0.n();
+    if support_nodes.is_empty() && mesh.contacts.is_empty() {
         bail!("no supports defined: add a Fixed Support (or Displacement) so the part cannot fly away");
     }
-    let f_ext = external_forces(model, mesh, temps)?;
-    let fscale = f_ext.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-30);
-    let mut u: Vec<f64>;
-    let mut pass = 0;
-    loop {
-        let mut k = k0.clone();
-        let mut f = f_ext.clone();
-        k.apply_dirichlet(&fixed, &mut f);
-        u = fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
-        prog.report(0.05, "factorising")?;
-        let solver = Solver::new(&k).map_err(|e| if contact.is_empty() { e } else { anyhow::anyhow!("{e} (the part may be lifting off its compression-only supports: add a support that holds it)") })?;
-        let its = solver.solve(&k, &f, &mut u, 1e-8, &prog.scalar(0.05, 0.85, "solving (PCG)"))?;
-        res.info.solver = solver.name().to_string();
-        res.info.iterations += its;
-        if contact.is_empty() {
-            break;
-        }
-        // contact active set: release supports in tension, close gaps that penetrate
-        let mut ku = vec![0.0; nn * 3];
-        k0.matvec(&u, &mut ku);
-        let mut changed = 0;
-        for &(dof, sgn) in &contact {
-            if fixed[dof].is_some() {
-                if (ku[dof] - f_ext[dof]) * sgn > 1e-7 * fscale {
-                    fixed[dof] = None;
+    let mut f_ext = external_forces(model, mesh, temps)?;
+    f_ext.resize(n, 0.0);
+
+    // Fast path: no assembly contact pairs and no bolt pretensions -> existing active-set compression-only / linear solve
+    if mesh.contacts.is_empty() && mesh.pretensions.is_empty() {
+        let mut fixed = full_fixed;
+        let fscale = f_ext.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-30);
+        let mut u: Vec<f64>;
+        let mut pass = 0;
+        loop {
+            let mut k = k0.clone();
+            let mut f = f_ext.clone();
+            k.apply_dirichlet(&fixed, &mut f);
+            u = fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
+            prog.report(0.05, "factorising")?;
+            let solver = Solver::new(&k).map_err(|e| if comp_contact.is_empty() { e } else { anyhow::anyhow!("{e} (the part may be lifting off its compression-only supports: add a support that holds it)") })?;
+            let its = solver.solve(&k, &f, &mut u, 1e-8, &prog.scalar(0.05, 0.85, "solving (PCG)"))?;
+            res.info.solver = solver.name().to_string();
+            res.info.iterations += its;
+            if comp_contact.is_empty() {
+                break;
+            }
+            let mut ku = vec![0.0; n];
+            k0.matvec(&u, &mut ku);
+            let mut changed = 0;
+            for &(dof, sgn) in &comp_contact {
+                if fixed[dof].is_some() {
+                    if (ku[dof] - f_ext[dof]) * sgn > 1e-7 * fscale {
+                        fixed[dof] = None;
+                        changed += 1;
+                    }
+                } else if u[dof] * sgn > 1e-12 {
+                    fixed[dof] = Some(0.0);
                     changed += 1;
                 }
-            } else if u[dof] * sgn > 1e-12 {
-                fixed[dof] = Some(0.0);
-                changed += 1;
+            }
+            pass += 1;
+            prog.report(0.5, &format!("contact iteration {pass}: {changed} change(s)"))?;
+            if changed == 0 || pass >= 60 {
+                if pass >= 60 {
+                    res.warnings.push("contact status did not fully settle after 60 iterations".into());
+                }
+                break;
             }
         }
-        pass += 1;
-        prog.report(0.5, &format!("contact iteration {pass}: {changed} change(s)"))?;
-        if changed == 0 {
-            break;
+        if !comp_contact.is_empty() {
+            let open = comp_contact.iter().filter(|(d, _)| fixed[*d].is_none()).count();
+            res.quantity("Contact nodes in contact", (comp_contact.len() - open) as f64, "");
+            res.quantity("Contact nodes lifted off", open as f64, "");
         }
-        if pass >= 60 {
-            res.warnings.push("contact status did not fully settle after 60 iterations".into());
-            break;
+        res.info.dofs = n;
+        prog.report(0.92, "computing stresses")?;
+        structural_post_ex(model, mesh, &u, temps, &units, &fixed, &f_ext, &support_nodes, &owner, Some(&couplings), res);
+        prog.report(1.0, "done")?;
+        return Ok(());
+    }
+
+    // Augmented-Lagrange solver for contact interfaces and two-step bolt pretension
+    let h_m = mesh.h * 1e-3;
+    let mut node_e = vec![0.0f64; nn];
+    let mut node_ecnt = vec![0u32; nn];
+    for (e, en) in mesh.elems.iter().enumerate() {
+        let ep = mesh.materials[mesh.elem_mat[e] as usize].youngs_modulus_gpa * 1e9;
+        for &nd in en {
+            node_e[nd as usize] += ep;
+            node_ecnt[nd as usize] += 1;
         }
     }
-    if !contact.is_empty() {
-        let open = contact.iter().filter(|(d, _)| fixed[*d].is_none()).count();
-        res.quantity("Contact nodes in contact", (contact.len() - open) as f64, "");
+    for (v, &c) in node_e.iter_mut().zip(&node_ecnt) {
+        *v = if c > 0 { *v / c as f64 } else { 1e9 };
+    }
+
+    let nc = mesh.contacts.len();
+    let mut kn = Vec::with_capacity(nc);
+    let mut kt = Vec::with_capacity(nc);
+    let mut active_n = Vec::with_capacity(nc);
+    let mut stick = Vec::with_capacity(nc);
+    for c in &mesh.contacts {
+        let ea = node_e[c.node_a as usize];
+        let eb = node_e[c.nodes_b[0] as usize];
+        let ec = (2.0 * ea * eb / (ea + eb).max(1.0)).max(1.0);
+        kn.push(15.0 * ec * (c.area_m2 / h_m));
+        kt.push(5.0 * ec * (c.area_m2 / h_m));
+        let act = matches!(c.kind, ContactKind::NoSeparation) || c.gap0_m <= 1e-4 * h_m + 1e-9;
+        active_n.push(act);
+        stick.push(act && c.kind == ContactKind::Frictional && c.friction > 0.0);
+    }
+    struct PretState {
+        force_n: Option<f64>,
+        delta: f64,
+        kc: Vec<f64>,
+        l_cut: Vec<[f64; 3]>,
+        step1_force: f64,
+    }
+    struct CachedAl {
+        active_n: Vec<bool>,
+        stick: Vec<bool>,
+        fixed: Vec<Option<f64>>,
+        k_factored: NodeSparse,
+        corr: Vec<f64>,
+        solver: Solver,
+    }
+    struct AlCtx {
+        active_n: Vec<bool>,
+        stick: Vec<bool>,
+        ln: Vec<f64>,
+        lt: Vec<[f64; 3]>,
+        kn: Vec<f64>,
+        kt: Vec<f64>,
+        prets: Vec<PretState>,
+        u: Vec<f64>,
+        fixed: Vec<Option<f64>>,
+        cache: Option<CachedAl>,
+    }
+
+    let mut prets = Vec::with_capacity(mesh.pretensions.len());
+    for ps in &mesh.pretensions {
+        let ld = model.loads.iter().find(|it| it.id == ps.load_id).map(|it| &it.load);
+        let (force_n, adj_mm) = match ld {
+            Some(Load::BoltPretension { force_n, adjustment_mm, .. }) => (*force_n, *adjustment_mm),
+            _ => (None, None),
+        };
+        if let Some(fn_) = force_n {
+            if !fn_.is_finite() {
+                bail!("bolt pretension #{}: force_n must be finite", ps.load_id);
+            }
+        }
+        if let Some(a) = adj_mm {
+            if !a.is_finite() {
+                bail!("bolt pretension #{}: adjustment_mm must be finite", ps.load_id);
+            }
+        }
+        let eb = node_e[ps.pairs.first().map(|p| p.minus as usize).unwrap_or(0)];
+        let area_tot: f64 = ps.pairs.iter().map(|p| p.area_m2).sum::<f64>().max(h_m * h_m);
+        let kc: Vec<f64> = ps.pairs.iter().map(|p| 40.0 * eb * (p.area_m2 / h_m)).collect();
+        let delta = match (force_n, adj_mm) {
+            (_, Some(a)) => a * 1e-3,
+            (Some(fn_), None) => (fn_ * (4.0 * h_m) / (eb * area_tot)).clamp(-0.05, 0.05),
+            (None, None) => 0.0,
+        };
+        let l_cut = vec![[0.0; 3]; ps.pairs.len()];
+        prets.push(PretState { force_n, delta, kc, l_cut, step1_force: 0.0 });
+    }
+
+    let mut ctx = AlCtx {
+        active_n,
+        stick,
+        ln: vec![0.0f64; nc],
+        lt: vec![[0.0f64; 3]; nc],
+        kn,
+        kt,
+        prets,
+        u: vec![0.0; n],
+        fixed: full_fixed.clone(),
+        cache: None,
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_al_stage(
+        stage_name: &str,
+        mesh: &Mesh,
+        k0: &NodeSparse,
+        comp_contact: &[(usize, f64)],
+        f_stage: &[f64],
+        stage_fixed: &[Option<f64>],
+        adjust_bolt_force: bool,
+        base_p: f64,
+        span_p: f64,
+        prog: Prog,
+        res: &mut Results,
+        ctx: &mut AlCtx,
+    ) -> Result<()> {
+        let n = k0.n();
+        let h_m = mesh.h * 1e-3;
+        let eye = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let mut comp_fixed = stage_fixed.to_vec();
+        let fscale = f_stage.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-12);
+        let bolt_target_scale: f64 = ctx.prets.iter().filter_map(|p| p.force_n).map(|v| v.abs()).sum::<f64>().max(fscale);
+        for pass in 0..80usize {
+            let need_rebuild = match &ctx.cache {
+                None => true,
+                Some(c) => c.active_n != ctx.active_n || c.stick != ctx.stick || c.fixed != comp_fixed,
+            };
+            if need_rebuild {
+                let mut k_iter = k0.clone();
+                for (i, c) in mesh.contacts.iter().enumerate() {
+                    if !ctx.active_n[i] {
+                        continue;
+                    }
+                    let nb = (c.n_b as usize).min(4);
+                    let mut m = outer3(c.normal, ctx.kn[i]);
+                    if ctx.stick[i] {
+                        let pn = outer3(c.normal, 1.0);
+                        for idx in 0..9 {
+                            m[idx] += ctx.kt[i] * (eye[idx] - pn[idx]);
+                        }
+                    }
+                    add_contact_matrix(&mut k_iter, c.node_a, &c.nodes_b[..nb], &c.weights_b[..nb], &m);
+                }
+                for (s, ps) in mesh.pretensions.iter().enumerate() {
+                    for (j, pr) in ps.pairs.iter().enumerate() {
+                        k_iter.add_symmetric_pair(pr.minus as usize, pr.plus as usize, &eye.map(|v| v * ctx.prets[s].kc[j]));
+                    }
+                }
+                let g_vec: Vec<f64> = comp_fixed.iter().map(|g| g.unwrap_or(0.0)).collect();
+                let mut corr = vec![0.0; n];
+                k_iter.matvec(&g_vec, &mut corr);
+                let mut dummy = vec![0.0; n];
+                k_iter.apply_dirichlet(&comp_fixed, &mut dummy);
+                let solver = Solver::new(&k_iter)?;
+                res.info.solver = format!("{} (AL)", solver.name());
+                ctx.cache = Some(CachedAl {
+                    active_n: ctx.active_n.clone(),
+                    stick: ctx.stick.clone(),
+                    fixed: comp_fixed.clone(),
+                    k_factored: k_iter,
+                    corr,
+                    solver,
+                });
+            }
+            let c_ref = ctx.cache.as_ref().unwrap();
+            let mut rhs = f_stage.to_vec();
+            for (i, c) in mesh.contacts.iter().enumerate() {
+                if !ctx.active_n[i] {
+                    continue;
+                }
+                let nb = (c.n_b as usize).min(4);
+                let fc = add(scale(c.normal, ctx.ln[i] - ctx.kn[i] * c.gap0_m), ctx.lt[i]);
+                for d in 0..3 {
+                    rhs[c.node_a as usize * 3 + d] += fc[d];
+                }
+                for (&bk, &wk) in c.nodes_b[..nb].iter().zip(&c.weights_b[..nb]) {
+                    for d in 0..3 {
+                        rhs[bk as usize * 3 + d] -= wk * fc[d];
+                    }
+                }
+            }
+            for (s, ps) in mesh.pretensions.iter().enumerate() {
+                let ncut = ps.normal;
+                let del = ctx.prets[s].delta;
+                for (j, pr) in ps.pairs.iter().enumerate() {
+                    let fc = add(ctx.prets[s].l_cut[j], scale(ncut, ctx.prets[s].kc[j] * del));
+                    for d in 0..3 {
+                        rhs[pr.minus as usize * 3 + d] += fc[d];
+                        rhs[pr.plus as usize * 3 + d] -= fc[d];
+                    }
+                }
+            }
+            for (r, g) in comp_fixed.iter().enumerate() {
+                if let Some(gv) = g {
+                    rhs[r] = *gv;
+                    ctx.u[r] = *gv;
+                } else {
+                    rhs[r] -= c_ref.corr[r];
+                }
+            }
+            let its = c_ref.solver.solve(&c_ref.k_factored, &rhs, &mut ctx.u, 1e-9, &prog.scalar(base_p, base_p + span_p * 0.9, stage_name))?;
+            res.info.iterations += its;
+
+            let mut status_changed = 0usize;
+            if !comp_contact.is_empty() {
+                let mut ku = vec![0.0; n];
+                k0.matvec(&ctx.u, &mut ku);
+                for &(dof, sgn) in comp_contact {
+                    if comp_fixed[dof].is_some() {
+                        if (ku[dof] - f_stage[dof]) * sgn > 1e-7 * fscale {
+                            comp_fixed[dof] = None;
+                            status_changed += 1;
+                        }
+                    } else if ctx.u[dof] * sgn > 1e-12 {
+                        comp_fixed[dof] = Some(0.0);
+                        status_changed += 1;
+                    }
+                }
+            }
+
+            let mut max_gap_err = 0.0f64;
+            let mut dl2 = 0.0f64;
+            let mut l2 = 0.0f64;
+            for (i, c) in mesh.contacts.iter().enumerate() {
+                let nb = (c.n_b as usize).min(4);
+                let ua = [ctx.u[c.node_a as usize * 3], ctx.u[c.node_a as usize * 3 + 1], ctx.u[c.node_a as usize * 3 + 2]];
+                let mut ub = [0.0; 3];
+                for (&bk, &wk) in c.nodes_b[..nb].iter().zip(&c.weights_b[..nb]) {
+                    for d in 0..3 {
+                        ub[d] += wk * ctx.u[bk as usize * 3 + d];
+                    }
+                }
+                let du = sub(ua, ub);
+                let dn = dot(du, c.normal);
+                let g_n = c.gap0_m + dn;
+                let dt = sub(du, scale(c.normal, dn));
+
+                let prev_act = ctx.active_n[i];
+                let prev_stk = ctx.stick[i];
+                if !prev_act {
+                    if g_n < -1e-9 * h_m {
+                        ctx.active_n[i] = true;
+                        ctx.stick[i] = false;
+                        ctx.ln[i] = 0.0;
+                        ctx.lt[i] = [0.0; 3];
+                        status_changed += 1;
+                    }
+                } else {
+                    let p_trial = ctx.ln[i] - ctx.kn[i] * g_n;
+                    if c.kind != ContactKind::NoSeparation && p_trial <= 0.0 {
+                        ctx.active_n[i] = false;
+                        ctx.stick[i] = false;
+                        dl2 += ctx.ln[i] * ctx.ln[i] + dot(ctx.lt[i], ctx.lt[i]);
+                        ctx.ln[i] = 0.0;
+                        ctx.lt[i] = [0.0; 3];
+                        status_changed += 1;
+                    } else {
+                        max_gap_err = max_gap_err.max(g_n.abs());
+                        let old_ln = ctx.ln[i];
+                        let old_lt = ctx.lt[i];
+                        ctx.ln[i] = p_trial;
+                        if c.kind == ContactKind::Frictional && c.friction > 0.0 && ctx.ln[i] > 0.0 {
+                            let kt_upd = if prev_stk { ctx.kt[i] } else { 0.05 * ctx.kt[i] };
+                            let t_trial = sub(ctx.lt[i], scale(dt, kt_upd));
+                            let lim = c.friction * ctx.ln[i];
+                            let tn = norm(t_trial);
+                            if tn <= lim {
+                                ctx.lt[i] = t_trial;
+                                ctx.stick[i] = true;
+                            } else {
+                                ctx.lt[i] = scale(t_trial, lim / tn);
+                                ctx.stick[i] = false;
+                            }
+                        } else {
+                            ctx.lt[i] = [0.0; 3];
+                            ctx.stick[i] = false;
+                        }
+                        if ctx.stick[i] != prev_stk {
+                            status_changed += 1;
+                        }
+                        dl2 += (ctx.ln[i] - old_ln).powi(2) + dot(sub(ctx.lt[i], old_lt), sub(ctx.lt[i], old_lt));
+                        l2 += ctx.ln[i].powi(2) + dot(ctx.lt[i], ctx.lt[i]);
+                    }
+                }
+            }
+
+            for (s, ps) in mesh.pretensions.iter().enumerate() {
+                let ncut = ps.normal;
+                let del = ctx.prets[s].delta;
+                for (j, pr) in ps.pairs.iter().enumerate() {
+                    let um = [ctx.u[pr.minus as usize * 3], ctx.u[pr.minus as usize * 3 + 1], ctx.u[pr.minus as usize * 3 + 2]];
+                    let up = [ctx.u[pr.plus as usize * 3], ctx.u[pr.plus as usize * 3 + 1], ctx.u[pr.plus as usize * 3 + 2]];
+                    let jump = add(sub(up, um), scale(ncut, del));
+                    max_gap_err = max_gap_err.max(norm(jump));
+                    let old_lc = ctx.prets[s].l_cut[j];
+                    let new_lc = add(old_lc, scale(jump, ctx.prets[s].kc[j]));
+                    ctx.prets[s].l_cut[j] = new_lc;
+                    dl2 += dot(sub(new_lc, old_lc), sub(new_lc, old_lc));
+                    l2 += dot(new_lc, new_lc);
+                }
+            }
+
+            let rel_dl = dl2.sqrt() / l2.sqrt().max(bolt_target_scale).max(1.0);
+            let mut bolt_err = 0.0f64;
+            if adjust_bolt_force && status_changed == 0 && (rel_dl < 5e-2 || pass >= 4) {
+                for (s, ps) in mesh.pretensions.iter().enumerate() {
+                    if let Some(f_target) = ctx.prets[s].force_n {
+                        let f_cur: f64 = ctx.prets[s].l_cut.iter().map(|lc| dot(*lc, ps.normal)).sum();
+                        let rel = (f_cur - f_target).abs() / f_target.abs().max(1.0);
+                        bolt_err = bolt_err.max(rel);
+                        if rel > 2e-4 && f_cur.abs() > 1e-9 {
+                            let ratio = (f_target / f_cur).clamp(0.2, 5.0);
+                            ctx.prets[s].delta *= ratio;
+                            for lc in &mut ctx.prets[s].l_cut {
+                                *lc = scale(*lc, ratio);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if status_changed == 0 && max_gap_err <= 2e-5 * h_m.max(1e-4) && rel_dl <= 1e-4 && (!adjust_bolt_force || bolt_err <= 2e-4) && pass >= 1 {
+                ctx.fixed = comp_fixed;
+                return Ok(());
+            }
+            if pass == 79 {
+                ctx.fixed = comp_fixed.clone();
+                res.warnings.push(format!("{stage_name} did not fully tighten AL tolerance (gap err {max_gap_err:.2e} m, dL {rel_dl:.2e})"));
+            }
+        }
+        Ok(())
+    }
+
+    if !ctx.prets.is_empty() {
+        let fixed_step1: Vec<Option<f64>> = full_fixed.iter().map(|g| g.map(|_| 0.0)).collect();
+        let f_step1 = vec![0.0; n];
+        run_al_stage("Step 1: bolt pretension", mesh, &k0, &comp_contact, &f_step1, &fixed_step1, true, 0.05, 0.4, prog, res, &mut ctx)?;
+        for (s, ps) in mesh.pretensions.iter().enumerate() {
+            ctx.prets[s].step1_force = ctx.prets[s].l_cut.iter().map(|lc| dot(*lc, ps.normal)).sum();
+        }
+        run_al_stage("Step 2: external loads", mesh, &k0, &comp_contact, &f_ext, &full_fixed, false, 0.45, 0.45, prog, res, &mut ctx)?;
+        for (s, ps) in mesh.pretensions.iter().enumerate() {
+            let f2: f64 = ctx.prets[s].l_cut.iter().map(|lc| dot(*lc, ps.normal)).sum();
+            let f1 = ctx.prets[s].step1_force;
+            res.quantity(&format!("Bolt #{} force (Step 1)", ps.load_id), f1, "N");
+            res.quantity(&format!("Bolt #{} force (Step 2)", ps.load_id), f2, "N");
+            res.quantity(&format!("Bolt #{} adjustment", ps.load_id), ctx.prets[s].delta * 1e3, "mm");
+            res.quantity(&format!("Bolt #{} preload loss", ps.load_id), f1 - f2, "N");
+        }
+    } else {
+        run_al_stage("contact AL solve", mesh, &k0, &comp_contact, &f_ext, &full_fixed, false, 0.05, 0.85, prog, res, &mut ctx)?;
+    }
+
+    if !mesh.contacts.is_empty() {
+        let mut p_node_f = vec![0.0f64; nn];
+        let mut p_node_a = vec![0.0f64; nn];
+        let mut peak_p = 0.0f64;
+        let mut sum_fn = 0.0f64;
+        let mut sum_ft = [0.0f64; 3];
+        let mut closed = 0usize;
+        for (i, c) in mesh.contacts.iter().enumerate() {
+            if ctx.active_n[i] {
+                closed += 1;
+            }
+            let f_n = ctx.ln[i];
+            sum_fn += f_n;
+            sum_ft = add(sum_ft, ctx.lt[i]);
+            let p_mpa = (f_n / c.area_m2.max(1e-18)) * 1e-6;
+            if ctx.active_n[i] {
+                peak_p = peak_p.max(p_mpa);
+            }
+            p_node_f[c.node_a as usize] += f_n;
+            p_node_a[c.node_a as usize] += c.area_m2;
+            let nb = (c.n_b as usize).min(4);
+            for (&bk, &wk) in c.nodes_b[..nb].iter().zip(&c.weights_b[..nb]) {
+                p_node_f[bk as usize] += wk * f_n;
+                p_node_a[bk as usize] += wk * c.area_m2;
+            }
+        }
+        let cp_field: Vec<f64> = p_node_f.iter().zip(&p_node_a).map(|(f, a)| if *a > 0.0 { (*f / *a) * 1e-6 } else { 0.0 }).collect();
+        res.extra.insert(Field::ContactPressure, cp_field);
+        res.quantity("Peak contact pressure", peak_p, "MPa");
+        res.quantity("Contact normal force", sum_fn, "N");
+        res.quantity("Contact tangential force", norm(sum_ft), "N");
+        res.quantity("Contact nodes closed", closed as f64, "");
+        res.quantity("Contact nodes open", (mesh.contacts.len() - closed) as f64, "");
+    }
+    if !comp_contact.is_empty() {
+        let open = comp_contact.iter().filter(|(d, _)| ctx.fixed[*d].is_none()).count();
+        res.quantity("Contact nodes in contact", (comp_contact.len() - open) as f64, "");
         res.quantity("Contact nodes lifted off", open as f64, "");
     }
-    res.info.dofs = nn * 3;
+
+    let mut f_with_contact = f_ext.clone();
+    for (i, c) in mesh.contacts.iter().enumerate() {
+        if !ctx.active_n[i] {
+            continue;
+        }
+        let fc = add(scale(c.normal, ctx.ln[i]), ctx.lt[i]);
+        for d in 0..3 {
+            f_with_contact[c.node_a as usize * 3 + d] += fc[d];
+        }
+        let nb = (c.n_b as usize).min(4);
+        for (&bk, &wk) in c.nodes_b[..nb].iter().zip(&c.weights_b[..nb]) {
+            for d in 0..3 {
+                f_with_contact[bk as usize * 3 + d] -= wk * fc[d];
+            }
+        }
+    }
+    for (s, ps) in mesh.pretensions.iter().enumerate() {
+        for (j, pr) in ps.pairs.iter().enumerate() {
+            let fc = ctx.prets[s].l_cut[j];
+            for d in 0..3 {
+                f_with_contact[pr.minus as usize * 3 + d] += fc[d];
+                f_with_contact[pr.plus as usize * 3 + d] -= fc[d];
+            }
+        }
+    }
+
+    res.info.dofs = n;
     prog.report(0.92, "computing stresses")?;
-    structural_post(model, mesh, &u, temps, &units, &fixed, &f_ext, &support_nodes, &owner, res);
+    structural_post_ex(model, mesh, &ctx.u, temps, &units, &ctx.fixed, &f_with_contact, &support_nodes, &owner, Some(&couplings), res);
     prog.report(1.0, "done")?;
     Ok(())
 }
@@ -881,6 +1997,11 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
 /// Stresses, safety factor and reactions from a displacement field `u` [m].
 #[allow(clippy::too_many_arguments)]
 pub fn structural_post(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f64]>, units: &[ElemUnit], fixed: &[Option<f64>], f_ext: &[f64], support_nodes: &[(u32, String, Vec<u32>)], owner: &[u32], res: &mut Results) {
+    structural_post_ex(model, mesh, u, temps, units, fixed, f_ext, support_nodes, owner, None, res);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn structural_post_ex(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f64]>, units: &[ElemUnit], fixed: &[Option<f64>], f_ext: &[f64], support_nodes: &[(u32, String, Vec<u32>)], owner: &[u32], couplings: Option<&StructuralCouplings>, res: &mut Results) {
     let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let tunits: Vec<Vec<f64>> = mesh.materials.iter().map(|m| thermal_load_unit(m.poisson_ratio)).collect();
@@ -945,7 +2066,8 @@ pub fn structural_post(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f6
         })
         .collect();
 
-    let mut fint = vec![0.0; nn * 3];
+    let total_dofs = owner.len();
+    let mut fint = vec![0.0; total_dofs.max(nn * 3)];
     let mut acc = vec![[0.0f64; 6]; nn];
     let mut cnt = vec![0u32; nn];
     let mut yld = vec![f64::INFINITY; nn];
@@ -963,6 +2085,9 @@ pub fn structural_post(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f6
             cnt[n] += 1;
             yld[n] = yld[n].min(ys);
         }
+    }
+    if let Some(cp) = couplings {
+        cp.add_internal_forces(u, &mut fint);
     }
     let stress: Vec<[f64; 6]> = acc.iter().zip(&cnt).map(|(s, &c)| s.map(|v| v / c.max(1) as f64)).collect();
     let vm: Vec<f64> = stress
@@ -988,9 +2113,9 @@ pub fn structural_post(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f6
     // reactions per support: each constrained dof belongs to the support that fixed it
     for (id, label, _) in support_nodes {
         let mut r = [0.0; 3];
-        for dof in 0..nn * 3 {
+        for dof in 0..fixed.len().min(owner.len()) {
             if owner[dof] == *id && fixed[dof].is_some() {
-                r[dof % 3] += fint[dof] - f_ext[dof];
+                r[dof % 3] += fint[dof] - f_ext.get(dof).copied().unwrap_or(0.0);
             }
         }
         res.reactions.push(Reaction { load_id: *id, label: label.clone(), value: r.map(float) });
@@ -1142,7 +2267,8 @@ pub fn assemble_thermal_k(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, se
         Some((s, _)) => mesh.elems.iter().zip(s).filter(|(_, b)| **b).map(|(e, _)| *e).collect(),
         None => mesh.elems.clone(),
     };
-    let mut k = NodeSparse::new(nn, &elems, 1);
+    let ties = mesh.interface_ties();
+    let mut k = NodeSparse::new_with_edges(nn, &elems, &ties, 1);
     let kax = hex_conduction_unit_axes();
     let general: Vec<Option<[Vec<f64>; 4]>> = (0..mesh.elems.len()).into_par_iter().map(|e| (on(e) && mesh.is_fitted(e)).then(|| hex_conduction_general(&elem_xyz_m(mesh, e)))).collect();
     for (e, en) in mesh.elems.iter().enumerate() {
@@ -1238,6 +2364,10 @@ pub fn assemble_thermal_k(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, se
         if *c != 0.0 {
             k.add_diag(n, *c);
         }
+    }
+    if !ties.is_empty() {
+        let avg_k = mesh.materials.iter().map(|m| m.thermal_conductivity).sum::<f64>() / mesh.materials.len().max(1) as f64;
+        add_scalar_ties(mesh, &mut k, avg_k.max(1e-3) * h * 1e4);
     }
     Ok(ThermalSystem { k, f, fixed, conv_diag, temp_sets, has_sink })
 }
@@ -1447,10 +2577,10 @@ pub fn modal(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
 
 /// Lowest `nmodes` modes by shifted subspace iteration with Rayleigh–Ritz.
 pub fn modal_basis(model: &Model, mesh: &Mesh, nmodes: usize, prog: Prog, res: &mut Results) -> Result<ModalBasis> {
-    let nn = mesh.nodes.len();
-    let n = nn * 3;
     let (asm, _) = assemble_structural(model, mesh, prog)?;
-    let Assembled { mut k, mut fixed, .. } = asm;
+    let Assembled { mut k, mut fixed, couplings, .. } = asm;
+    couplings.apply_linear_interface_ties(mesh, &mut k);
+    let n = k.n();
     for g in fixed.iter_mut() {
         if g.is_some() {
             *g = Some(0.0);
@@ -1466,6 +2596,7 @@ pub fn modal_basis(model: &Model, mesh: &Mesh, nmodes: usize, prog: Prog, res: &
             }
         }
     }
+    couplings.apply_mass_diag(&mut mdiag);
     let kd = k.diag();
     let ratio = kd.iter().sum::<f64>() / mdiag.iter().sum::<f64>();
     let sigma = -1e-4 * ratio; // shift so free-free models stay positive definite

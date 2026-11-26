@@ -260,6 +260,66 @@ pub(super) fn draw_load_glyphs(
                     draw_arrow_3d(cam, rect, painter, c, e, 30.0, false, col, Some("E"));
                 }
             }
+            Load::BoltPretension { body, axis, cut_mm, .. } => {
+                let (mut c, _) = body_center_and_radius(model, mesh, Some(body));
+                let mut ax = [0.0, 0.0, 1.0];
+                if let Some(a) = axis {
+                    ax = [0.0; 3];
+                    ax[a.idx()] = 1.0;
+                } else if let Some(b) = model.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(body)) {
+                    if let crate::geometry::Shape::Cylinder { axis: ca, .. } = b.shape {
+                        ax = [0.0; 3];
+                        ax[ca.idx()] = 1.0;
+                    }
+                }
+                if let Some(cm) = cut_mm {
+                    let ai = ax.iter().position(|v| *v > 0.5).unwrap_or(2);
+                    c[ai] = *cm;
+                }
+                draw_arrow_3d(cam, rect, painter, c, scale(ax, -1.0), 22.0, true, col, Some("Preload"));
+                draw_arrow_3d(cam, rect, painter, c, ax, 22.0, true, col, None);
+            }
+            Load::Spring { stiffness_n_per_mm, .. } => {
+                for (c, n) in anchors {
+                    draw_arrow_3d(cam, rect, painter, c, n, 26.0, false, col, Some(&format!("k={stiffness_n_per_mm}")));
+                }
+            }
+            Load::RemoteForce { point, force, moment, .. } => {
+                let sp = world_to_screen(cam, rect, *point);
+                for (c, _) in anchors {
+                    let sc = world_to_screen(cam, rect, c);
+                    painter.line_segment([sp, sc], Stroke::new(1.2, col.gamma_multiply(0.6)));
+                }
+                if norm(*force) > 0.0 {
+                    draw_arrow_3d(cam, rect, painter, *point, *force, 36.0, false, col, tag.as_deref());
+                } else if norm(*moment) > 0.0 {
+                    draw_arrow_3d(cam, rect, painter, *point, *moment, 32.0, false, col, Some("M"));
+                }
+            }
+            Load::RemoteDisplacement { point, .. } => {
+                let sp = world_to_screen(cam, rect, *point);
+                for (c, _) in anchors {
+                    let sc = world_to_screen(cam, rect, c);
+                    painter.line_segment([sp, sc], Stroke::new(1.2, col.gamma_multiply(0.6)));
+                }
+                if rect.contains(sp) {
+                    painter.circle(sp, 5.5, col, Stroke::new(1.5, Color32::WHITE));
+                    painter.text(sp + vec2(8.0, -8.0), Align2::LEFT_CENTER, "RP", FontId::proportional(10.5), col);
+                }
+            }
+            Load::PointMass { mass_kg, point, .. } => {
+                let pt = point.unwrap_or_else(|| anchors.first().map(|a| a.0).unwrap_or([0.0; 3]));
+                let sp = world_to_screen(cam, rect, pt);
+                if point.is_some() {
+                    for (c, _) in &anchors {
+                        painter.line_segment([sp, world_to_screen(cam, rect, *c)], Stroke::new(1.2, col.gamma_multiply(0.6)));
+                    }
+                }
+                if rect.contains(sp) {
+                    painter.circle(sp, 6.5, col, Stroke::new(1.5, Color32::WHITE));
+                    painter.text(sp + vec2(9.0, -8.0), Align2::LEFT_CENTER, format!("{mass_kg} kg"), FontId::proportional(10.5), col);
+                }
+            }
         }
     }
 }

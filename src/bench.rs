@@ -535,6 +535,93 @@ END-ISO-10303-21;
             }),
         });
     }
+    v.push(Case {
+        id: "sliding_friction",
+        group: "Structural",
+        title: "Sliding block on flat plane with Coulomb friction μ = 0.25",
+        source: "Amontons–Coulomb friction: F = μ N = 0.25 × 800 N = 200 N",
+        sizes: vec![5.0, 3.33],
+        size_unit: "mm",
+        quick: true,
+        metrics: vec![m("sliding_friction.ft", "tangential friction force", 200.0, "N", 0.02)],
+        run: Box::new(|hh| {
+            let c = new_core();
+            let r = script(&c, &[
+                ("add_box", json!({"name": "Plane", "min": [0, 0, 0], "size": [60, 30, 10], "material": "Structural Steel"})),
+                ("add_box", json!({"name": "Block", "min": [20, 5, 10], "size": [20, 20, 10], "material": "Structural Steel"})),
+                ("set_mesh", json!({"element_size_mm": hh})),
+                ("add_contact", json!({"body_a": "Block", "body_b": "Plane", "kind": "frictional", "friction": 0.25})),
+                ("add_fixed_support", json!({"faces": ["Plane.zmin"]})),
+                ("add_displacement", json!({"faces": ["Block.xmax"], "x": 0.02, "y": 0.0})),
+                ("add_pressure", json!({"faces": ["Block.zmax"], "value_mpa": 2.0})),
+                ("solve", json!({})),
+            ])?;
+            out(vec![qty(&r, "Contact tangential force")?], &r)
+        }),
+    });
+    {
+        let e_gpa = 3.0;
+        let nu = 0.35;
+        let r_mm = 40.0;
+        let len_mm = 4.0;
+        let f_half = 800.0;
+        let f_prime = (2.0 * f_half) / (len_mm * 1e-3);
+        let e_star = (e_gpa * 1e9) / (2.0 * (1.0 - nu * nu));
+        let p0_want = (f_prime * e_star / (pi * r_mm * 1e-3)).sqrt() * 1e-6;
+        v.push(Case {
+            id: "hertz_contact",
+            group: "Structural",
+            title: "Hertz cylinder-on-flat fitted contact (R = 40 mm): peak contact pressure",
+            source: "Hertz (1882): p₀ = √(F' E* / πR)",
+            sizes: vec![1.33, 1.0],
+            size_unit: "mm",
+            quick: true,
+            metrics: vec![m("hertz_contact.p0", "peak contact pressure", p0_want, "MPa", 0.10)],
+            run: Box::new(move |hh| {
+                let c = new_core();
+                let r = script(&c, &[
+                    ("define_material", json!({"name": "HertzMat", "youngs_modulus_gpa": e_gpa, "poisson_ratio": nu})),
+                    ("add_box", json!({"name": "Base", "min": [0, 0, -24], "size": [28, len_mm, 24], "material": "HertzMat"})),
+                    ("add_cylinder", json!({"name": "Cyl", "base": [0, 0, r_mm], "axis": "y", "radius": r_mm, "height": len_mm, "material": "HertzMat"})),
+                    ("add_box", json!({"name": "CutX", "min": [-45, -1, -5], "size": [45, len_mm + 2.0, 90], "operation": "subtract"})),
+                    ("add_box", json!({"name": "CutTop", "min": [-5, -1, 20], "size": [50, len_mm + 2.0, 70], "operation": "subtract"})),
+                    ("set_mesh", json!({"element_size_mm": hh})),
+                    ("add_contact", json!({"body_a": "Cyl", "body_b": "Base", "kind": "frictionless"})),
+                    ("add_fixed_support", json!({"faces": ["Base.zmin"]})),
+                    ("add_symmetry", json!({"faces": ["bbox.xmin", "bbox.ymin", "bbox.ymax"]})),
+                    ("add_force", json!({"faces": ["CutTop.zmin"], "vector": [0, 0, -f_half]})),
+                    ("solve", json!({})),
+                ])?;
+                out(vec![qty(&r, "Peak contact pressure")?], &r)
+            }),
+        });
+    }
+    {
+        let e = steel.youngs_modulus_gpa * 1e9;
+        let i_yy = 0.012 * 0.012_f64.powi(3) / 12.0;
+        let uz_want = (20.0 * 0.12_f64.powi(2)) / (2.0 * e * i_yy) * 1e3;
+        v.push(Case {
+            id: "remote_moment",
+            group: "Structural",
+            title: "Cantilever beam under RBE3 remote moment (20 N·m): tip deflection",
+            source: "Euler–Bernoulli: δ = M L² / (2 E I)",
+            sizes: vec![4.0, 3.0],
+            size_unit: "mm",
+            quick: true,
+            metrics: vec![m("remote_moment.uz", "tip deflection", uz_want, "mm", 0.02)],
+            run: Box::new(|hh| {
+                let c = new_core();
+                let r = script(&c, &[
+                    ("add_box", json!({"name": "Beam", "min": [0, 0, 0], "size": [120, 12, 12], "material": "Structural Steel"})),
+                    ("set_mesh", json!({"element_size_mm": hh})),
+                    ("add_fixed_support", json!({"faces": ["Beam.xmin"]})),
+                    ("add_remote_force", json!({"faces": ["Beam.xmax"], "point": [120, 6, 6], "force": [0, 0, 0], "moment": [0, 20, 0]})),
+                    ("solve", json!({})),
+                ])?;
+                out(vec![-field(&r, "deformation_z", "min")?], &r)
+            }),
+        });
+    }
     {
         let e = steel.youngs_modulus_gpa * 1e3;
         let pcr = pi * pi * e * (10.0f64.powi(4) / 12.0) / (4.0 * 200.0f64.powi(2));

@@ -39,6 +39,44 @@ pub struct PatchInfo {
 pub const REGION_SOLID: u8 = 0;
 pub const REGION_ENCLOSURE: u8 = 1;
 
+/// One nodal pair on a split contact interface, paired geometrically after boundary fitting.
+#[derive(Clone, Debug)]
+pub struct ContactConstraint {
+    pub pair_id: u32,
+    pub kind: crate::model::ContactKind,
+    pub friction: f64,
+    /// Contactor node (body src).
+    pub node_a: u32,
+    /// Target quad nodes on body tgt (1 for coincident node-to-node, up to 4 for quad interpolation).
+    pub nodes_b: [u32; 4],
+    pub weights_b: [f64; 4],
+    pub n_b: u8,
+    /// Unit outward normal of body tgt (pointing into body src).
+    pub normal: V3,
+    /// Initial geometric normal gap [m] (>0 open, <0 interference).
+    pub gap0_m: f64,
+    /// Tributary contact area of `node_a` [m²].
+    pub area_m2: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PretensionPair {
+    pub minus: u32,
+    pub plus: u32,
+    pub area_m2: f64,
+}
+
+/// Interior cut section across a bolt body used for two-step bolt pretension.
+#[derive(Clone, Debug)]
+pub struct PretensionSection {
+    pub load_id: u32,
+    pub body_idx: usize,
+    /// Unit normal pointing from minus side to plus side.
+    pub normal: V3,
+    pub cut_mm: f64,
+    pub pairs: Vec<PretensionPair>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Mesh {
     pub h: f64,
@@ -65,6 +103,10 @@ pub struct Mesh {
     /// Per element: true when boundary fitting moved its nodes (general hexahedron, not a cube).
     /// Empty for plain voxel meshes.
     pub fitted: Vec<bool>,
+    /// Non-bonded contact pairs built from `Model::contacts`.
+    pub contacts: Vec<ContactConstraint>,
+    /// Bolt pretension cut sections built from `Load::BoltPretension`.
+    pub pretensions: Vec<PretensionSection>,
 }
 
 /// Local hex node index for corner offset (dx,dy,dz).
@@ -209,6 +251,80 @@ pub fn build_mesh_ex(bodies: &[Body], h: f64, materials: &[Material], with_enclo
 }
 
 pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material], with_enclosure: bool, max_cells: usize, conservative: bool, cancel: &AtomicBool) -> Result<Mesh> {
+    build_mesh_ex_model_cancellable(bodies, h, materials, with_enclosure, max_cells, conservative, None, cancel)
+}
+
+pub fn build_mesh_ex_model_cancellable(
+    bodies: &[Body],
+    h: f64,
+    materials: &[Material],
+    with_enclosure: bool,
+    max_cells: usize,
+    conservative: bool,
+    model: Option<&crate::model::Model>,
+    cancel: &AtomicBool,
+) -> Result<Mesh> {
+    use std::collections::{HashMap, HashSet};
+    let pair_key = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
+    let find_body = |name: &str| bodies.iter().position(|b| b.name.eq_ignore_ascii_case(name.trim()));
+    let mut non_bonded: HashSet<(usize, usize)> = HashSet::new();
+    let mut protected_bodies: HashSet<usize> = HashSet::new();
+    struct PendingBolt {
+        load_id: u32,
+        bi: usize,
+        ax: usize,
+        cut_val: f64,
+    }
+    let mut pending_bolts: Vec<PendingBolt> = Vec::new();
+    if let Some(mdl) = model {
+        let resolve_contact_body = |bname: &str, fnames: &[String]| -> Option<usize> {
+            if !bname.trim().is_empty() {
+                return find_body(bname);
+            }
+            fnames.first().and_then(|s| s.split('.').next()).and_then(find_body)
+        };
+        for c in &mdl.contacts {
+            if !c.kind.splits_mesh() {
+                continue;
+            }
+            if let (Some(ba), Some(bb)) = (resolve_contact_body(&c.body_a, &c.faces_a), resolve_contact_body(&c.body_b, &c.faces_b)) {
+                if ba != bb {
+                    non_bonded.insert(pair_key(ba, bb));
+                    protected_bodies.insert(ba);
+                    protected_bodies.insert(bb);
+                }
+            }
+        }
+        for it in &mdl.loads {
+            if let Some(bname) = it.load.body() {
+                if let Some(bi) = find_body(bname) {
+                    protected_bodies.insert(bi);
+                }
+            }
+            for f in it.load.faces() {
+                if let Some(prefix) = f.split('.').next() {
+                    if let Some(bi) = find_body(prefix) {
+                        protected_bodies.insert(bi);
+                    }
+                }
+            }
+            if let crate::model::Load::BoltPretension { body, axis, cut_mm, .. } = &it.load {
+                if let Some(bi) = find_body(body) {
+                    let ax = axis.map(|a| a.idx()).unwrap_or_else(|| match &bodies[bi].shape {
+                        Shape::Cylinder { axis, .. } => axis.idx(),
+                        _ => {
+                            let (blo, bhi) = bodies[bi].shape.bounds();
+                            let d = [bhi[0] - blo[0], bhi[1] - blo[1], bhi[2] - blo[2]];
+                            if d[0] >= d[1] && d[0] >= d[2] { 0 } else if d[1] >= d[2] { 1 } else { 2 }
+                        }
+                    });
+                    let (blo, bhi) = bodies[bi].shape.bounds();
+                    let cut_val = cut_mm.unwrap_or(0.5 * (blo[ax] + bhi[ax]));
+                    pending_bolts.push(PendingBolt { load_id: it.id, bi, ax, cut_val });
+                }
+            }
+        }
+    }
     let has_solid = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Solid);
     let mut restored: Vec<String> = Vec::new();
     let has_encl = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Enclosure);
@@ -468,16 +584,65 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
             }
             v
         };
-        let mut solid = vec![false; gx * gy * gz];
-        for b in bodies.iter().filter(|b| b.role == Role::Solid && b.op == Op::Add) {
-            for (s, v) in solid.iter_mut().zip(node_in(b, false)) {
-                *s |= v;
+        let mut cgroup = vec![0usize; bodies.len()];
+        let n_cgroups = if non_bonded.is_empty() {
+            1
+        } else {
+            let mut par: Vec<usize> = (0..bodies.len()).collect();
+            let find = |par: &mut Vec<usize>, mut x: usize| -> usize {
+                while par[x] != x {
+                    par[x] = par[par[x]];
+                    x = par[x];
+                }
+                x
+            };
+            for a in 0..bodies.len() {
+                if bodies[a].role != Role::Solid || bodies[a].op != Op::Add {
+                    continue;
+                }
+                for b in (a + 1)..bodies.len() {
+                    if bodies[b].role != Role::Solid || bodies[b].op != Op::Add {
+                        continue;
+                    }
+                    if !non_bonded.contains(&pair_key(a, b)) {
+                        let (ra, rb) = (find(&mut par, a), find(&mut par, b));
+                        if ra != rb {
+                            par[rb] = ra;
+                        }
+                    }
+                }
             }
-        }
-        for b in bodies.iter().filter(|b| b.role == Role::Solid && b.op == Op::Subtract) {
-            for (s, v) in solid.iter_mut().zip(node_in(b, true)) {
-                if v {
-                    *s = false;
+            let mut map = HashMap::new();
+            for bi in 0..bodies.len() {
+                if bodies[bi].role == Role::Solid && bodies[bi].op == Op::Add {
+                    let r = find(&mut par, bi);
+                    let nxt = map.len();
+                    cgroup[bi] = *map.entry(r).or_insert(nxt);
+                }
+            }
+            map.len().max(1)
+        };
+        let mut solids = vec![vec![false; gx * gy * gz]; n_cgroups];
+        for (bi, b) in bodies.iter().enumerate() {
+            if b.role != Role::Solid {
+                continue;
+            }
+            match b.op {
+                Op::Add => {
+                    let g = cgroup[bi];
+                    for (s, v) in solids[g].iter_mut().zip(node_in(b, false)) {
+                        *s |= v;
+                    }
+                }
+                Op::Subtract => {
+                    let nv = node_in(b, true);
+                    for sg in &mut solids {
+                        for (s, &v) in sg.iter_mut().zip(&nv) {
+                            if v {
+                                *s = false;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -490,7 +655,8 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
                     if occ[c] < 0 || region[c] != REGION_SOLID {
                         continue;
                     }
-                    let all = CORNER.iter().all(|o| solid[nid(i + o[0], j + o[1], k + o[2])]);
+                    let sg = &solids[cgroup[owner[c] as usize]];
+                    let all = CORNER.iter().all(|o| sg[nid(i + o[0], j + o[1], k + o[2])]);
                     if !all {
                         occ[c] = if with_enclosure { encl_mat[c] } else { -1 };
                         if with_enclosure && encl_mat[c] >= 0 {
@@ -537,16 +703,21 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
     }
     let mut comp = vec![u32::MAX; ncell];
     let mut sizes = Vec::new();
+    let mut comp_protected = Vec::new();
     for s in 0..ncell {
         if occ[s] < 0 || comp[s] != u32::MAX {
             continue;
         }
         let id = sizes.len() as u32;
         let mut cnt = 0usize;
+        let mut prot = false;
         let mut stack = vec![s];
         comp[s] = id;
         while let Some(c) = stack.pop() {
             cnt += 1;
+            if region[c] == REGION_SOLID && protected_bodies.contains(&(owner[c] as usize)) {
+                prot = true;
+            }
             let (i, j, k) = ((c % nx) as isize, ((c / nx) % ny) as isize, (c / (nx * ny)) as isize);
             for (di, dj, dk) in [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
                 let (ii, jj, kk) = (i + di, j + dj, k + dk);
@@ -561,17 +732,18 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
             }
         }
         sizes.push(cnt);
+        comp_protected.push(prot);
     }
     if sizes.is_empty() {
         bail!("geometry produced an empty mesh; check that bodies are not fully subtracted and the element size is smaller than the part");
     }
     let largest = *sizes.iter().max().unwrap();
-    let keep: Vec<bool> = sizes.iter().map(|&s| s * 50 >= largest && s >= 2).collect();
+    let keep: Vec<bool> = sizes.iter().zip(&comp_protected).map(|(&s, &p)| (s * 50 >= largest && s >= 2) || p).collect();
     let dropped: usize = sizes.iter().zip(&keep).filter(|(_, k)| !**k).map(|(s, _)| s).sum();
     if dropped > 0 {
         warnings.push(format!("removed {dropped} disconnected fragment cell(s)"));
     }
-    if !with_enclosure && keep.iter().filter(|k| **k).count() > 1 {
+    if !with_enclosure && keep.iter().filter(|k| **k).count() > 1 && non_bonded.is_empty() {
         warnings.push("model contains several disconnected parts; each needs its own supports".into());
     }
     for c in 0..ncell {
@@ -580,10 +752,70 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
         }
     }
 
-    // Nodes and elements
+    // Resolve bolt cut planes onto interior grid planes of each bolt body
+    struct BoltCut {
+        load_id: u32,
+        bi: usize,
+        ax: usize,
+        k_cut: usize,
+        cut_mm: f64,
+    }
+    let mut bolt_cuts = Vec::new();
+    for pb in pending_bolts {
+        let mut k_lo = usize::MAX;
+        let mut k_hi = 0usize;
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let c = cid(i, j, k);
+                    if occ[c] >= 0 && region[c] == REGION_SOLID && owner[c] as usize == pb.bi {
+                        let ck = [i, j, k][pb.ax];
+                        k_lo = k_lo.min(ck);
+                        k_hi = k_hi.max(ck);
+                    }
+                }
+            }
+        }
+        if k_lo == usize::MAX || k_hi <= k_lo {
+            bail!(
+                "bolt pretension on '{}' needs at least 2 element layers along the bolt axis (decrease element size)",
+                bodies[pb.bi].name
+            );
+        }
+        let k_cut = ((k_lo + 1)..=k_hi)
+            .min_by(|&a, &b| (lines[pb.ax][a] - pb.cut_val).abs().total_cmp(&(lines[pb.ax][b] - pb.cut_val).abs()))
+            .unwrap();
+        bolt_cuts.push(BoltCut { load_id: pb.load_id, bi: pb.bi, ax: pb.ax, k_cut, cut_mm: lines[pb.ax][k_cut] });
+    }
+
+    // Nodes and elements (split per non-bonded contact interface and bolt pretension cut)
     let (gx, gy) = (nx + 1, ny + 1);
     let gid = |i: usize, j: usize, k: usize| i + gx * (j + gy * k);
+    let has_splits = !non_bonded.is_empty() || !bolt_cuts.is_empty();
+    let split_compatible = |ca: usize, ijk_a: [usize; 3], cb: usize, ijk_b: [usize; 3], g_ijk: [usize; 3]| -> bool {
+        if region[ca] != REGION_SOLID || region[cb] != REGION_SOLID {
+            return true;
+        }
+        let (ba, bb) = (owner[ca] as usize, owner[cb] as usize);
+        if ba != bb && non_bonded.contains(&pair_key(ba, bb)) {
+            return false;
+        }
+        for bc in &bolt_cuts {
+            if g_ijk[bc.ax] != bc.k_cut {
+                continue;
+            }
+            if ba == bc.bi || bb == bc.bi {
+                let sa = ijk_a[bc.ax] >= bc.k_cut;
+                let sb = ijk_b[bc.ax] >= bc.k_cut;
+                if sa != sb {
+                    return false;
+                }
+            }
+        }
+        true
+    };
     let mut node_map = vec![u32::MAX; gx * gy * (nz + 1)];
+    let mut split_map: HashMap<usize, Vec<(Vec<[usize; 4]>, u32)>> = HashMap::new(); // g -> [(cells in cluster as [c,i,j,k], node_id)]
     let mut nodes = Vec::new();
     let (mut elems, mut elem_mat, mut elem_region, mut elem_body, mut elem_cell) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut elem_of_cell = vec![u32::MAX; ncell];
@@ -596,13 +828,34 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
                     continue;
                 }
                 let mut en = [0u32; 8];
-                for (l, d) in CORNER.iter().enumerate() {
-                    let g = gid(i + d[0], j + d[1], k + d[2]);
-                    if node_map[g] == u32::MAX {
-                        node_map[g] = nodes.len() as u32;
-                        nodes.push([lines[0][i + d[0]], lines[1][j + d[1]], lines[2][k + d[2]]]);
+                if !has_splits {
+                    for (l, d) in CORNER.iter().enumerate() {
+                        let g = gid(i + d[0], j + d[1], k + d[2]);
+                        if node_map[g] == u32::MAX {
+                            node_map[g] = nodes.len() as u32;
+                            nodes.push([lines[0][i + d[0]], lines[1][j + d[1]], lines[2][k + d[2]]]);
+                        }
+                        en[l] = node_map[g];
                     }
-                    en[l] = node_map[g];
+                } else {
+                    for (l, d) in CORNER.iter().enumerate() {
+                        let gijk = [i + d[0], j + d[1], k + d[2]];
+                        let g = gid(gijk[0], gijk[1], gijk[2]);
+                        let clusters = split_map.entry(g).or_default();
+                        let cur = [c, i, j, k];
+                        let nid = if let Some(cl) = clusters.iter_mut().find(|(members, _)| {
+                            members.iter().all(|m| split_compatible(c, [i, j, k], m[0], [m[1], m[2], m[3]], gijk))
+                        }) {
+                            cl.0.push(cur);
+                            cl.1
+                        } else {
+                            let id = nodes.len() as u32;
+                            nodes.push([lines[0][gijk[0]], lines[1][gijk[1]], lines[2][gijk[2]]]);
+                            clusters.push((vec![cur], id));
+                            id
+                        };
+                        en[l] = nid;
+                    }
                 }
                 elem_of_cell[c] = elems.len() as u32;
                 elems.push(en);
@@ -613,12 +866,62 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
             }
         }
     }
+    drop(split_map);
     if elems.len() > max_cells {
         bail!("mesh has {} elements (limit {}); increase the element size", elems.len(), max_cells);
     }
 
-    // Boundary faces: solid surfaces (solid next to non-solid) and the enclosure's outer boundary.
+    // Record internal bolt pretension cut pairs across `k == bc.k_cut` inside each bolt body
+    let hm = h * 1e-3;
+    let mut pretensions = Vec::with_capacity(bolt_cuts.len());
+    for bc in &bolt_cuts {
+        let mut pmap: HashMap<(u32, u32), f64> = HashMap::new();
+        let (ax, b_ax, c_ax) = (bc.ax, (bc.ax + 1) % 3, (bc.ax + 2) % 3);
+        let q_area_m2 = 0.25 * (lines[b_ax][1] - lines[b_ax][0]) * 0.0; // replaced per cell below
+        let _ = q_area_m2;
+        for j in 0..dims[b_ax] {
+            for i in 0..dims[c_ax] {
+                let mut ijk_m = [0usize; 3];
+                ijk_m[ax] = bc.k_cut - 1;
+                ijk_m[b_ax] = j;
+                ijk_m[c_ax] = i;
+                let mut ijk_p = ijk_m;
+                ijk_p[ax] = bc.k_cut;
+                let cm = cid(ijk_m[0], ijk_m[1], ijk_m[2]);
+                let cp = cid(ijk_p[0], ijk_p[1], ijk_p[2]);
+                if occ[cm] >= 0 && occ[cp] >= 0 && region[cm] == REGION_SOLID && region[cp] == REGION_SOLID && owner[cm] as usize == bc.bi && owner[cp] as usize == bc.bi {
+                    let em = elems[elem_of_cell[cm] as usize];
+                    let ep = elems[elem_of_cell[cp] as usize];
+                    let db = (lines[b_ax][ijk_m[b_ax] + 1] - lines[b_ax][ijk_m[b_ax]]) * 1e-3;
+                    let dc = (lines[c_ax][ijk_m[c_ax] + 1] - lines[c_ax][ijk_m[c_ax]]) * 1e-3;
+                    let share = 0.25 * db * dc;
+                    for (ob, oc) in [(0usize, 0usize), (1, 0), (1, 1), (0, 1)] {
+                        let mut dm = [0usize; 3];
+                        dm[ax] = 1;
+                        dm[b_ax] = ob;
+                        dm[c_ax] = oc;
+                        let mut dp = [0usize; 3];
+                        dp[ax] = 0;
+                        dp[b_ax] = ob;
+                        dp[c_ax] = oc;
+                        let lm = CORNER.iter().position(|&p| p == dm).unwrap();
+                        let lp = CORNER.iter().position(|&p| p == dp).unwrap();
+                        *pmap.entry((em[lm], ep[lp])).or_insert(0.0) += share;
+                    }
+                }
+            }
+        }
+        let mut pairs: Vec<PretensionPair> = pmap.into_iter().map(|((minus, plus), area_m2)| PretensionPair { minus, plus, area_m2 }).collect();
+        pairs.sort_by_key(|p| (p.minus, p.plus));
+        let mut normal = [0.0; 3];
+        normal[ax] = 1.0;
+        pretensions.push(PretensionSection { load_id: bc.load_id, body_idx: bc.bi, normal, cut_mm: bc.cut_mm, pairs });
+    }
+    let _ = hm;
+
+    // Boundary faces: solid surfaces (solid next to non-solid or non-bonded contact body) and the enclosure's outer boundary.
     let mut faces = Vec::new();
+    let mut split_face = Vec::new();
     let order = [(0usize, 0usize), (1, 0), (1, 1), (0, 1)];
     for k in 0..nz {
         for j in 0..ny {
@@ -627,7 +930,10 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
                 if occ[c] < 0 {
                     continue;
                 }
-                let ijk = [i, j, k];
+                let el = elem_of_cell[c] as usize;
+                let en = elems[el];
+                let mut ijk = [i, j, k];
+                let _ = &mut ijk;
                 for dir in 0..6u8 {
                     let a = (dir / 2) as usize;
                     let plus = dir % 2 == 1;
@@ -637,8 +943,9 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
                     let ncell = inside.then(|| cid(n[0] as usize, n[1] as usize, n[2] as usize));
                     let n_active = ncell.is_some_and(|q| occ[q] >= 0);
                     let n_solid = ncell.is_some_and(|q| occ[q] >= 0 && region[q] == REGION_SOLID);
+                    let is_split = n_solid && ncell.is_some_and(|nc| non_bonded.contains(&pair_key(owner[c] as usize, owner[nc] as usize)));
                     let outer = match region[c] {
-                        REGION_SOLID if !n_solid => false,
+                        REGION_SOLID if !n_solid || is_split => false,
                         REGION_ENCLOSURE if !n_active => true,
                         _ => continue,
                     };
@@ -649,14 +956,16 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
                         d[a] = plus as usize;
                         d[b] = *ob;
                         d[cax] = *oc;
-                        quad[q] = node_map[gid(ijk[0] + d[0], ijk[1] + d[1], ijk[2] + d[2])];
+                        let cl = CORNER.iter().position(|&p| p == d).unwrap();
+                        quad[q] = en[cl];
                     }
                     if !plus {
                         quad.swap(1, 3);
                     }
                     let mut ctr = center(i, j, k);
                     ctr[a] = lines[a][ijk[a] + plus as usize];
-                    faces.push(BFace { elem: elem_of_cell[c], nodes: quad, dir, patch: 0, center: ctr, outer });
+                    faces.push(BFace { elem: el as u32, nodes: quad, dir, patch: 0, center: ctr, outer });
+                    split_face.push(is_split);
                 }
             }
         }
@@ -680,10 +989,20 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
             }
             let n = dir_normal(f.dir);
             let want = if f.outer { Role::Enclosure } else { Role::Solid };
+            let owner_bi = elem_body[f.elem as usize] as usize;
+            let is_split = split_face[fi];
             let mut best = (0usize, f64::INFINITY);
             for (bi, b) in bodies.iter().enumerate() {
                 if b.role != want {
                     continue;
+                }
+                if !f.outer {
+                    if is_split && bi != owner_bi && b.op != Op::Subtract {
+                        continue;
+                    }
+                    if !is_split && non_bonded.contains(&pair_key(bi, owner_bi)) {
+                        continue;
+                    }
                 }
                 let (pi, s) = b.shape.best_patch(f.center, n, h, b.op == Op::Subtract);
                 if s < best.1 {
@@ -725,7 +1044,7 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
     } else {
         Vec::new()
     };
-    Ok(Mesh {
+    let mut mesh = Mesh {
         h,
         origin,
         dims,
@@ -744,7 +1063,15 @@ pub fn build_mesh_ex_cancellable(bodies: &[Body], h: f64, materials: &[Material]
         with_enclosure,
         patch_src,
         fitted: snapped_elems,
-    })
+        contacts: Vec::new(),
+        pretensions,
+    };
+    if !conservative {
+        if let Some(mdl) = model {
+            mesh.build_contact_pairs(mdl)?;
+        }
+    }
+    Ok(mesh)
 }
 
 /// Mesh for a model: voxel mesh, boundary-fitted when the analysis asks for it.
@@ -754,9 +1081,10 @@ pub fn build_for(model: &crate::model::Model, h: f64, max_cells: usize) -> Resul
 
 pub fn build_for_cancellable(model: &crate::model::Model, h: f64, max_cells: usize, cancel: &AtomicBool) -> Result<Mesh> {
     let fit = model.mesh_fitted();
-    let mut m = build_mesh_ex_cancellable(&model.bodies, h, &model.materials(), model.mesh_with_enclosure(), max_cells, fit, cancel)?;
+    let mut m = build_mesh_ex_model_cancellable(&model.bodies, h, &model.materials(), model.mesh_with_enclosure(), max_cells, fit, Some(model), cancel)?;
     if fit {
         m.fit_boundary_cancellable(&model.bodies, cancel)?;
+        m.build_contact_pairs(model)?;
     }
     Ok(m)
 }
@@ -1372,5 +1700,291 @@ impl Mesh {
                 Some(out)
             })
             .collect()
+    }
+
+    /// Outward face normal at current (possibly fitted) vertex coordinates.
+    pub fn face_normal(&self, fi: usize) -> V3 {
+        let q = self.faces[fi].nodes.map(|n| self.nodes[n as usize]);
+        let c = cross(sub(q[2], q[0]), sub(q[3], q[1]));
+        let l = norm(c);
+        if l > 1e-18 { scale(c, 1.0 / l) } else { dir_normal(self.faces[fi].dir) }
+    }
+
+    /// Populate `self.contacts` by pairing split interface nodes geometrically (call after boundary fitting).
+    pub fn build_contact_pairs(&mut self, model: &crate::model::Model) -> Result<()> {
+        self.contacts.clear();
+        if model.contacts.is_empty() {
+            return Ok(());
+        }
+        let body_faces = |name: &str, fsel: &[String]| -> Result<Vec<usize>> {
+            if !fsel.is_empty() {
+                return Ok(self.resolve_faces(fsel)?.into_iter().map(|i| i as usize).collect());
+            }
+            let Some(bi) = self.body_names.iter().position(|b| b.eq_ignore_ascii_case(name.trim())) else {
+                anyhow::bail!("contact references unknown body '{name}' (bodies: {:?})", self.body_names);
+            };
+            Ok((0..self.faces.len())
+                .filter(|&fi| !self.faces[fi].outer && self.elem_body[self.faces[fi].elem as usize] as usize == bi)
+                .collect())
+        };
+        let mut out_contacts = Vec::new();
+        let mut out_warnings = Vec::new();
+        let face_aabb = |list: &[usize]| -> (V3, V3) {
+            let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for &fi in list {
+                for &n in &self.faces[fi].nodes {
+                    let p = self.nodes[n as usize];
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                }
+            }
+            (lo, hi)
+        };
+        let in_box = |p: V3, b: &(V3, V3), pad: f64| (0..3).all(|k| p[k] >= b.0[k] - pad && p[k] <= b.1[k] + pad);
+
+        for cp in &model.contacts {
+            if !cp.kind.splits_mesh() {
+                continue;
+            }
+            if !cp.friction.is_finite() || cp.friction < 0.0 {
+                anyhow::bail!("contact #{}: friction coefficient must be finite and ≥ 0", cp.id);
+            }
+            if !cp.offset_mm.is_finite() {
+                anyhow::bail!("contact #{}: offset_mm must be finite", cp.id);
+            }
+            let fa_all = body_faces(&cp.body_a, &cp.faces_a)?;
+            let fb_all = body_faces(&cp.body_b, &cp.faces_b)?;
+            if fa_all.is_empty() || fb_all.is_empty() {
+                continue;
+            }
+            let search = (2.5 * self.h).max(cp.offset_mm.abs() + 2.0 * self.h);
+            let ba = face_aabb(&fa_all);
+            let bb = face_aabb(&fb_all);
+            let fa_cand: Vec<(usize, V3, V3)> = fa_all
+                .iter()
+                .filter_map(|&fi| {
+                    let f = &self.faces[fi];
+                    in_box(f.center, &bb, search + self.h).then(|| (fi, f.center, self.face_normal(fi)))
+                })
+                .collect();
+            let fb_cand: Vec<(usize, V3, V3)> = fb_all
+                .iter()
+                .filter_map(|&fi| {
+                    let f = &self.faces[fi];
+                    in_box(f.center, &ba, search + self.h).then(|| (fi, f.center, self.face_normal(fi)))
+                })
+                .collect();
+            let has_opp = |c: (usize, V3, V3), others: &[(usize, V3, V3)]| -> bool {
+                let lim2 = (search + 1.5 * self.h).powi(2);
+                others.iter().any(|o| dot(c.2, o.2) < -0.25 && {
+                    let d = sub(c.1, o.1);
+                    dot(d, d) <= lim2
+                })
+            };
+            let fa_opp: Vec<(usize, V3, V3)> = fa_cand.iter().copied().filter(|c| has_opp(*c, &fb_cand)).collect();
+            let fb_opp: Vec<(usize, V3, V3)> = fb_cand.iter().copied().filter(|c| has_opp(*c, &fa_cand)).collect();
+            if fa_opp.is_empty() || fb_opp.is_empty() {
+                out_warnings.push(format!("contact #{} ({}) found no opposing face pairs within {search:.2} mm", cp.id, cp.summary()));
+                continue;
+            }
+            let stats = |list: &[(usize, V3, V3)]| -> (f64, bool) {
+                let mut tot = 0.0;
+                let mut nmean = [0.0; 3];
+                for &(fi, _, nrm) in list {
+                    let q = self.faces[fi].nodes.map(|n| self.nodes[n as usize].map(|v| v * 1e-3));
+                    let a: f64 = quad_shares(&q).1.iter().sum();
+                    tot += a;
+                    nmean = add(nmean, scale(nrm, a));
+                }
+                let nm = norm(nmean);
+                let flat = if nm > 1e-18 {
+                    let u = scale(nmean, 1.0 / nm);
+                    list.iter().all(|&(_, _, n)| dot(n, u) >= 0.995)
+                } else {
+                    false
+                };
+                (tot, !flat)
+            };
+            let (area_a, curved_a) = stats(&fa_opp);
+            let (area_b, curved_b) = stats(&fb_opp);
+            // Put curved side (e.g. Hertz cylinder) or smaller side as contactor onto flatter/larger target quads
+            let a_is_src = if curved_a != curved_b { curved_a } else { area_a <= area_b * (1.0 + 1e-6) };
+            let (src_faces, tgt_faces) = if a_is_src { (&fa_opp, &fb_opp) } else { (&fb_opp, &fa_opp) };
+
+            let mut src_nodes: std::collections::HashMap<u32, (V3, f64)> = std::collections::HashMap::new();
+            for &(fi, _, _) in src_faces {
+                let q = self.faces[fi].nodes.map(|n| self.nodes[n as usize].map(|v| v * 1e-3));
+                let (sh, sa) = quad_shares(&q);
+                for k in 0..4 {
+                    let nd = self.faces[fi].nodes[k];
+                    let e = src_nodes.entry(nd).or_insert(([0.0; 3], 0.0));
+                    e.0 = add(e.0, sh[k]);
+                    e.1 += sa[k];
+                }
+            }
+            let mut sorted_src: Vec<(u32, (V3, f64))> = src_nodes.into_iter().collect();
+            sorted_src.sort_by_key(|(n, _)| *n);
+
+            for (node_a, (na_vec, area_m2)) in sorted_src {
+                if area_m2 <= 0.0 || norm(na_vec) <= 1e-24 {
+                    continue;
+                }
+                let p_a = self.nodes[node_a as usize];
+                let na_u = scale(na_vec, 1.0 / norm(na_vec));
+                let mut best: Option<(bool, f64, [u32; 4], [f64; 4], u8, V3, f64)> = None;
+                for &(tf, _, nb_u) in tgt_faces {
+                    if dot(na_u, nb_u) >= -0.25 {
+                        continue;
+                    }
+                    let q_nodes = self.faces[tf].nodes;
+                    let q_pts = q_nodes.map(|n| self.nodes[n as usize]);
+                    let (p_proj, w) = closest_point_on_quad(p_a, &q_pts);
+                    let dv = sub(p_a, p_proj);
+                    let dist3 = norm(dv);
+                    if dist3 > search {
+                        continue;
+                    }
+                    let g_geom = dot(dv, nb_u);
+                    if g_geom < -search {
+                        continue;
+                    }
+                    let dt = norm(sub(dv, scale(nb_u, g_geom)));
+                    if dt > 0.45 * self.h {
+                        continue;
+                    }
+                    let out_of_quad = dt > 0.05 * self.h;
+                    // Check if coinciding with a single vertex on the quad
+                    let (mut nodes_b, mut weights_b, mut n_b) = (q_nodes, w, 4u8);
+                    for k in 0..4 {
+                        if norm(sub(p_a, q_pts[k])) <= 1e-4 * self.h || w[k] >= 1.0 - 1e-4 {
+                            nodes_b = [q_nodes[k], 0, 0, 0];
+                            weights_b = [1.0, 0.0, 0.0, 0.0];
+                            n_b = 1;
+                            break;
+                        }
+                    }
+                    let better = match &best {
+                        None => true,
+                        Some((prev_out, prev_d, ..)) => (out_of_quad, dist3) < (*prev_out, *prev_d),
+                    };
+                    if better {
+                        best = Some((out_of_quad, dist3, nodes_b, weights_b, n_b, nb_u, g_geom));
+                    }
+                }
+                if let Some((_, _, nodes_b, weights_b, n_b, normal, g_geom)) = best {
+                    let gap0_m = (g_geom - cp.offset_mm) * 1e-3;
+                    out_contacts.push(ContactConstraint { pair_id: cp.id, kind: cp.kind, friction: cp.friction, node_a, nodes_b, weights_b, n_b, normal, gap0_m, area_m2 });
+                }
+            }
+        }
+        self.contacts = out_contacts;
+        self.warnings.extend(out_warnings);
+        Ok(())
+    }
+
+    /// Node ties `(a, b)` for zero-gap contact interfaces and pretension cuts in linear/thermal/field solvers.
+    pub fn interface_ties(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for ps in &self.pretensions {
+            for pr in &ps.pairs {
+                out.push((pr.minus, pr.plus));
+            }
+        }
+        let tol = 1e-4 * (self.h * 1e-3) + 1e-9;
+        for c in &self.contacts {
+            if c.gap0_m.abs() <= tol {
+                let mut kmax = 0;
+                for k in 1..(c.n_b as usize) {
+                    if c.weights_b[k] > c.weights_b[kmax] {
+                        kmax = k;
+                    }
+                }
+                out.push((c.node_a, c.nodes_b[kmax]));
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// Consistent bilinear quad shares `(∫ Nᵢ n dA, ∫ Nᵢ dA)` in the vertex array's length² units.
+pub fn quad_shares(q: &[V3; 4]) -> ([V3; 4], [f64; 4]) {
+    const GP: f64 = 0.577_350_269_189_625_8;
+    let mut sh = [[0.0; 3]; 4];
+    let mut sa = [0.0; 4];
+    for (a, b) in [(-GP, -GP), (GP, -GP), (GP, GP), (-GP, GP)] {
+        let nn = [(1.0 - a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 - b) / 4.0, (1.0 + a) * (1.0 + b) / 4.0, (1.0 - a) * (1.0 + b) / 4.0];
+        let da = [-(1.0 - b) / 4.0, (1.0 - b) / 4.0, (1.0 + b) / 4.0, -(1.0 + b) / 4.0];
+        let db = [-(1.0 - a) / 4.0, -(1.0 + a) / 4.0, (1.0 + a) / 4.0, (1.0 - a) / 4.0];
+        let mut ta = [0.0; 3];
+        let mut tb = [0.0; 3];
+        for k in 0..4 {
+            ta = add(ta, scale(q[k], da[k]));
+            tb = add(tb, scale(q[k], db[k]));
+        }
+        let dav = cross(ta, tb);
+        let dan = dot(dav, dav).sqrt();
+        for k in 0..4 {
+            sh[k] = add(sh[k], scale(dav, nn[k]));
+            sa[k] += dan * nn[k];
+        }
+    }
+    (sh, sa)
+}
+
+fn closest_on_tri(p: V3, a: V3, b: V3, c: V3) -> (V3, [f64; 3]) {
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(p, a);
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return (a, [1.0, 0.0, 0.0]);
+    }
+    let bp = sub(p, b);
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return (b, [0.0, 1.0, 0.0]);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return (add(a, scale(ab, v)), [1.0 - v, v, 0.0]);
+    }
+    let cp = sub(p, c);
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return (c, [0.0, 0.0, 1.0]);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return (add(a, scale(ac, w)), [1.0 - w, 0.0, w]);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return (add(b, scale(sub(c, b), w)), [0.0, 1.0 - w, w]);
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    (add(a, add(scale(ab, v), scale(ac, w))), [1.0 - v - w, v, w])
+}
+
+fn closest_point_on_quad(p: V3, q: &[V3; 4]) -> (V3, [f64; 4]) {
+    let (p1, w1) = closest_on_tri(p, q[0], q[1], q[2]);
+    let (p2, w2) = closest_on_tri(p, q[0], q[2], q[3]);
+    let d1 = sub(p, p1);
+    let d2 = sub(p, p2);
+    if dot(d1, d1) <= dot(d2, d2) {
+        (p1, [w1[0], w1[1], w1[2], 0.0])
+    } else {
+        (p2, [w2[0], 0.0, w2[1], w2[2]])
     }
 }

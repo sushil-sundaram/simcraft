@@ -144,6 +144,13 @@ fn load_fields(l: &Load) -> Vec<String> {
         Load::Magnet { .. } => v3("remanence"),
         Load::Inlet { .. } => vec!["velocity".into()],
         Load::Outlet { .. } => vec!["pressure".into()],
+        Load::BoltPretension { force_n, adjustment_mm, .. } => {
+            if force_n.is_some() { vec!["force_n".into()] } else if adjustment_mm.is_some() { vec!["adjustment_mm".into()] } else { vec![] }
+        }
+        Load::Spring { .. } => vec!["stiffness_n_per_mm".into(), "preload_n".into()],
+        Load::RemoteForce { .. } => v3("force").into_iter().chain(v3("moment")).collect(),
+        Load::RemoteDisplacement { .. } => vec!["x".into(), "y".into(), "z".into(), "rx".into(), "ry".into(), "rz".into()],
+        Load::PointMass { .. } => vec!["mass_kg".into()],
         _ => vec![],
     }
 }

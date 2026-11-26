@@ -149,20 +149,12 @@ Trilinear hex-mesh point locator and straight-line path sampling (`Mesh::locate_
   conversion, 3-part bonded AP214 assembly, elementary analytic surfaces, sandbox/malformed-input safety,
   and cancellation.
 
-### P2.4 Assemblies: contact, pretension, connections (L)
+### P2.4 Assemblies: contact, pretension, connections (L) — done (`tests/p2_4.rs`, `src/bench.rs`)
 
-- Today bodies that touch share voxel nodes, so every interface is **bonded**. Add per-pair
-  interface types — bonded, no separation, frictionless, frictional (μ) — by duplicating the
-  interface nodes. On the voxel lattice the duplicated nodes stay paired, so contact is
-  node-to-node (small sliding): augmented-Lagrange gap and Coulomb friction with an active-set loop,
-  extending today's compression-only supports.
-- **Bolt pretension**: a cylinder body or selected bolt body with a pretension section (force or
-  adjustment), solved as step 1, external loads as step 2; reports preload loss.
-- **Connections**: springs (point-to-ground and between faces), remote points / remote forces and
-  moments (distributing coupling), point masses for modal.
-- **Validate**: stacked blocks under pressure (separation where expected); block on a plane sliding
-  at F = μN; Hertz cylinder-on-flat with fitting (peak pressure within 10 %); bolted joint stiffness
-  ratio vs VDI 2230; remote moment vs beam theory.
+- **Done:** Pairwise body contact interfaces (`ContactKind::Bonded`, `NoSeparation`, `Frictionless`, `Frictional` with `friction` μ and `offset_mm`) with split interface nodes, per-owner B-rep boundary fitting, and an Augmented-Lagrange + active-set solver with cached LDLᵀ factorizations (`src/fem.rs`, `src/mesh.rs`, `src/model.rs`, `src/sparse.rs`). Outputs `Field::ContactPressure` contours and contact force/status quantities, with thermal/field continuity ties across zero-gap interfaces.
+- **Done:** Two-step `BoltPretension` across internal cut sections (`force_n` N or `adjustment_mm` mm): Step 1 solves preload shortening against supports and contacts; Step 2 locks adjustment under external loads and reports Step 1/Step 2 bolt forces, locked adjustment, and preload loss.
+- **Done:** Structural connections (`Load::Spring` face-to-ground and face-to-face with preload, `Load::RemoteForce` RBE3 distributing force & moment, `Load::RemoteDisplacement` distributing/rigid pilot DOFs, and `Load::PointMass` for Gravity/Modal/Vibration/Transient), GUI ribbon/forms/overlays/browser controls, and MCP tools (`add_contact`, `remove_contact`, `clear_contacts`, `add_bolt_pretension`, `add_spring`, `add_remote_force`, `add_remote_displacement`, `add_point_mass`).
+- **Validated (`tests/p2_4.rs`, `bench --quick`):** Stacked blocks (separation vs no-separation under prying and compression); Coulomb sliding at $F = \mu N$ ($\mu = 0, 0.25, 0.5$) plus static sticking; Hertz fitted cylinder-on-flat peak pressure within 10%; bolted joint VDI 2230 stiffness factor + positive preload loss; RBE3 remote moment vs Euler–Bernoulli theory (`remote_moment`), eccentric load, springs, and point-mass modal/gravity response.
 
 ### P2.5 Local mesh refinement (XL)
 

@@ -40,7 +40,7 @@ current density and the IPC-2221 temperature rise of each track, with vias betwe
 
 | Group | Analysis | Results |
 |---|---|---|
-| Structural | **Static Structural** (+ compression-only contact, symmetry) | deformation, von Mises, principal stresses, safety factor, reactions |
+| Structural | **Static Structural** (bonded/no-separation/frictionless/frictional contact, bolt pretension, springs, remote loads/points, symmetry) | deformation, contact pressure, von Mises, principal stresses, safety factor, bolt forces, reactions |
 | | **Modal** | natural frequencies + mode shapes |
 | | **Linear Buckling** | critical load multipliers + buckled shapes |
 | | **Transient Structural** | time history, peak displacement, animated response |
@@ -138,9 +138,9 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | Cantilever Richardson extrapolation (3 coarse meshes, 4 → 2 mm) | 2.6617 mm | 2.6719 mm (Timoshenko, 0.38 %) |
 
 ### Benchmarks (`simcraft bench`)
-33 reference cases (NAFEMS LE1 and T4, closed forms, Ghia, de Vahl Davis, Dean, waveguide and dipole
+35 reference cases (NAFEMS LE1 and T4, closed forms, Hertz & Coulomb contact, RBE3 remote moment, Ghia, de Vahl Davis, Dean, waveguide and dipole
 fields, KiCad copper, cylindrical paths and Richardson convergence), each at several mesh sizes → `bench-out/bench.html` with error-vs-unknowns
-plots and convergence order. `--quick` (23 cases, ≈ 21 s) gates every CI run; `--template` /
+plots and convergence order. `--quick` (27 cases) gates every CI run; `--template` /
 `--compare FILE` put another solver's results (e.g. Ansys) next to SimCraft's in the same report.
 
 ### Limitations
@@ -152,8 +152,7 @@ plots and convergence order. `--quick` (23 cases, ≈ 21 s) gates every CI run; 
   does not settle, e.g. vortex shedding); conjugate heat transfer radiates to the surroundings only.
 - Full-wave EM is single-frequency; far fields are free-space estimates.
 - Thermal radiation is grey and diffuse.
-- Not included: contact between two
-  deformable bodies (only contact against a rigid surface).
+- Assembly contact uses small-sliding Augmented-Lagrange pairing (large-sliding finite-deformation contact is not yet supported).
 
 ## Desktop app
 Ribbon tabs **GEOMETRY · MATERIAL · SETUP · MESH · SOLVE · RESULTS**, a model browser, a

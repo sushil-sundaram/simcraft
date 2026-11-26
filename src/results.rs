@@ -92,10 +92,11 @@ pub enum Field {
     VelocityX,
     VelocityY,
     VelocityZ,
+    ContactPressure,
 }
 
 impl Field {
-    pub fn all() -> [Field; 31] {
+    pub fn all() -> [Field; 32] {
         use Field::*;
         [
             TotalDeformation,
@@ -110,6 +111,7 @@ impl Field {
             AxialStress,
             SafetyFactor,
             PlasticStrain,
+            ContactPressure,
             Temperature,
             HeatFlux,
             ElectricPotential,
@@ -146,6 +148,7 @@ impl Field {
             AxialStress => "Axial Stress",
             SafetyFactor => "Safety Factor",
             PlasticStrain => "Equivalent Plastic Strain",
+            ContactPressure => "Contact Pressure",
             Temperature => "Temperature",
             HeatFlux => "Total Heat Flux",
             ElectricPotential => "Electric Potential",
@@ -171,7 +174,7 @@ impl Field {
         use Field::*;
         match self {
             TotalDeformation | DeformationX | DeformationY | DeformationZ => "mm",
-            VonMises | MaxPrincipal | MinPrincipal | RadialStress | HoopStress | AxialStress => "MPa",
+            VonMises | MaxPrincipal | MinPrincipal | RadialStress | HoopStress | AxialStress | ContactPressure => "MPa",
             SafetyFactor => "",
             PlasticStrain => "mm/mm",
             Temperature => "°C",

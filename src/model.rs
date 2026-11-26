@@ -249,6 +249,69 @@ pub enum CoilMode {
     Circumferential,
 }
 
+/// Body-to-body structural interface behaviour (default when omitted: bonded / merged nodes).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactKind {
+    #[default]
+    Bonded,
+    NoSeparation,
+    Frictionless,
+    Frictional,
+}
+
+impl ContactKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ContactKind::Bonded => "Bonded",
+            ContactKind::NoSeparation => "No Separation",
+            ContactKind::Frictionless => "Frictionless",
+            ContactKind::Frictional => "Frictional",
+        }
+    }
+    pub fn splits_mesh(self) -> bool {
+        !matches!(self, ContactKind::Bonded)
+    }
+}
+
+/// Pairwise contact definition between two bodies (or subsets of their faces).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContactPair {
+    pub id: u32,
+    #[serde(default)]
+    pub body_a: String,
+    #[serde(default)]
+    pub body_b: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub faces_a: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub faces_b: Vec<String>,
+    #[serde(default)]
+    pub kind: ContactKind,
+    /// Coulomb friction coefficient μ ≥ 0 (used when `kind == Frictional`).
+    #[serde(default = "default_friction")]
+    pub friction: f64,
+    /// Normal offset [mm] subtracted from geometric gap (>0 = interference / shrink fit; <0 = initial clearance).
+    #[serde(default)]
+    pub offset_mm: f64,
+}
+fn default_friction() -> f64 {
+    0.2
+}
+
+impl ContactPair {
+    pub fn summary(&self) -> String {
+        let a = if !self.faces_a.is_empty() { self.faces_a.join(", ") } else { self.body_a.clone() };
+        let b = if !self.faces_b.is_empty() { self.faces_b.join(", ") } else { self.body_b.clone() };
+        let extra = match self.kind {
+            ContactKind::Frictional => format!(", μ={}", self.friction),
+            _ => String::new(),
+        };
+        let off = if self.offset_mm != 0.0 { format!(", offset={} mm", self.offset_mm) } else { String::new() };
+        format!("{} ↔ {} ({}{}{})", a, b, self.kind.label(), extra, off)
+    }
+}
+
 /// Units: lengths/displacements mm, forces N, pressure MPa, temperature °C,
 /// heat flux W/m², film coefficient W/(m² K), heat generation W/m³, acceleration m/s²,
 /// voltage V, current A, current density A/mm², remanence T, velocity m/s, fluid pressure Pa.
@@ -340,6 +403,68 @@ pub enum Load {
         #[serde(default = "te10")]
         profile: String,
     },
+    /// Bolt pretension across an interior cut plane of `body`. Specify either `force_n` [N]
+    /// (Step 1 target preload, then locked for Step 2) or `adjustment_mm` [mm] (shortening Δ).
+    BoltPretension {
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        force_n: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adjustment_mm: Option<f64>,
+        /// Cut normal axis (None = auto: cylinder axis or longest bounding-box axis of `body`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis: Option<Axis>,
+        /// Cut coordinate along `axis` [mm] (None = body midpoint).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_mm: Option<f64>,
+    },
+    /// Elastic spring connecting `faces` to ground (when `to_faces` is None) or to `to_faces`.
+    Spring {
+        faces: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_faces: Option<Vec<String>>,
+        stiffness_n_per_mm: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        anchor: Option<V3>,
+        #[serde(default)]
+        preload_n: f64,
+    },
+    /// Remote force [N] and/or moment [N·m] applied at `point` [mm] via RBE3 weighted distribution on `faces`.
+    RemoteForce {
+        faces: Vec<String>,
+        point: V3,
+        #[serde(default)]
+        force: V3,
+        #[serde(default)]
+        moment: V3,
+    },
+    /// Remote point constraint/displacement at `point` [mm] coupled to `faces` (rigid RBE2 or distributing RBE3).
+    /// Translations in mm, rotations in rad.
+    RemoteDisplacement {
+        faces: Vec<String>,
+        point: V3,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        z: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rx: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ry: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rz: Option<f64>,
+        #[serde(default)]
+        rigid: bool,
+    },
+    /// Concentrated mass [kg] attached to `faces` (at `point` [mm] or face centroid). Participates in Gravity and dynamic/modal analyses.
+    PointMass {
+        faces: Vec<String>,
+        mass_kg: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        point: Option<V3>,
+    },
 }
 fn g() -> V3 {
     [0.0, 0.0, -9.80665]
@@ -369,6 +494,11 @@ impl Load {
             Load::Outlet { .. } => "Pressure Outlet",
             Load::Port { .. } => "RF Port",
             Load::MovingWall { .. } => "Moving Wall",
+            Load::BoltPretension { .. } => "Bolt Pretension",
+            Load::Spring { .. } => "Elastic Spring",
+            Load::RemoteForce { .. } => "Remote Force",
+            Load::RemoteDisplacement { .. } => "Remote Displacement",
+            Load::PointMass { .. } => "Point Mass",
         }
     }
     pub fn faces(&self) -> &[String] {
@@ -388,13 +518,17 @@ impl Load {
             | Load::Inlet { faces, .. }
             | Load::Outlet { faces, .. }
             | Load::Port { faces, .. }
-            | Load::MovingWall { faces, .. } => faces,
+            | Load::MovingWall { faces, .. }
+            | Load::Spring { faces, .. }
+            | Load::RemoteForce { faces, .. }
+            | Load::RemoteDisplacement { faces, .. }
+            | Load::PointMass { faces, .. } => faces,
             _ => &[],
         }
     }
     pub fn body(&self) -> Option<&str> {
         match self {
-            Load::Coil { body, .. } | Load::Magnet { body, .. } => Some(body),
+            Load::Coil { body, .. } | Load::Magnet { body, .. } | Load::BoltPretension { body, .. } => Some(body),
             Load::HeatGeneration { body: Some(b), .. } => Some(b),
             _ => None,
         }
@@ -409,10 +543,22 @@ impl Load {
                 | Load::Force { .. }
                 | Load::Pressure { .. }
                 | Load::Gravity { .. }
+                | Load::BoltPretension { .. }
+                | Load::Spring { .. }
+                | Load::RemoteForce { .. }
+                | Load::RemoteDisplacement { .. }
+                | Load::PointMass { .. }
         )
     }
     pub fn is_support(&self) -> bool {
-        matches!(self, Load::FixedSupport { .. } | Load::Displacement { .. } | Load::CompressionOnly { .. } | Load::Symmetry { .. })
+        matches!(
+            self,
+            Load::FixedSupport { .. }
+                | Load::Displacement { .. }
+                | Load::CompressionOnly { .. }
+                | Load::Symmetry { .. }
+                | Load::RemoteDisplacement { .. }
+        )
     }
     pub fn is_thermal(&self) -> bool {
         matches!(self, Load::Temperature { .. } | Load::HeatFlux { .. } | Load::Convection { .. } | Load::Radiation { .. } | Load::HeatGeneration { .. })
@@ -422,7 +568,9 @@ impl Load {
         use AnalysisType::*;
         match kind {
             StaticStructural | NonlinearStructural | TransientStructural | LinearBuckling => self.is_structural(),
-            Modal | ResponseSpectrum | RandomVibration => self.is_support(),
+            Modal | ResponseSpectrum | RandomVibration => {
+                self.is_support() || matches!(self, Load::Spring { .. } | Load::PointMass { .. } | Load::BoltPretension { .. })
+            }
             HarmonicResponse => self.is_structural() && !matches!(self, Load::Gravity { .. }),
             SteadyThermal | TransientThermal => self.is_thermal(),
             ThermalStress => self.is_structural() || self.is_thermal(),
@@ -470,6 +618,31 @@ impl Load {
             Load::MovingWall { faces, velocity: v } => format!("({}, {}, {}) m/s on {}", v[0], v[1], v[2], f(faces)),
             Load::Outlet { faces, pressure } => format!("{pressure} Pa on {}", f(faces)),
             Load::Port { faces, power, polarization, profile } => format!("{power} W, E along {:?} ({profile}) on {}", polarization, f(faces)),
+            Load::BoltPretension { body, force_n, adjustment_mm, axis, .. } => {
+                let ax = axis.map(|a| format!(" ({a:?})")).unwrap_or_default();
+                match (force_n, adjustment_mm) {
+                    (Some(fn_), _) => format!("{fn_} N preload on {body}{ax}"),
+                    (None, Some(dz)) => format!("{dz} mm adjustment on {body}{ax}"),
+                    (None, None) => format!("on {body}{ax}"),
+                }
+            }
+            Load::Spring { faces, to_faces, stiffness_n_per_mm, preload_n, .. } => {
+                let target = to_faces.as_ref().map(|v| f(v)).unwrap_or_else(|| "ground".into());
+                let pre = if *preload_n != 0.0 { format!(", preload {preload_n} N") } else { String::new() };
+                format!("k={stiffness_n_per_mm} N/mm{} ({} ↔ {target})", pre, f(faces))
+            }
+            Load::RemoteForce { faces, point, force, moment } => {
+                format!("F=({}, {}, {}) N, M=({}, {}, {}) N·m at ({}, {}, {}) mm on {}", force[0], force[1], force[2], moment[0], moment[1], moment[2], point[0], point[1], point[2], f(faces))
+            }
+            Load::RemoteDisplacement { faces, point, x, y, z, rx, ry, rz, rigid } => {
+                let c = |o: &Option<f64>| o.map(|v| format!("{v}")).unwrap_or("free".into());
+                let kind = if *rigid { "rigid" } else { "distributing" };
+                format!("({kind}) u=({},{},{}) mm θ=({},{},{}) rad at ({},{},{}) on {}", c(x), c(y), c(z), c(rx), c(ry), c(rz), point[0], point[1], point[2], f(faces))
+            }
+            Load::PointMass { faces, mass_kg, point } => match point {
+                Some(p) => format!("{mass_kg} kg at ({}, {}, {}) mm on {}", p[0], p[1], p[2], f(faces)),
+                None => format!("{mass_kg} kg on {}", f(faces)),
+            },
         }
     }
 }
@@ -491,6 +664,8 @@ pub struct Model {
     pub analysis: AnalysisSettings,
     #[serde(default)]
     pub loads: Vec<LoadItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacts: Vec<ContactPair>,
     /// Element size [mm]; None = automatic.
     #[serde(default)]
     pub element_size: Option<f64>,
@@ -500,7 +675,7 @@ pub struct Model {
 
 impl Default for Model {
     fn default() -> Self {
-        Model { bodies: vec![], custom_materials: vec![], analysis: AnalysisSettings::default(), loads: vec![], element_size: None, next_id: 1 }
+        Model { bodies: vec![], custom_materials: vec![], analysis: AnalysisSettings::default(), loads: vec![], contacts: vec![], element_size: None, next_id: 1 }
     }
 }
 
@@ -605,10 +780,35 @@ pub fn preflight_check(model: &Model, mesh: Option<&crate::mesh::Mesh>, elem_siz
     }
 
     let has = |pred: &dyn Fn(&Load) -> bool| model.loads.iter().any(|l| pred(&l.load));
-    let has_support = has(&|l| matches!(l, Load::FixedSupport { .. } | Load::Displacement { .. } | Load::CompressionOnly { .. } | Load::Symmetry { .. }));
+    let has_support = has(&|l| {
+        matches!(
+            l,
+            Load::FixedSupport { .. }
+                | Load::Displacement { .. }
+                | Load::CompressionOnly { .. }
+                | Load::Symmetry { .. }
+                | Load::Spring { to_faces: None, .. }
+        ) || matches!(
+            l,
+            Load::RemoteDisplacement { x, y, z, rx, ry, rz, .. }
+                if [x, y, z, rx, ry, rz].iter().any(|c| c.is_some())
+        )
+    });
     let has_struct_load = has(&|l| {
-        matches!(l, Load::Force { .. } | Load::Pressure { .. } | Load::Gravity { .. })
+        matches!(
+            l,
+            Load::Force { .. }
+                | Load::Pressure { .. }
+                | Load::Gravity { .. }
+                | Load::BoltPretension { .. }
+                | Load::RemoteForce { .. }
+        ) || matches!(l, Load::Spring { preload_n, .. } if *preload_n != 0.0)
             || matches!(l, Load::Displacement { x, y, z, .. } if [x, y, z].iter().any(|c| c.is_some_and(|v| v != 0.0)))
+            || matches!(
+                l,
+                Load::RemoteDisplacement { x, y, z, rx, ry, rz, .. }
+                    if [x, y, z, rx, ry, rz].iter().any(|c| c.is_some_and(|v| v != 0.0))
+            )
     });
     let has_thermal_bc = has(&|l| matches!(l, Load::Temperature { .. } | Load::Convection { .. } | Load::Radiation { .. }));
     let has_thermal_src = has(&|l| matches!(l, Load::HeatFlux { .. } | Load::HeatGeneration { .. } | Load::Temperature { .. }));

@@ -115,11 +115,12 @@ fn basis(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<Mo
 pub fn harmonic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<()> {
     let st = &model.analysis;
     let zeta = st.damping_ratio.max(1e-4);
-    let f_ext = fem::external_forces(model, mesh, None)?;
+    let mut f_ext = fem::external_forces(model, mesh, None)?;
     if f_ext.iter().all(|v| *v == 0.0) {
         bail!("harmonic response needs a Force or Pressure: its value is the amplitude of the harmonic load");
     }
     let b = basis(model, mesh, prog, res)?;
+    f_ext.resize(b.fixed.len(), 0.0);
     let fm: Vec<f64> = b.phi.iter().map(|p| p.iter().zip(&f_ext).map(|(a, f)| a * f).sum()).collect();
     let fmodes: Vec<f64> = b.omega.iter().map(|w| w / TWO_PI).collect();
     let fmin = st.freq_min.unwrap_or(fmodes[0] * 0.5).max(1e-6);
