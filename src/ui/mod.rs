@@ -244,6 +244,7 @@ pub(super) struct Forms {
     pub grav: [f64; 3],
     pub material: String,
     pub mesh_size: f64,
+    pub refine_size: f64,
     pub body: String,
     pub coil_axis: usize,
     pub coil_axial: bool,
@@ -312,6 +313,7 @@ impl Default for Forms {
             grav: [0.0, 0.0, -9.80665],
             material: "Structural Steel".into(),
             mesh_size: 2.0,
+            refine_size: 0.5,
             body: String::new(),
             coil_axis: 2,
             coil_axial: false,
@@ -1163,8 +1165,15 @@ impl eframe::App for SimApp {
                     "material" => Tab::Material,
                     "solve" => Tab::Solve,
                     "help" => Tab::Help,
+                    "mesh" => Tab::Mesh,
+                    "setup" => Tab::Setup,
+                    "geometry" => Tab::Geometry,
+                    "optimize" => Tab::Optimize,
                     _ => self.tab,
                 };
+            }
+            if let Some([w, h]) = q["window"].as_array().and_then(|a| a.iter().map(|v| v.as_f64()).collect::<Option<Vec<_>>>()).as_deref().and_then(|v| <[f64; 2]>::try_from(v).ok()).map(|a| [a[0], a[1]]) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w as f32, h as f32)));
             }
         }
 

@@ -419,15 +419,14 @@ fn collect_refine_zones(
                 continue;
             }
             let cell_target = base_h / (1usize << lvl) as f64;
-            if let Some(bname) = &r.body {
-                if r.faces.is_empty() {
+            if let Some(bname) = &r.body
+                && r.faces.is_empty() {
                     let Some(bi) = bodies.iter().position(|b| b.name.eq_ignore_ascii_case(bname.trim())) else {
                         bail!("mesh refinement references unknown body '{bname}'");
                     };
                     let (lo, hi) = bodies[bi].shape.bounds();
                     zones.push(RefineZone { lo, hi, target_level: lvl, kind: ZoneKind::Body });
                 }
-            }
             for sel in &r.faces {
                 let sl = sel.trim().to_lowercase();
                 let mut matched = false;
@@ -468,7 +467,7 @@ fn collect_refine_zones(
                         let bname = b.name.to_lowercase();
                         let (lo, hi) = b.shape.bounds();
                         let pad = 2.0 * cell_target;
-                        if sl == bname && r.faces.len() >= 1 {
+                        if sl == bname && !r.faces.is_empty() {
                             matched = true;
                             zones.push(RefineZone { lo, hi, target_level: lvl, kind: ZoneKind::Body });
                         } else {
@@ -734,29 +733,26 @@ pub fn build_octree_ex_model_cancellable(
             if !c.kind.splits_mesh() {
                 continue;
             }
-            if let (Some(ba), Some(bb)) = (resolve_contact_body(&c.body_a, &c.faces_a), resolve_contact_body(&c.body_b, &c.faces_b)) {
-                if ba != bb {
+            if let (Some(ba), Some(bb)) = (resolve_contact_body(&c.body_a, &c.faces_a), resolve_contact_body(&c.body_b, &c.faces_b))
+                && ba != bb {
                     non_bonded.insert(pair_key(ba, bb));
                     protected_bodies.insert(ba);
                     protected_bodies.insert(bb);
                 }
-            }
         }
         for it in &mdl.loads {
-            if let Some(bname) = it.load.body() {
-                if let Some(bi) = find_body(bname) {
+            if let Some(bname) = it.load.body()
+                && let Some(bi) = find_body(bname) {
                     protected_bodies.insert(bi);
                 }
-            }
             for f in it.load.faces() {
-                if let Some(prefix) = f.split('.').next() {
-                    if let Some(bi) = find_body(prefix) {
+                if let Some(prefix) = f.split('.').next()
+                    && let Some(bi) = find_body(prefix) {
                         protected_bodies.insert(bi);
                     }
-                }
             }
-            if let crate::model::Load::BoltPretension { body, axis, cut_mm, .. } = &it.load {
-                if let Some(bi) = find_body(body) {
+            if let crate::model::Load::BoltPretension { body, axis, cut_mm, .. } = &it.load
+                && let Some(bi) = find_body(body) {
                     let ax = axis.map(|a| a.idx()).unwrap_or_else(|| match &bodies[bi].shape {
                         Shape::Cylinder { axis, .. } => axis.idx(),
                         _ => {
@@ -769,7 +765,6 @@ pub fn build_octree_ex_model_cancellable(
                     let cut_val = cut_mm.unwrap_or(0.5 * (blo[ax] + bhi[ax]));
                     pending_bolts.push(PendingBolt { load_id: it.id, bi, ax, cut_val });
                 }
-            }
         }
     }
 
@@ -1144,11 +1139,10 @@ pub fn build_octree_ex_model_cancellable(
         let u = [ijk[0] as u32, ijk[1] as u32, ijk[2] as u32];
         for c in (0..=lvl).rev() {
             let sh = (lvl - c) as u32;
-            if let Some(&id) = map.get(&pack_key(c, [u[0] >> sh, u[1] >> sh, u[2] >> sh])) {
-                if leaves[id].alive {
+            if let Some(&id) = map.get(&pack_key(c, [u[0] >> sh, u[1] >> sh, u[2] >> sh]))
+                && leaves[id].alive {
                     return Some(id);
                 }
-            }
         }
         None
     };
@@ -1255,23 +1249,21 @@ pub fn build_octree_ex_model_cancellable(
                             n[a] += if plus { 2 } else { -1 };
                             n[b] += ob;
                             n[cax] += oc;
-                            if let Some(nb) = neighbor_lookup(cl, n, &leaf_map, &leaves) {
-                                if leaves[nb].occ >= 0 && comp[nb] == u32::MAX {
+                            if let Some(nb) = neighbor_lookup(cl, n, &leaf_map, &leaves)
+                                && leaves[nb].occ >= 0 && comp[nb] == u32::MAX {
                                     comp[nb] = id;
                                     q.push(nb);
                                 }
-                            }
                         }
                     }
                 } else {
                     let mut n = [lf.ijk[0] as isize, lf.ijk[1] as isize, lf.ijk[2] as isize];
                     n[a] += if plus { 1 } else { -1 };
-                    if let Some(nb) = neighbor_lookup(lf.level, n, &leaf_map, &leaves) {
-                        if leaves[nb].occ >= 0 && comp[nb] == u32::MAX {
+                    if let Some(nb) = neighbor_lookup(lf.level, n, &leaf_map, &leaves)
+                        && leaves[nb].occ >= 0 && comp[nb] == u32::MAX {
                             comp[nb] = id;
                             q.push(nb);
                         }
-                    }
                 }
             }
         }
@@ -1411,11 +1403,10 @@ pub fn build_octree_ex_model_cancellable(
             let pa = node_lat[en[a] as usize];
             let pb = node_lat[en[b] as usize];
             let mid = [(pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2, (pa[2] + pb[2]) / 2];
-            if let Some(&hn) = group_node_map.get(&(cg, mid)) {
-                if hn != en[a] && hn != en[b] {
+            if let Some(&hn) = group_node_map.get(&(cg, mid))
+                && hn != en[a] && hn != en[b] {
                     raw_hang.entry(hn).or_insert_with(|| vec![(en[a], 0.5), (en[b], 0.5)]);
                 }
-            }
         }
         for q in FACES {
             let p0 = node_lat[en[q[0]] as usize];
@@ -1427,11 +1418,10 @@ pub fn build_octree_ex_model_cancellable(
                 (p0[1] + p1[1] + p2[1] + p3[1]) / 4,
                 (p0[2] + p1[2] + p2[2] + p3[2]) / 4,
             ];
-            if let Some(&hn) = group_node_map.get(&(cg, ctr)) {
-                if !q.iter().any(|&c| en[c] == hn) {
+            if let Some(&hn) = group_node_map.get(&(cg, ctr))
+                && !q.iter().any(|&c| en[c] == hn) {
                     raw_hang.entry(hn).or_insert_with(|| q.iter().map(|&c| (en[c], 0.25)).collect());
                 }
-            }
         }
     }
 
@@ -1492,11 +1482,10 @@ pub fn build_octree_ex_model_cancellable(
                 let lm = CORNER.iter().position(|&p| p == dm).unwrap();
                 let nm = elems[ei][lm];
                 let plat = node_lat[nm as usize];
-                if let Some(cl) = split_clusters.get(&plat) {
-                    if let Some(&(_, _, np)) = cl.iter().find(|&&(sc, sb, _)| sc == lf.cgroup && (sb & bit) != 0) {
+                if let Some(cl) = split_clusters.get(&plat)
+                    && let Some(&(_, _, np)) = cl.iter().find(|&&(sc, sb, _)| sc == lf.cgroup && (sb & bit) != 0) {
                         *pmap.entry((nm, np)).or_insert(0.0) += share;
                     }
-                }
             }
         }
         let mut pairs: Vec<crate::mesh::PretensionPair> = pmap.into_iter().map(|((minus, plus), area_m2)| crate::mesh::PretensionPair { minus, plus, area_m2 }).collect();
@@ -1662,11 +1651,10 @@ pub fn build_octree_ex_model_cancellable(
         hanging,
         node_lat,
     };
-    if !conservative {
-        if let Some(mdl) = model {
+    if !conservative
+        && let Some(mdl) = model {
             mesh.build_contact_pairs(mdl)?;
         }
-    }
     Ok(mesh)
 }
 

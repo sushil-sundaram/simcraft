@@ -411,7 +411,7 @@ impl Shape {
             Shape::Box { min, size } => {
                 let a = patch / 2;
                 let mut q = p;
-                q[a] = if patch % 2 == 0 { min[a] } else { min[a] + size[a] };
+                q[a] = if patch.is_multiple_of(2) { min[a] } else { min[a] + size[a] };
                 Some(q)
             }
             Shape::Cylinder { base, axis, radius, height } => {

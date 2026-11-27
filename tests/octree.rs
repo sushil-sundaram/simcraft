@@ -257,3 +257,74 @@ fn adaptive_converges_faster_than_uniform() {
     let (uu, eu) = uni[1];
     assert!(ea < eu && ua < 0.5 * uu, "adaptive ({ua}, {ea}) vs uniform ({uu}, {eu})");
 }
+
+/// Buckling, plasticity and harmonic response run on octree meshes and agree with uniform meshes.
+#[test]
+fn other_structural_analyses_on_octree() {
+    let run = |analysis: Value, refine: bool, extra: &dyn Fn(&Shared)| -> Value {
+        let c = new_core();
+        call(&c, "new_model", json!({}));
+        call(&c, "add_box", json!({"name": "Col", "size": [6, 6, 60], "material": "Structural Steel"}));
+        call(&c, "set_analysis", analysis);
+        let mesh = if refine { json!({"element_size_mm": 1.5, "refinements": [{"faces": ["Col.zmin"], "size_mm": 0.75}]}) } else { json!({"element_size_mm": 1.5}) };
+        let m = call(&c, "set_mesh", mesh);
+        assert_eq!(m.get("octree").is_some(), refine, "{m}");
+        call(&c, "add_fixed_support", json!({"faces": ["Col.zmin"]}));
+        extra(&c);
+        solve(&c)
+    };
+    let close = |a: f64, b: f64, tol: f64, what: &str| assert!((a - b).abs() <= tol * a.abs().max(b.abs()), "{what}: uniform {a} vs octree {b}");
+    // linear buckling: load factor
+    let ld = |c: &Shared| { call(c, "add_force", json!({"faces": ["Col.zmax"], "vector": [0, 0, -1000]})); };
+    let bf = |r: &Value| r["modes"][0]["load_multiplier"].as_f64().or_else(|| r["modes"][0]["frequency_hz"].as_f64()).unwrap_or_else(|| panic!("{}", r["modes"]));
+    let (u, o) = (run(json!({"type": "linear_buckling", "modes": 1}), false, &ld), run(json!({"type": "linear_buckling", "modes": 1}), true, &ld));
+    close(bf(&u), bf(&o), 0.03, "buckling");
+    // plasticity: tip deflection past yield
+    let lp = |c: &Shared| { call(c, "add_force", json!({"faces": ["Col.zmax"], "vector": [400, 0, 0]})); };
+    let dx = |r: &Value| r["fields"]["deformation_x"]["max"].as_f64().unwrap();
+    let (u, o) = (run(json!({"type": "nonlinear_structural", "load_steps": 5}), false, &lp), run(json!({"type": "nonlinear_structural", "load_steps": 5}), true, &lp));
+    let fine = {
+        let c = new_core();
+        call(&c, "new_model", json!({}));
+        call(&c, "add_box", json!({"name": "Col", "size": [6, 6, 60], "material": "Structural Steel"}));
+        call(&c, "set_analysis", json!({"type": "nonlinear_structural", "load_steps": 5}));
+        call(&c, "set_mesh", json!({"element_size_mm": 0.75}));
+        call(&c, "add_fixed_support", json!({"faces": ["Col.zmin"]}));
+        lp(&c);
+        solve(&c)
+    };
+    eprintln!("plasticity: uniform 1.5 {} octree {} uniform 0.75 {}", dx(&u), dx(&o), dx(&fine));
+    // refining the plastic hinge moves the answer from the coarse towards the fine uniform mesh
+    assert!(dx(&o) > dx(&u) && dx(&o) < dx(&fine), "plasticity: {} {} {}", dx(&u), dx(&o), dx(&fine));
+    // harmonic response: peak amplitude frequency
+    let lh = |c: &Shared| { call(c, "add_force", json!({"faces": ["Col.zmax"], "vector": [10, 0, 0]})); };
+    let pk = |r: &Value| r["fields"]["total_deformation"]["max"].as_f64().unwrap();
+    let (u, o) = (run(json!({"type": "harmonic_response", "freq_steps": 60}), false, &lh), run(json!({"type": "harmonic_response", "freq_steps": 60}), true, &lh));
+    eprintln!("harmonic peak uniform {} octree {}", pk(&u), pk(&o));
+    close(pk(&u), pk(&o), 0.15, "harmonic peak");
+}
+
+/// Magnetostatics with an air enclosure: refining the magnet converges towards the fine uniform mesh.
+#[test]
+fn magnetostatic_on_octree() {
+    let run = |refine: bool| -> f64 { run_h(refine, 2.5) };
+    let fine = run_h(false, 1.25);
+    eprintln!("fine uniform {fine}");
+    fn run_h(refine: bool, hh: f64) -> f64 {
+        let c = new_core();
+        call(&c, "new_model", json!({}));
+        call(&c, "add_box", json!({"name": "Mag", "min": [-5, -5, -5], "size": [10, 10, 10], "material": "Structural Steel"}));
+        call(&c, "set_analysis", json!({"type": "magnetostatic"}));
+        call(&c, "add_enclosure", json!({"margin": 15}));
+        call(&c, "add_magnet", json!({"body": "Mag", "remanence": [0, 0, 1.2]}));
+        let mesh = if refine { json!({"element_size_mm": hh, "refinements": [{"body": "Mag", "size_mm": hh / 2.0}]}) } else { json!({"element_size_mm": hh}) };
+        let m = call(&c, "set_mesh", mesh);
+        assert_eq!(m.get("octree").is_some(), refine, "{m}");
+        let r = solve(&c);
+        r["quantities"].as_array().unwrap().iter().find(|q| q["name"] == "Stored magnetic energy").unwrap()["value"].as_f64().unwrap()
+    }
+    let (u, o) = (run(false), run(true));
+    eprintln!("magnetic energy uniform {u} octree {o}");
+    // refining the magnet moves the energy from the coarse towards the fine uniform answer
+    assert!((o - fine).abs() < (u - fine).abs() * 0.5, "coarse {u}, octree {o}, fine {fine}");
+}

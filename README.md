@@ -84,6 +84,7 @@ density, permanent magnet, velocity inlet, pressure outlet.
   Chorin projection (time-averaging) as the fallback for unsteady flows; LVEL turbulence, Boussinesq
   buoyancy, conjugate heat transfer.
 - **Mesher**: voxel hex mesh of a CSG model (add/subtract boxes, cylinders, spheres, closed STL files).
+- **Local refinement (P2.5)**: 2:1-balanced octree meshes refined per face / body, automatically at small features, or adaptively from a Zienkiewicz–Zhu error estimate; hanging nodes are condensed inside the linear solver so every FE analysis supports them (plate with a hole: same Kt with 7× fewer elements).
 
 ### Validation (`cargo test --release`)
 | Case | SimCraft | Theory |
@@ -124,6 +125,7 @@ density, permanent magnet, velocity inlet, pressure outlet.
 | Slab with k(T) = 50 (1 + 0.005 T): heat flow / midpoint T | 30.000 W / 116.228 °C | 30 W / 116.228 °C (Kirchhoff) |
 | Heated block in a duct + radiation (CHT): carried + radiated | 0.2000 W | 0.2 W generated |
 | Plate with hole (d/W = 0.1) Kt, h = r/10 | fitted 3.08 / voxel 3.31 | 3.03 (Heywood) |
+| Plate with hole Kt, octree 2 mm refined to 0.5 mm at the hole (49 k DOF) | 3.063 (uniform 1 mm, 273 k DOF: 3.069) | 3.03 (Heywood) |
 | Lamé thick cylinder, bore hoop stress | fitted 16.95 / voxel 21.05 MPa | 16.67 MPa |
 | Radial conduction through a pipe wall (quarter, ri 10 / ro 20 mm) | fitted 354.43 / voxel 369.46 W | 354.43 W (2πkLΔT / ln(ro/ri)) |
 | Cantilever round rod (r 3.3, L 80 mm), first bending frequency | fitted 722.5 / voxel 764.5 Hz | 728.2 Hz (Euler–Bernoulli) |

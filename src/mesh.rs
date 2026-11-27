@@ -125,7 +125,7 @@ pub const CORNER: [[usize; 3]; 8] = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
 
 pub fn dir_normal(dir: u8) -> V3 {
     let mut n = [0.0; 3];
-    n[(dir / 2) as usize] = if dir % 2 == 0 { -1.0 } else { 1.0 };
+    n[(dir / 2) as usize] = if dir.is_multiple_of(2) { -1.0 } else { 1.0 };
     n
 }
 
@@ -185,11 +185,10 @@ pub fn additive_bounds(bodies: &[Body]) -> (V3, V3) {
 }
 
 pub fn domain_bounds(bodies: &[Body], with_enclosure: bool) -> (V3, V3) {
-    if with_enclosure {
-        if let Some(b) = union_bounds(bodies.iter().filter(|b| b.op == Op::Add)) {
+    if with_enclosure
+        && let Some(b) = union_bounds(bodies.iter().filter(|b| b.op == Op::Add)) {
             return b;
         }
-    }
     additive_bounds(bodies)
 }
 
@@ -298,29 +297,26 @@ pub fn build_mesh_ex_model_cancellable(
             if !c.kind.splits_mesh() {
                 continue;
             }
-            if let (Some(ba), Some(bb)) = (resolve_contact_body(&c.body_a, &c.faces_a), resolve_contact_body(&c.body_b, &c.faces_b)) {
-                if ba != bb {
+            if let (Some(ba), Some(bb)) = (resolve_contact_body(&c.body_a, &c.faces_a), resolve_contact_body(&c.body_b, &c.faces_b))
+                && ba != bb {
                     non_bonded.insert(pair_key(ba, bb));
                     protected_bodies.insert(ba);
                     protected_bodies.insert(bb);
                 }
-            }
         }
         for it in &mdl.loads {
-            if let Some(bname) = it.load.body() {
-                if let Some(bi) = find_body(bname) {
+            if let Some(bname) = it.load.body()
+                && let Some(bi) = find_body(bname) {
                     protected_bodies.insert(bi);
                 }
-            }
             for f in it.load.faces() {
-                if let Some(prefix) = f.split('.').next() {
-                    if let Some(bi) = find_body(prefix) {
+                if let Some(prefix) = f.split('.').next()
+                    && let Some(bi) = find_body(prefix) {
                         protected_bodies.insert(bi);
                     }
-                }
             }
-            if let crate::model::Load::BoltPretension { body, axis, cut_mm, .. } = &it.load {
-                if let Some(bi) = find_body(body) {
+            if let crate::model::Load::BoltPretension { body, axis, cut_mm, .. } = &it.load
+                && let Some(bi) = find_body(body) {
                     let ax = axis.map(|a| a.idx()).unwrap_or_else(|| match &bodies[bi].shape {
                         Shape::Cylinder { axis, .. } => axis.idx(),
                         _ => {
@@ -333,7 +329,6 @@ pub fn build_mesh_ex_model_cancellable(
                     let cut_val = cut_mm.unwrap_or(0.5 * (blo[ax] + bhi[ax]));
                     pending_bolts.push(PendingBolt { load_id: it.id, bi, ax, cut_val });
                 }
-            }
         }
     }
     let has_solid = bodies.iter().any(|b| b.op == Op::Add && b.role == Role::Solid);
@@ -1083,11 +1078,10 @@ pub fn build_mesh_ex_model_cancellable(
         hanging: Vec::new(),
         node_lat: Vec::new(),
     };
-    if !conservative {
-        if let Some(mdl) = model {
+    if !conservative
+        && let Some(mdl) = model {
             mesh.build_contact_pairs(mdl)?;
         }
-    }
     Ok(mesh)
 }
 
@@ -1368,7 +1362,7 @@ impl Mesh {
         let base = self.nodes.clone();
         let mut d = vec![[0.0f64; 3]; nn];
         let mut pinned = vec![false; nn];
-        for (&old, _) in prime.iter() {
+        for &old in prime.keys() {
             pinned[old as usize] = true;
         }
         for n in 0..nn {

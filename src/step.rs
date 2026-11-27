@@ -392,11 +392,10 @@ impl StepData {
                 }
                 StepSurfaceAnalytic::Plane { .. } => None,
             };
-            if let Some(r) = r_opt {
-                if r.is_finite() && r > 1e-4 {
+            if let Some(r) = r_opt
+                && r.is_finite() && r > 1e-4 {
                     out.push((pi, r, lo, hi));
                 }
-            }
         }
         out
     }
