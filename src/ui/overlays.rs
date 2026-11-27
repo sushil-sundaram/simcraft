@@ -368,7 +368,7 @@ pub(super) fn draw_hover_highlight(
     }
 
     if let Some((_, edges)) = &app.hover_cache {
-        let col = if body_mode { Color32::from_rgb(80, 195, 255) } else { Color32::from_rgb(255, 195, 65) };
+        let col = if body_mode { Color32::from_rgb(80, 195, 255) } else { Color32::from_rgb(192, 132, 252) };
         let stroke = Stroke::new(2.0, col);
         for &[a, b] in edges {
             let pa = world_to_screen(cam, rect, a);
@@ -473,7 +473,7 @@ pub(super) fn draw_ghost_and_gizmo(
 ) {
     let mut gizmo_anchor: Option<V3> = None;
     let ghost_stroke = Stroke::new(2.0, Color32::from_rgb(70, 210, 255));
-    let sub_stroke = Stroke::new(2.0, Color32::from_rgb(255, 130, 65));
+    let sub_stroke = Stroke::new(2.0, Color32::from_rgb(251, 113, 133));
     let ghost_fill = Some(Color32::from_rgba_unmultiplied(70, 195, 255, 26));
 
     match app.form {
@@ -526,7 +526,7 @@ pub(super) fn draw_ghost_and_gizmo(
                         && let Some((lo, hi)) = shape_bbox(&orig_b.shape) {
                             let d = app.xform.1;
                             if norm(d) > 1e-6 {
-                                draw_wire_box(cam, rect, painter, add(lo, d), add(hi, d), Stroke::new(1.5, Color32::from_rgb(245, 190, 60)), None);
+                                draw_wire_box(cam, rect, painter, add(lo, d), add(hi, d), Stroke::new(1.5, Color32::from_rgb(165, 180, 252)), None);
                             }
                         }
                 }
@@ -539,8 +539,8 @@ pub(super) fn draw_ghost_and_gizmo(
     if let Some((pt, label)) = &app.highlight_point {
         let sp = world_to_screen(cam, rect, *pt);
         if rect.contains(sp) {
-            painter.circle(sp, 7.0, Color32::from_rgba_unmultiplied(255, 85, 45, 220), Stroke::new(2.0, Color32::WHITE));
-            painter.text(sp + vec2(10.0, -10.0), Align2::LEFT_CENTER, label, FontId::proportional(11.5), Color32::from_rgb(255, 190, 90));
+            painter.circle(sp, 7.0, Color32::from_rgba_unmultiplied(244, 63, 94, 220), Stroke::new(2.0, Color32::WHITE));
+            painter.text(sp + vec2(10.0, -10.0), Align2::LEFT_CENTER, label, FontId::proportional(11.5), Color32::from_rgb(253, 164, 175));
         }
     }
 
