@@ -1013,6 +1013,15 @@ pub fn preflight_check(model: &Model, mesh: Option<&crate::mesh::Mesh>, elem_siz
     }
 
     let has_octree_req = model.mesh.local_refinement || model.mesh.feature_refinement || !model.mesh.refinements.is_empty() || model.mesh.adaptive_passes > 0;
+    if has_octree_req && kind.supports_octree() && (!model.contacts.is_empty() || model.loads.iter().any(|l| matches!(l.load, Load::BoltPretension { .. }))) {
+        out.push(item(
+            "mesh_octree_contact",
+            "Uniform Grid Used",
+            "Contact pairs and bolt pretension use the uniform grid; local refinement and adaptive settings are ignored for this model.".to_string(),
+            PreflightStatus::Warn,
+            "mesh",
+        ));
+    }
     if has_octree_req && !kind.supports_octree() {
         out.push(item(
             "mesh_octree_uniform",
