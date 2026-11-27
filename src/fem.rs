@@ -1551,6 +1551,7 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
             }
             let mut ku = vec![0.0; n];
             k0.matvec(&u, &mut ku);
+            mesh.condense_rhs(&mut ku, 3);
             let mut changed = 0;
             for &(dof, sgn) in &comp_contact {
                 if fixed[dof].is_some() {

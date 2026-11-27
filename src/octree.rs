@@ -1748,3 +1748,149 @@ impl Mesh {
         self.hanging.iter().map(|h| h.node).collect()
     }
 }
+
+/// Zienkiewicz–Zhu error estimate of a solved static structural or steady thermal model.
+pub struct ZzEstimate {
+    /// Relative energy-norm error ‖e‖ / √(‖u‖² + ‖e‖²) [%].
+    pub error_pct: f64,
+    /// Squared element error contributions (same units as the energy norm).
+    pub elem_err2: Vec<f64>,
+}
+
+/// ZZ estimate: element-centre (superconvergent) stresses or heat fluxes are averaged to the
+/// nodes (volume-weighted), and each element's error is the energy-norm distance between that
+/// recovered field and its own constant centre value.
+pub fn zz_estimate(mesh: &Mesh, res: &crate::results::Results) -> Option<ZzEstimate> {
+    let ne = mesh.elems.len();
+    let cg = crate::fem::center_grads();
+    // centre gradients of the 8 shape functions [1/mm]
+    let grads = |e: usize| -> Vec<[f64; 3]> {
+        if mesh.is_fitted(e) {
+            crate::fem::center_grads_general(&mesh.elem_nodes(e))
+        } else {
+            let h = mesh.elem_h_mm(e);
+            cg.iter().map(|g| g.map(|v| v / h)).collect()
+        }
+    };
+    let solid = |e: usize| mesh.elem_region[e] == REGION_SOLID;
+    // per element: (field vector, energy weight 1/modulus)
+    let (ncomp, vals): (usize, Vec<(Vec<f64>, f64)>) = if let Some(u) = &res.disp {
+        let v = (0..ne)
+            .into_par_iter()
+            .map(|e| {
+                let m = &mesh.materials[mesh.elem_mat[e] as usize];
+                let g = grads(e);
+                let mut du = [[0.0; 3]; 3]; // du[i][j] = ∂u_i/∂x_j
+                for (a, &n) in mesh.elems[e].iter().enumerate() {
+                    for i in 0..3 {
+                        for j in 0..3 {
+                            du[i][j] += u[n as usize][i] * g[a][j];
+                        }
+                    }
+                }
+                let (ee, nu) = (m.youngs_modulus_gpa * 1e3, m.poisson_ratio);
+                let lam = ee * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+                let mu = ee / (2.0 * (1.0 + nu));
+                let tr = du[0][0] + du[1][1] + du[2][2];
+                let s = vec![
+                    lam * tr + 2.0 * mu * du[0][0],
+                    lam * tr + 2.0 * mu * du[1][1],
+                    lam * tr + 2.0 * mu * du[2][2],
+                    mu * (du[0][1] + du[1][0]),
+                    mu * (du[1][2] + du[2][1]),
+                    mu * (du[0][2] + du[2][0]),
+                ];
+                (s, 1.0 / ee.max(1e-12))
+            })
+            .collect();
+        (6, v)
+    } else if let Some(t) = &res.temp {
+        let v = (0..ne)
+            .into_par_iter()
+            .map(|e| {
+                let m = &mesh.materials[mesh.elem_mat[e] as usize];
+                let g = grads(e);
+                let mut q = vec![0.0; 3];
+                for (a, &n) in mesh.elems[e].iter().enumerate() {
+                    for c in 0..3 {
+                        q[c] -= m.k_axis(c) * t[n as usize] * g[a][c] * 1e3;
+                    }
+                }
+                (q, 1.0 / m.thermal_conductivity.max(1e-12))
+            })
+            .collect();
+        (3, v)
+    } else {
+        return None;
+    };
+    let nn = mesh.nodes.len();
+    let mut acc = vec![0.0; nn * ncomp];
+    let mut wsum = vec![0.0; nn];
+    let vol: Vec<f64> = (0..ne).map(|e| mesh.elem_volume(e)).collect();
+    for e in (0..ne).filter(|&e| solid(e)) {
+        for &n in &mesh.elems[e] {
+            let n = n as usize;
+            wsum[n] += vol[e];
+            for c in 0..ncomp {
+                acc[n * ncomp + c] += vol[e] * vals[e].0[c];
+            }
+        }
+    }
+    // shear components weigh twice in σ:σ
+    let wc = |c: usize| if ncomp == 6 && c >= 3 { 2.0 } else { 1.0 };
+    let mut elem_err2 = vec![0.0; ne];
+    let (mut err2, mut norm2) = (0.0, 0.0);
+    for e in (0..ne).filter(|&e| solid(e)) {
+        let (s, w) = &vals[e];
+        let mut ee = 0.0;
+        for &n in &mesh.elems[e] {
+            let n = n as usize;
+            for c in 0..ncomp {
+                let d = acc[n * ncomp + c] / wsum[n].max(1e-300) - s[c];
+                ee += wc(c) * d * d;
+            }
+        }
+        let ee = ee * w * vol[e] / 8.0;
+        elem_err2[e] = ee;
+        err2 += ee;
+        norm2 += (0..ncomp).map(|c| wc(c) * s[c] * s[c]).sum::<f64>() * w * vol[e];
+    }
+    if !(norm2 > 0.0) {
+        return None;
+    }
+    Some(ZzEstimate { error_pct: 100.0 * (err2 / (norm2 + err2)).sqrt(), elem_err2 })
+}
+
+/// Dörfler marking: the smallest set of elements carrying `theta` of the squared error, each
+/// asked one level finer (up to `max_levels`). Returns the number of marked elements.
+pub fn mark_for_refinement(mesh: &Mesh, est: &ZzEstimate, theta: f64, max_levels: u8, hint: &mut AdaptiveHint) -> usize {
+    let total: f64 = est.elem_err2.iter().sum();
+    let mut order: Vec<usize> = (0..est.elem_err2.len()).filter(|&e| est.elem_err2[e] > 0.0).collect();
+    order.sort_unstable_by(|&a, &b| est.elem_err2[b].total_cmp(&est.elem_err2[a]));
+    let mut acc = 0.0;
+    let mut marked = 0;
+    for e in order {
+        if acc >= theta * total {
+            break;
+        }
+        acc += est.elem_err2[e];
+        let lvl = mesh.elem_level.get(e).copied().unwrap_or(0);
+        if lvl >= max_levels {
+            continue;
+        }
+        // the element's own cell (pre-fitting lattice box), shrunk so neighbours are not caught
+        let x = mesh.elem_nodes(e);
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for p in &x {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let pad = 0.05 * mesh.elem_h_mm(e);
+        hint.regions.push((add(lo, [pad; 3]), sub(hi, [pad; 3]), lvl + 1));
+        marked += 1;
+    }
+    marked
+}

@@ -54,9 +54,6 @@ fn solve(c: &Shared) -> Value {
     call(c, "get_results", json!({}))
 }
 
-fn qty(res: &Value, prefix: &str) -> f64 {
-    res["quantities"].as_array().unwrap().iter().find(|q| q["name"].as_str().unwrap_or("").starts_with(prefix)).unwrap_or_else(|| panic!("no '{prefix}' in {res}"))["value"].as_f64().unwrap()
-}
 
 /// Patch test: a uniform strain state is reproduced exactly across 2:1 hanging-node transitions.
 #[test]
@@ -177,18 +174,86 @@ fn transient_thermal_on_octree() {
     assert!((u - o).abs() < 0.03 * u, "uniform {u} vs octree {o}");
 }
 
+
+fn kirsch(c: &Shared, mesh: Value) -> (f64, usize) {
+    call(c, "new_model", json!({}));
+    call(c, "add_box", json!({"name": "Plate", "min": [0, 0, 0], "size": [300, 100, 2]}));
+    call(c, "add_cylinder", json!({"name": "Hole", "base": [0, 0, 0], "axis": "z", "radius": 10, "height": 2, "operation": "subtract"}));
+    let m = call(c, "set_mesh", mesh);
+    call(c, "add_symmetry", json!({"faces": ["Plate.xmin", "Plate.ymin", "Plate.zmin"]}));
+    call(c, "add_pressure", json!({"faces": ["Plate.xmax"], "value_mpa": -10}));
+    let r = solve(c);
+    (r["fields"]["max_principal"]["max"].as_f64().unwrap() / 10.0, m["elements"].as_u64().unwrap() as usize)
+}
+
+/// Kirsch strip with a hole: refining only around the hole gives the uniform-fine Kt with ≥ 5× fewer elements.
 #[test]
-#[ignore]
-fn dbg_thermal() {
+fn kirsch_octree_matches_uniform_with_fewer_elements() {
+    let kt_ref = (2.0 + 0.9f64.powi(3)) / 0.9;
     let c = new_core();
-    refined_bar(&c, "steady_thermal");
-    call(&c, "add_temperature", json!({"faces": ["Bar.xmin"], "value": 0}));
-    call(&c, "add_temperature", json!({"faces": ["Bar.xmax"], "value": 100}));
+    let (kt_u, n_u) = kirsch(&c, json!({"element_size_mm": 1.0}));
+    let (kt_o, n_o) = kirsch(&c, json!({"element_size_mm": 2.0, "refinements": [{"faces": ["Hole.side"], "size_mm": 0.5}]}));
+    eprintln!("uniform 1 mm: Kt {kt_u:.4} ({n_u} elements); octree 2→0.5 mm: Kt {kt_o:.4} ({n_o} elements); reference {kt_ref:.4}");
+    assert!((kt_o - kt_ref).abs() < 0.03 * kt_ref, "octree Kt {kt_o} vs {kt_ref}");
+    assert!((kt_o - kt_u).abs() < 0.015 * kt_u, "octree {kt_o} vs uniform {kt_u}");
+    assert!(n_u >= 5 * n_o, "uniform {n_u} vs octree {n_o} elements");
+}
+
+fn qtys(r: &Value, needle: &str) -> Vec<(String, f64)> {
+    r["quantities"].as_array().unwrap().iter().filter(|q| q["name"].as_str().unwrap().contains(needle)).map(|q| (q["name"].as_str().unwrap().to_string(), q["value"].as_f64().unwrap())).collect()
+}
+
+/// Adaptive ZZ loop: the estimated error falls pass by pass and beats uniform refinement per DOF.
+#[test]
+fn adaptive_zz_refines_the_hole() {
+    let kt_ref = (2.0 + 0.9f64.powi(3)) / 0.9;
+    let c = new_core();
+    call(&c, "new_model", json!({}));
+    call(&c, "add_box", json!({"name": "Plate", "min": [0, 0, 0], "size": [300, 100, 2]}));
+    call(&c, "add_cylinder", json!({"name": "Hole", "base": [0, 0, 0], "axis": "z", "radius": 10, "height": 2, "operation": "subtract"}));
+    call(&c, "set_mesh", json!({"element_size_mm": 2.0, "adaptive_passes": 4, "adaptive_error_pct": 1.0, "max_levels": 3}));
+    call(&c, "add_symmetry", json!({"faces": ["Plate.xmin", "Plate.ymin", "Plate.zmin"]}));
+    call(&c, "add_pressure", json!({"faces": ["Plate.xmax"], "value_mpa": -10}));
     let r = solve(&c);
-    for p in [[5.0, 5.0, 3.0], [19.0, 9.5, 3.0], [15.0, 9.75, 5.0], [17.0, 8.0, 1.0], [10.0, 10.0, 6.0]] {
-        let v = call(&c, "probe", json!({"point": p}));
-        eprintln!("{p:?} -> {}", v);
+    let hist = qtys(&r, "Adaptive pass");
+    let kt = r["fields"]["max_principal"]["max"].as_f64().unwrap() / 10.0;
+    for h in &hist {
+        eprintln!("{} = {:.3} %", h.0, h.1);
     }
-    eprintln!("{}", r["fields"]["temperature"]);
-    eprintln!("{}", r["fields"]["heat_flux"]);
+    eprintln!("Kt {kt:.4} (reference {kt_ref:.4}); warnings {}", r["warnings"]);
+    assert!(hist.len() >= 3, "{hist:?}");
+    for w in hist.windows(2) {
+        assert!(w[1].1 < w[0].1, "error did not fall: {hist:?}");
+    }
+    assert!((kt - kt_ref).abs() < 0.03 * kt_ref, "adaptive Kt {kt} vs {kt_ref}");
+}
+
+/// Energy-norm convergence: adaptive refinement converges faster per DOF than uniform refinement.
+#[test]
+fn adaptive_converges_faster_than_uniform() {
+    let run = |mesh: Value| -> Vec<(f64, f64)> {
+        let c = new_core();
+        call(&c, "new_model", json!({}));
+        call(&c, "add_box", json!({"name": "Plate", "min": [0, 0, 0], "size": [300, 100, 2]}));
+        call(&c, "add_cylinder", json!({"name": "Hole", "base": [0, 0, 0], "axis": "z", "radius": 10, "height": 2, "operation": "subtract"}));
+        call(&c, "set_mesh", mesh);
+        call(&c, "add_symmetry", json!({"faces": ["Plate.xmin", "Plate.ymin", "Plate.zmin"]}));
+        call(&c, "add_pressure", json!({"faces": ["Plate.xmax"], "value_mpa": -10}));
+        let r = solve(&c);
+        let h = qtys(&r, "Adaptive pass");
+        if h.is_empty() {
+            let dofs = r["info"]["dofs"].as_f64().unwrap();
+            return vec![(dofs, qtys(&r, "Estimated discretisation error")[0].1)];
+        }
+        h.iter().map(|(n, e)| (n.split(", ").nth(1).unwrap().split(' ').next().unwrap().parse::<f64>().unwrap(), *e)).collect()
+    };
+    let uni: Vec<(f64, f64)> = [2.0, 1.0].iter().flat_map(|hh| run(json!({"element_size_mm": hh}))).collect();
+    let ada = run(json!({"element_size_mm": 2.0, "adaptive_passes": 3, "adaptive_error_pct": 0.1, "max_levels": 3}));
+    let rate = |p: &[(f64, f64)]| -((p[p.len() - 1].1 / p[0].1).ln() / (p[p.len() - 1].0 / p[0].0).ln());
+    eprintln!("uniform {uni:?} rate {:.2}\nadaptive {ada:?} rate {:.2}", rate(&uni), rate(&ada));
+    assert!(rate(&ada) > 2.0 * rate(&uni), "adaptive rate {} vs uniform {}", rate(&ada), rate(&uni));
+    // the adaptive mesh beats the uniform 1 mm mesh with far fewer unknowns
+    let (ua, ea) = *ada.last().unwrap();
+    let (uu, eu) = uni[1];
+    assert!(ea < eu && ua < 0.5 * uu, "adaptive ({ua}, {ea}) vs uniform ({uu}, {eu})");
 }

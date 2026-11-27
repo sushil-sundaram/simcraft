@@ -2466,6 +2466,57 @@ impl Core {
         })
     }
 
+    /// Adaptive h-refinement: solve, estimate the Zienkiewicz–Zhu error, refine the octree where
+    /// it is largest (Dörfler marking), re-mesh and re-solve until the target or the pass limit.
+    fn solve_adaptive(&self, model: &Model, mesh: &mut Arc<Mesh>, rev: u64, cb: &(dyn Fn(f64, &str) + Sync)) -> Result<Results> {
+        let passes = model.mesh.adaptive_passes as usize;
+        let target = model.mesh.adaptive_error_pct;
+        let (h, limit, mode) = {
+            let s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (s.element_size(), mesh::max_cells_for(&s.model), (s.model.mesh_with_enclosure(), s.model.mesh_fitted()))
+        };
+        let mut hint = crate::octree::AdaptiveHint::default();
+        let mut history: Vec<(usize, usize, f64)> = Vec::new();
+        let mut reached = false;
+        let mut pass = 0;
+        let mut res = loop {
+            let span = 1.0 / (passes + 1) as f64;
+            let (a, b) = (pass as f64 * span, (pass + 1) as f64 * span);
+            let sub = |f: f64, msg: &str| cb(a + (b - a) * f, &format!("adaptive pass {}: {msg}", pass + 1));
+            let res = fem::solve(model, mesh, fem::Progress::new(&self.cancel, &sub))?;
+            let Some(est) = crate::octree::zz_estimate(mesh, &res) else { break res };
+            history.push((mesh.elems.len(), res.info.dofs, est.error_pct));
+            if est.error_pct <= target {
+                reached = true;
+                break res;
+            }
+            if pass >= passes {
+                break res;
+            }
+            if crate::octree::mark_for_refinement(mesh, &est, 0.5, model.mesh.max_levels, &mut hint) == 0 {
+                break res;
+            }
+            sub(1.0, "refining");
+            let built = mesh::build_for_octree_adaptive_cancellable(model, h, limit, Some(&hint), &self.cancel)?;
+            if built.elems.len() <= mesh.elems.len() {
+                break res;
+            }
+            let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            *mesh = s.install_mesh(built, rev, mode).ok_or_else(|| anyhow!("geometry changed during meshing; solve again"))?;
+            pass += 1;
+        };
+        for (i, (ne, dofs, err)) in history.iter().enumerate() {
+            res.quantity(&format!("Adaptive pass {}: ZZ error ({ne} elements, {dofs} DOF)", i + 1), *err, "%");
+        }
+        if let Some(&(_, _, err)) = history.last() {
+            res.quantity("Estimated discretisation error (ZZ energy norm)", err, "%");
+            if !reached {
+                res.warnings.push(format!("adaptive refinement stopped at {err:.2} % estimated error (target {target} %): raise adaptive_passes or max_levels, or use a smaller element size"));
+            }
+        }
+        Ok(res)
+    }
+
     fn solve_inner(&self) -> Result<Output> {
         {
             let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2481,9 +2532,19 @@ impl Core {
             drop(p);
             self.changed();
         };
-        let (model, mesh, rev) = self.prepare_mesh(false, &cb)?;
-        let prog = fem::Progress::new(&self.cancel, &cb);
-        let res = fem::solve(&model, &mesh, prog)?;
+        let (model, mut mesh, rev) = self.prepare_mesh(false, &cb)?;
+        let adaptive = model.mesh.adaptive_passes > 0 && mesh.octree && matches!(model.analysis.kind, AnalysisType::StaticStructural | AnalysisType::SteadyThermal);
+        let res = if adaptive {
+            self.solve_adaptive(&model, &mut mesh, rev, &cb)?
+        } else {
+            let mut r = fem::solve(&model, &mesh, fem::Progress::new(&self.cancel, &cb))?;
+            if matches!(model.analysis.kind, AnalysisType::StaticStructural | AnalysisType::SteadyThermal)
+                && let Some(est) = crate::octree::zz_estimate(&mesh, &r)
+            {
+                r.quantity("Estimated discretisation error (ZZ energy norm)", est.error_pct, "%");
+            }
+            r
+        };
         let mut s = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if s.geom_rev != rev {
             bail!("geometry changed during the solve; solve again");
