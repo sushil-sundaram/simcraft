@@ -78,7 +78,6 @@ fn voltage_bcs(model: &Model, mesh: &Mesh) -> Result<ScalarBc> {
 
 /// Solve the scalar Poisson problem K φ = f with Dirichlet values; returns (φ, K before BCs).
 fn solve_scalar(mesh: &Mesh, coef: &[f64], fixed: &[Option<f64>], f: &[f64], prog: Prog, res: &mut Results) -> Result<(Vec<f64>, NodeSparse)> {
-    let h = mesh.h * 1e-3;
     let ku = hex_conduction_unit();
     let ties = mesh.interface_ties();
     let mut k = NodeSparse::new_with_edges(mesh.nodes.len(), &mesh.elems, &ties, 1);
@@ -88,7 +87,7 @@ fn solve_scalar(mesh: &Mesh, coef: &[f64], fixed: &[Option<f64>], f: &[f64], pro
     }
     if !ties.is_empty() {
         let avg = coef.iter().sum::<f64>() / coef.len().max(1) as f64;
-        crate::fem::add_scalar_ties(mesh, &mut k, avg.max(1e-18) * h * 1e4);
+        crate::fem::add_scalar_ties(mesh, &mut k, avg.max(1e-18) * mesh.h * 1e-3 * 1e4);
     }
     let k0 = k.clone();
     let mut rhs = f.to_vec();
@@ -106,6 +105,13 @@ fn solve_scalar(mesh: &Mesh, coef: &[f64], fixed: &[Option<f64>], f: &[f64], pro
 fn set_reactions(k0: &NodeSparse, phi: &[f64], f: &[f64], sets: &[(u32, String, Vec<u32>, f64)], res: &mut Results) -> Vec<f64> {
     let mut kp = vec![0.0; phi.len()];
     k0.matvec(phi, &mut kp);
+    // octree: residual on the independent dofs (hanging-node shares go to their parents)
+    for (v, fi) in kp.iter_mut().zip(f) {
+        *v -= fi;
+    }
+    if let Some(h) = &k0.hang {
+        h.condense_rhs(&mut kp, 1);
+    }
     let mut claimed = vec![false; phi.len()];
     let mut out = Vec::new();
     for (id, label, nodes, _) in sets {
@@ -114,7 +120,7 @@ fn set_reactions(k0: &NodeSparse, phi: &[f64], f: &[f64], sets: &[(u32, String, 
             let n = n as usize;
             if !claimed[n] {
                 claimed[n] = true;
-                q += kp[n] - f[n];
+                q += kp[n];
             }
         }
         res.reactions.push(Reaction { load_id: *id, label: label.clone(), value: [float(q), 0.0, 0.0] });
@@ -249,7 +255,6 @@ fn grad_integrals() -> Vec<V3> {
 }
 
 pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<()> {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     prog.report(0.0, "assembling magnetic system")?;
     let nu: Vec<f64> = mesh.elem_mat.iter().map(|&m| 1.0 / (MU0 * mesh.materials[m as usize].relative_permeability.max(1e-6))).collect();
@@ -262,7 +267,7 @@ pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
     }
     if !ties.is_empty() {
         let avg = nu.iter().sum::<f64>() / nu.len().max(1) as f64;
-        crate::fem::add_vec3_ties(mesh, &mut k, avg.max(1.0) * h * 1e4);
+        crate::fem::add_vec3_ties(mesh, &mut k, avg.max(1.0) * mesh.h * 1e-3 * 1e4);
     }
     let k0 = k.clone();
     let gi = grad_integrals();

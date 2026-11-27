@@ -385,7 +385,7 @@ struct RefineZone {
 
 enum ZoneKind {
     Box,
-    Body { bi: usize },
+    Body,
     Patch { bi: usize, patch: usize, band: f64 },
 }
 
@@ -425,7 +425,7 @@ fn collect_refine_zones(
                         bail!("mesh refinement references unknown body '{bname}'");
                     };
                     let (lo, hi) = bodies[bi].shape.bounds();
-                    zones.push(RefineZone { lo, hi, target_level: lvl, kind: ZoneKind::Body { bi } });
+                    zones.push(RefineZone { lo, hi, target_level: lvl, kind: ZoneKind::Body });
                 }
             }
             for sel in &r.faces {
@@ -470,7 +470,7 @@ fn collect_refine_zones(
                         let pad = 2.0 * cell_target;
                         if sl == bname && r.faces.len() >= 1 {
                             matched = true;
-                            zones.push(RefineZone { lo, hi, target_level: lvl, kind: ZoneKind::Body { bi } });
+                            zones.push(RefineZone { lo, hi, target_level: lvl, kind: ZoneKind::Body });
                         } else {
                             for (lp, p) in b.shape.patch_names().iter().enumerate() {
                                 if format!("{bname}.{}", p.to_lowercase()) == sl {
@@ -533,7 +533,7 @@ fn collect_refine_zones(
                             let target = (min_dim / 2.0).max(h_min_floor);
                             let lvl = level_for_size(base_h, target, max_levels);
                             if lvl > 0 {
-                                zones.push(RefineZone { lo: blo, hi: bhi, target_level: lvl, kind: ZoneKind::Body { bi } });
+                                zones.push(RefineZone { lo: blo, hi: bhi, target_level: lvl, kind: ZoneKind::Body });
                             }
                         }
                     }
@@ -597,7 +597,7 @@ fn desired_level(zones: &[RefineZone], bodies: &[Body], clo: V3, chi: V3, h_cell
             continue;
         }
         let hit = match z.kind {
-            ZoneKind::Box | ZoneKind::Body { .. } => true,
+            ZoneKind::Box | ZoneKind::Body => true,
             ZoneKind::Patch { bi, patch, band } => {
                 if h_cell > 2.5 * band {
                     true

@@ -21,16 +21,28 @@ fn frame_stride(steps: usize) -> usize {
 }
 
 /// Dirichlet values as a vector (0 for free dofs) and the column-correction K·g.
-fn dirichlet_correction(k: &NodeSparse, fixed: &[Option<f64>]) -> Vec<f64> {
+fn dirichlet_correction(k: &NodeSparse, fixed: &[Option<f64>]) -> BcCorrection {
     let g: Vec<f64> = fixed.iter().map(|v| v.unwrap_or(0.0)).collect();
     let mut corr = vec![0.0; g.len()];
     if g.iter().any(|v| *v != 0.0) {
-        k.matvec(&g, &mut corr);
+        // octree: the correction belongs to the condensed operator CᵀKC
+        k.condensed_copy().matvec(&g, &mut corr);
     }
-    corr
+    BcCorrection { corr, hang: k.hang.clone(), bs: k.bs }
 }
 
-fn apply_rhs_bc(rhs: &mut [f64], corr: &[f64], fixed: &[Option<f64>]) {
+struct BcCorrection {
+    corr: Vec<f64>,
+    hang: Option<std::sync::Arc<crate::sparse::Hanging>>,
+    bs: usize,
+}
+
+fn apply_rhs_bc(rhs: &mut [f64], bc: &BcCorrection, fixed: &[Option<f64>]) {
+    // octree: f ← Cᵀf before the prescribed values go in
+    if let Some(h) = &bc.hang {
+        h.condense_rhs(rhs, bc.bs);
+    }
+    let corr = &bc.corr;
     for i in 0..rhs.len() {
         match fixed[i] {
             Some(g) => rhs[i] = g,
@@ -422,7 +434,6 @@ fn von_mises(s: &[f64; 6]) -> f64 {
 // ------------------------------------------------------------------ linear buckling
 
 pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut Results) -> Result<()> {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let (asm, units) = assemble_structural(model, mesh, prog)?;
     let Assembled { k: mut k0, fixed, support_nodes, owner, couplings, .. } = asm;
@@ -465,6 +476,7 @@ pub fn buckling(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut R
             let m = &mesh.materials[mi];
             let d = dmat(m.poisson_ratio);
             let epa = m.youngs_modulus_gpa * 1e9;
+            let h = mesh.elem_h_m(e);
             let ue: Vec<f64> = (0..24).map(|i| u[en[i / 3] as usize * 3 + i % 3]).collect();
             let mut kg = vec![0.0; 576];
             for (g, x) in gps.iter().enumerate() {
@@ -685,7 +697,6 @@ fn return_map(eps: &[f64; 6], st: &GpState, e: f64, nu: f64, sy: f64, hmod: f64)
 }
 
 pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut Results) -> Result<()> {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let (asm, units) = assemble_structural(model, mesh, prog)?;
     let Assembled { k: k_base, fixed, support_nodes, contact, owner, couplings } = asm;
@@ -731,6 +742,7 @@ pub fn plasticity(model: &Model, mesh: &crate::mesh::Mesh, prog: Prog, res: &mut
             .map(|(e, en)| {
                 let mi = mesh.elem_mat[e] as usize;
                 let (em, nu, sy, hm) = mats[mi];
+                let h = mesh.elem_h_m(e);
                 let ue: Vec<f64> = (0..24).map(|i| u[en[i / 3] as usize * 3 + i % 3]).collect();
                 let mut fe = [0.0; 24];
                 let mut ke = if want_k { vec![0.0; 576] } else { Vec::new() };

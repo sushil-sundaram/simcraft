@@ -2297,10 +2297,10 @@ pub fn assemble_thermal_k(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, se
                         k.add_element(en, &g[a + 1], kk[a] * ks);
                     }
                 }
-                (None, None) => k.add_element(en, &ku, m.thermal_conductivity * h * ks),
+                (None, None) => k.add_element(en, &ku, m.thermal_conductivity * mesh.elem_h_m(e) * ks),
                 (None, Some(kk)) => {
                     for a in 0..3 {
-                        k.add_element(en, &kax[a], kk[a] * h * ks);
+                        k.add_element(en, &kax[a], kk[a] * mesh.elem_h_m(e) * ks);
                     }
                 }
             }
@@ -2495,7 +2495,6 @@ pub fn radiation_quantities(r: &crate::radiation::Radiation, t: &[f64], res: &mu
 
 /// Heat flux field and (optionally) heat flow through fixed-temperature faces.
 pub fn thermal_post(mesh: &Mesh, t: &[f64], sys: Option<&ThermalSystem>, res: &mut Results) {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let ku = hex_conduction_unit();
     let kax = hex_conduction_unit_axes();
@@ -2508,6 +2507,7 @@ pub fn thermal_post(mesh: &Mesh, t: &[f64], sys: Option<&ThermalSystem>, res: &m
         let mat = &mesh.materials[mesh.elem_mat[e] as usize];
         let ks = kscale.as_ref().map(|v| v[e]).unwrap_or(1.0);
         let kc = mat.thermal_conductivity * ks;
+        let h = mesh.elem_h_m(e);
         let kv = [mat.k_axis(0) * ks, mat.k_axis(1) * ks, mat.k_axis(2) * ks];
         let ortho = mat.conductivity_xyz.is_some();
         let fitted = mesh.is_fitted(e);
@@ -2544,13 +2544,16 @@ pub fn thermal_post(mesh: &Mesh, t: &[f64], sys: Option<&ThermalSystem>, res: &m
     }
     if let Some(sys) = sys {
         let mut claimed = vec![false; nn];
+        // nodal heat residual; on octree meshes hanging-node shares go to their parents
+        let mut resid: Vec<f64> = (0..nn).map(|n| fint[n] + sys.conv_diag[n] * t[n] - sys.f[n]).collect();
+        mesh.condense_rhs(&mut resid, 1);
         for (id, label, nodes) in &sys.temp_sets {
             let mut q = 0.0;
             for &n in nodes {
                 let n = n as usize;
                 if !claimed[n] {
                     claimed[n] = true;
-                    q += fint[n] + sys.conv_diag[n] * t[n] - sys.f[n];
+                    q += resid[n];
                 }
             }
             // positive = heat flowing INTO the body through this face (negative = heat leaving)

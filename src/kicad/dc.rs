@@ -407,7 +407,7 @@ pub fn dc_drop_text(text: &str, path: &str, net: Option<&str>, from: &str, to: &
         }
         ptr.push(adj.len());
     }
-    let a = NodeSparse { bs: 1, ptr, adj, vals, hang: None };
+    let a = NodeSparse { bs: 1, ptr, adj, vals, hang: None, condensed: false };
     let mut vsol: Vec<f64> = (0..m).map(|r| fixed[nodes[r]].unwrap_or(0.5)).collect();
     // layers are coupled only through via barrels: keep them apart in the aggregation (the layer
     // coordinate is spread so 2×2×2 blocks never merge two layers)

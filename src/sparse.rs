@@ -14,6 +14,8 @@ pub struct NodeSparse {
     /// Hanging-node constraints of an octree mesh (`u = C q`): [`Solver`] condenses the system
     /// to the independent dofs and expands the solution. `None` for conforming meshes.
     pub hang: Option<std::sync::Arc<Hanging>>,
+    /// True once `hang` has been applied (`CᵀKC` in the full numbering, hanging rows decoupled).
+    pub condensed: bool,
 }
 
 /// Affine hanging-node constraints `u[node] = Σ w·u[parent]` with every parent independent.
@@ -70,7 +72,7 @@ impl Hanging {
             ptr.push(adj.len());
         }
         let vals = vec![0.0; adj.len() * bs * bs];
-        let mut out = NodeSparse { bs, ptr, adj, vals, hang: None };
+        let mut out = NodeSparse { bs, ptr, adj, vals, hang: None, condensed: false };
         let mut blk = vec![0.0; bs * bs];
         let mut tmp = vec![0.0; bs * bs];
         for a in 0..nrow {
@@ -180,12 +182,12 @@ impl NodeSparse {
             ptr.push(adj.len());
         }
         let vals = vec![0.0; adj.len() * bs * bs];
-        NodeSparse { bs, ptr, adj, vals, hang: None }
+        NodeSparse { bs, ptr, adj, vals, hang: None, condensed: false }
     }
 
     /// Copy sparsity pattern with all values reset to zero.
     pub fn empty_like(&self) -> Self {
-        NodeSparse { bs: self.bs, ptr: self.ptr.clone(), adj: self.adj.clone(), vals: vec![0.0; self.vals.len()], hang: self.hang.clone() }
+        NodeSparse { bs: self.bs, ptr: self.ptr.clone(), adj: self.adj.clone(), vals: vec![0.0; self.vals.len()], hang: self.hang.clone(), condensed: self.condensed }
     }
 
     /// Add a bs × bs row-major block into entry `(row_node, col_node)`.
@@ -266,7 +268,36 @@ impl NodeSparse {
             .collect()
     }
 
+    /// `CᵀKC` with the hanging constraints still attached (marked `condensed`).
+    pub fn condensed_copy(&self) -> NodeSparse {
+        match &self.hang {
+            Some(h) if !self.condensed => {
+                let mut c = h.condense(self);
+                c.hang = Some(h.clone());
+                c.condensed = true;
+                c
+            }
+            _ => self.clone(),
+        }
+    }
+
     pub fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        self.matvec_raw(x, y);
+        // a condensed operator acts on the independent dofs only
+        if self.condensed
+            && let Some(h) = &self.hang
+        {
+            for (n, _) in &h.nodes {
+                for c in 0..self.bs {
+                    if let Some(v) = y.get_mut(*n as usize * self.bs + c) {
+                        *v = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    fn matvec_raw(&self, x: &[f64], y: &mut [f64]) {
         let bs = self.bs;
         let body = |(n, yn): (usize, &mut [f64])| {
             let nb = &self.adj[self.ptr[n]..self.ptr[n + 1]];
@@ -294,6 +325,13 @@ impl NodeSparse {
     /// puts 1 on the diagonal.
     pub fn apply_dirichlet(&mut self, fixed: &[Option<f64>], f: &mut [f64]) {
         let bs = self.bs;
+        // octree: eliminate hanging nodes first (K ← CᵀKC, f ← Cᵀf), then prescribe the masters
+        if let Some(h) = self.hang.clone() {
+            h.condense_rhs(f, bs);
+            if !self.condensed {
+                *self = self.condensed_copy();
+            }
+        }
         // hanging dofs follow their parents: never prescribe them directly
         let released: Vec<Option<f64>>;
         let fixed = match &self.hang {
@@ -746,7 +784,9 @@ pub const GPU_AUTO_MIN: usize = 50_000;
 impl Solver {
     pub fn new(a: &NodeSparse) -> Result<Solver> {
         if let Some(h) = &a.hang {
-            let ac = h.condense(a);
+            let mut ac = if a.condensed { a.clone() } else { h.condense(a) };
+            ac.hang = None;
+            ac.condensed = false;
             let inner = Solver::new(&ac)?;
             return Ok(Solver::Condensed(Box::new(inner), Box::new(ac), h.clone()));
         }

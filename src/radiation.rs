@@ -238,7 +238,7 @@ impl Radiation {
     }
 
     fn view_factors(mesh: &Mesh, sel: &[(usize, f64, f64, usize)], npatch: &mut usize, nrays: &mut usize, cancel: &AtomicBool) -> Result<S2s> {
-        let h = mesh.h;
+        let h = mesh.min_h_mm();
         // outward normal (unit) and centre of every selected face
         let info: Vec<(V3, V3, f64)> = sel
             .iter()
