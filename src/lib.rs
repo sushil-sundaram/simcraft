@@ -2,6 +2,7 @@
 //! simple desktop UI and an MCP server for AI agents.
 pub mod assistant;
 pub mod bench;
+pub mod broadband;
 pub mod bridge;
 pub mod cfd;
 pub mod dynamics;

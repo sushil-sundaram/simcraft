@@ -24,6 +24,7 @@ pub enum AnalysisType {
     ThermalElectric,
     Magnetostatic,
     FullWaveEm,
+    BroadbandEm,
     MicrowaveHeating,
     Fluid,
     ConjugateHeatTransfer,
@@ -49,6 +50,7 @@ impl AnalysisType {
             ThermalElectric => "Thermal-Electric (Joule Heating)",
             Magnetostatic => "Magnetostatic",
             FullWaveEm => "Full-Wave EM (FDTD)",
+            BroadbandEm => "Broadband EM (S-parameters, emissions)",
             MicrowaveHeating => "Microwave Heating",
             Fluid => "Fluid Flow (CFD)",
             ConjugateHeatTransfer => "Conjugate Heat Transfer (CFD + thermal)",
@@ -59,13 +61,13 @@ impl AnalysisType {
         match self {
             StaticStructural | Modal | LinearBuckling | TransientStructural | NonlinearStructural | HarmonicResponse | ResponseSpectrum | RandomVibration => "Structural",
             SteadyThermal | TransientThermal | ThermalStress => "Thermal",
-            Electrostatic | CurrentFlow | ThermalElectric | Magnetostatic | FullWaveEm | MicrowaveHeating => "Electromagnetic",
+            Electrostatic | CurrentFlow | ThermalElectric | Magnetostatic | FullWaveEm | BroadbandEm | MicrowaveHeating => "Electromagnetic",
             Fluid | ConjugateHeatTransfer => "Fluids",
         }
     }
-    pub fn all() -> [AnalysisType; 19] {
+    pub fn all() -> [AnalysisType; 20] {
         use AnalysisType::*;
-        [StaticStructural, Modal, LinearBuckling, TransientStructural, NonlinearStructural, HarmonicResponse, ResponseSpectrum, RandomVibration, SteadyThermal, TransientThermal, ThermalStress, Electrostatic, CurrentFlow, ThermalElectric, Magnetostatic, FullWaveEm, MicrowaveHeating, Fluid, ConjugateHeatTransfer]
+        [StaticStructural, Modal, LinearBuckling, TransientStructural, NonlinearStructural, HarmonicResponse, ResponseSpectrum, RandomVibration, SteadyThermal, TransientThermal, ThermalStress, Electrostatic, CurrentFlow, ThermalElectric, Magnetostatic, FullWaveEm, BroadbandEm, MicrowaveHeating, Fluid, ConjugateHeatTransfer]
     }
     pub fn key(self) -> String {
         serde_json::to_value(self).unwrap().as_str().unwrap().to_string()
@@ -86,17 +88,17 @@ impl AnalysisType {
     }
     /// Meshes the enclosure (air / fluid box) when one exists.
     pub fn uses_enclosure(self) -> bool {
-        matches!(self, AnalysisType::Electrostatic | AnalysisType::Magnetostatic | AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer | AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating)
+        matches!(self, AnalysisType::Electrostatic | AnalysisType::Magnetostatic | AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer | AnalysisType::FullWaveEm | AnalysisType::BroadbandEm | AnalysisType::MicrowaveHeating)
     }
     pub fn requires_enclosure(self) -> bool {
-        matches!(self, AnalysisType::Magnetostatic | AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer | AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating)
+        matches!(self, AnalysisType::Magnetostatic | AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer | AnalysisType::FullWaveEm | AnalysisType::BroadbandEm | AnalysisType::MicrowaveHeating)
     }
     pub fn transient(self) -> bool {
         matches!(self, AnalysisType::TransientStructural | AnalysisType::TransientThermal | AnalysisType::MicrowaveHeating)
     }
     /// Finite-element analyses that support 2:1-balanced octree local refinement (CFD and FDTD stay uniform).
     pub fn supports_octree(self) -> bool {
-        !matches!(self, AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer | AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating)
+        !matches!(self, AnalysisType::Fluid | AnalysisType::ConjugateHeatTransfer | AnalysisType::FullWaveEm | AnalysisType::BroadbandEm | AnalysisType::MicrowaveHeating)
     }
 }
 
@@ -162,6 +164,13 @@ pub struct AnalysisSettings {
     /// Full-wave EM: maximum number of RF periods to reach steady state.
     #[serde(default = "max_periods")]
     pub max_periods: usize,
+    /// Broadband EM emissions: a metal ground plane under the model (image theory) with a
+    /// 1–4 m receive-antenna height scan, as on an open-area test site.
+    #[serde(default)]
+    pub ground_plane: bool,
+    /// Broadband EM emissions: height of the model's base above the ground plane [m].
+    #[serde(default = "eut_h")]
+    pub eut_height_m: f64,
     /// Where linear solves run: auto (GPU for large iterative solves), cpu or gpu.
     #[serde(default)]
     pub compute: crate::gpu::ComputeMode,
@@ -205,6 +214,15 @@ fn pec() -> String {
 fn max_periods() -> usize {
     400
 }
+fn eut_h() -> f64 {
+    0.8
+}
+fn fifty() -> f64 {
+    50.0
+}
+fn one_v() -> f64 {
+    1.0
+}
 fn te10() -> String {
     "te10".into()
 }
@@ -214,6 +232,15 @@ fn srss() -> String {
 fn cfd_it() -> usize {
     3000
 }
+impl AnalysisSettings {
+    /// Broadband EM frequency band [Hz]: `freq_min`..`freq_max`, or ±50 % around `frequency_hz`.
+    pub fn band(&self) -> (f64, f64) {
+        let lo = self.freq_min.filter(|v| *v >= 0.0).unwrap_or(0.5 * self.frequency_hz);
+        let hi = self.freq_max.filter(|v| *v > lo).unwrap_or((1.5 * self.frequency_hz).max(1.5 * lo));
+        (lo, hi)
+    }
+}
+
 impl Default for AnalysisSettings {
     fn default() -> Self {
         Self {
@@ -239,6 +266,8 @@ impl Default for AnalysisSettings {
             frequency_hz: 2.45e9,
             em_boundary: "pec".into(),
             max_periods: 400,
+            ground_plane: false,
+            eut_height_m: 0.8,
         }
     }
 }
@@ -407,6 +436,18 @@ pub enum Load {
         #[serde(default = "te10")]
         profile: String,
     },
+    /// Lumped port (broadband EM): a resistive voltage source of `impedance` [Ω] driving the line
+    /// of grid edges from `from` to `to` [mm] (axis-aligned, across a gap between two conductors).
+    /// `voltage` is the source amplitude [V] (0 = a passive matched termination). Reports the port
+    /// voltage, current, input impedance and S-parameters (reference impedance = `impedance`).
+    LumpedPort {
+        from: V3,
+        to: V3,
+        #[serde(default = "fifty")]
+        impedance: f64,
+        #[serde(default = "one_v")]
+        voltage: f64,
+    },
     /// Bolt pretension across an interior cut plane of `body`. Specify either `force_n` [N]
     /// (Step 1 target preload, then locked for Step 2) or `adjustment_mm` [mm] (shortening Δ).
     BoltPretension {
@@ -497,6 +538,7 @@ impl Load {
             Load::Inlet { .. } => "Velocity Inlet",
             Load::Outlet { .. } => "Pressure Outlet",
             Load::Port { .. } => "RF Port",
+            Load::LumpedPort { .. } => "Lumped Port",
             Load::MovingWall { .. } => "Moving Wall",
             Load::BoltPretension { .. } => "Bolt Pretension",
             Load::Spring { .. } => "Elastic Spring",
@@ -583,6 +625,7 @@ impl Load {
             ThermalElectric => matches!(self, Load::Voltage { .. } | Load::Current { .. }) || self.is_thermal(),
             Magnetostatic => matches!(self, Load::Coil { .. } | Load::Magnet { .. }),
             FullWaveEm => matches!(self, Load::Port { .. }),
+            BroadbandEm => matches!(self, Load::LumpedPort { .. }),
             MicrowaveHeating => matches!(self, Load::Port { .. }) || self.is_thermal(),
             Fluid => matches!(self, Load::Inlet { .. } | Load::Outlet { .. } | Load::Symmetry { .. } | Load::MovingWall { .. }),
             ConjugateHeatTransfer => matches!(self, Load::Inlet { .. } | Load::Outlet { .. } | Load::Symmetry { .. } | Load::MovingWall { .. } | Load::Gravity { .. }) || self.is_thermal(),
@@ -622,6 +665,10 @@ impl Load {
             Load::MovingWall { faces, velocity: v } => format!("({}, {}, {}) m/s on {}", v[0], v[1], v[2], f(faces)),
             Load::Outlet { faces, pressure } => format!("{pressure} Pa on {}", f(faces)),
             Load::Port { faces, power, polarization, profile } => format!("{power} W, E along {:?} ({profile}) on {}", polarization, f(faces)),
+            Load::LumpedPort { from, to, impedance, voltage } => {
+                let src = if *voltage == 0.0 { "passive".to_string() } else { format!("{voltage} V source") };
+                format!("{impedance} Ω, {src}, ({}, {}, {}) → ({}, {}, {}) mm", from[0], from[1], from[2], to[0], to[1], to[2])
+            }
             Load::BoltPretension { body, force_n, adjustment_mm, axis, .. } => {
                 let ax = axis.map(|a| format!(" ({a:?})")).unwrap_or_default();
                 match (force_n, adjustment_mm) {
@@ -985,6 +1032,23 @@ pub fn preflight_check(model: &Model, mesh: Option<&crate::mesh::Mesh>, elem_siz
                 out.push(item("flow_bc", "Needs Heat Sink", "CHT needs an Inlet/Outlet, Temperature, or Convection boundary for heat to leave.".into(), PreflightStatus::Fail, "setup"));
             } else {
                 out.push(item("flow_bc", "Flow BCs", "Inflow / boundary conditions defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+        }
+        BroadbandEm => {
+            if !has(&|l| matches!(l, Load::LumpedPort { voltage, .. } if *voltage != 0.0)) {
+                out.push(item("excitation", "Needs a Driven Port", "Add a Lumped Port with a source voltage to excite the model.".into(), PreflightStatus::Fail, "setup"));
+            } else {
+                out.push(item("excitation", "Ports", "Driven port defined.".into(), PreflightStatus::Pass, "setup"));
+            }
+            let (_, fhi) = model.analysis.band();
+            if elem_size_mm > 0.0 {
+                let max_er = resolved_mats.iter().map(|m| m.relative_permittivity).fold(1.0f64, f64::max).max(1.0);
+                let limit_mm = 299_792_458.0 / fhi * 1000.0 / max_er.sqrt() / 10.0;
+                if elem_size_mm > limit_mm {
+                    out.push(item("mesh_wavelength", "Mesh > λ/10", format!("Element size {elem_size_mm:.2} mm exceeds λ/10 ({limit_mm:.2} mm at the top of the band, {:.2} GHz, εr={max_er:.1}).", fhi / 1e9), PreflightStatus::Warn, "mesh"));
+                } else {
+                    out.push(item("mesh_wavelength", "Mesh ≤ λ/10", format!("{elem_size_mm:.2} mm ≤ {limit_mm:.2} mm at {:.2} GHz", fhi / 1e9), PreflightStatus::Pass, "mesh"));
+                }
             }
         }
         FullWaveEm | MicrowaveHeating => {

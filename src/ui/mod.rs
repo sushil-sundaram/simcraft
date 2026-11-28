@@ -76,6 +76,7 @@ pub(super) enum LoadKind {
     RemoteForce,
     RemoteDisplacement,
     PointMass,
+    LumpedPort,
 }
 
 impl LoadKind {
@@ -94,7 +95,7 @@ impl LoadKind {
         LoadKind::PointMass,
     ];
     pub(super) const THERMAL: [LoadKind; 5] = [LoadKind::Temperature, LoadKind::HeatFlux, LoadKind::Convection, LoadKind::Radiation, LoadKind::HeatGen];
-    pub(super) const ELECTRO: [LoadKind; 5] = [LoadKind::Voltage, LoadKind::Current, LoadKind::Coil, LoadKind::Magnet, LoadKind::Port];
+    pub(super) const ELECTRO: [LoadKind; 6] = [LoadKind::Voltage, LoadKind::Current, LoadKind::Coil, LoadKind::Magnet, LoadKind::Port, LoadKind::LumpedPort];
     pub(super) const FLUID: [LoadKind; 5] = [LoadKind::Inlet, LoadKind::Outlet, LoadKind::Symmetry, LoadKind::MovingWall, LoadKind::Gravity];
 
     pub(super) fn label(self) -> &'static str {
@@ -124,6 +125,7 @@ impl LoadKind {
             LoadKind::RemoteForce => "Remote Force",
             LoadKind::RemoteDisplacement => "Remote Disp.",
             LoadKind::PointMass => "Point Mass",
+            LoadKind::LumpedPort => "Lumped Port",
         }
     }
     pub(super) fn title(self) -> &'static str {
@@ -156,6 +158,7 @@ impl LoadKind {
             LoadKind::RemoteForce => "↗",
             LoadKind::RemoteDisplacement => "🎯",
             LoadKind::PointMass => "⚖",
+            LoadKind::LumpedPort => "⏚",
         }
     }
     pub(super) fn sample(self) -> Load {
@@ -186,6 +189,7 @@ impl LoadKind {
             LoadKind::RemoteForce => Load::RemoteForce { faces: f, point: [0.0; 3], force: [0.0; 3], moment: [0.0; 3] },
             LoadKind::RemoteDisplacement => Load::RemoteDisplacement { faces: f, point: [0.0; 3], x: None, y: None, z: None, rx: None, ry: None, rz: None, rigid: false },
             LoadKind::PointMass => Load::PointMass { faces: f, mass_kg: 1.0, point: None },
+            LoadKind::LumpedPort => Load::LumpedPort { from: [0.0; 3], to: [0.0; 3], impedance: 50.0, voltage: 1.0 },
         }
     }
     pub(super) fn color(self) -> Color32 {
@@ -197,7 +201,7 @@ impl LoadKind {
         Color32::from_rgb(c[0], c[1], c[2])
     }
     pub(super) fn needs_faces(self) -> bool {
-        !matches!(self, LoadKind::Gravity | LoadKind::HeatGen | LoadKind::Coil | LoadKind::Magnet | LoadKind::BoltPretension)
+        !matches!(self, LoadKind::Gravity | LoadKind::HeatGen | LoadKind::Coil | LoadKind::Magnet | LoadKind::BoltPretension | LoadKind::LumpedPort)
     }
     pub(super) fn needs_body(self) -> bool {
         matches!(self, LoadKind::Coil | LoadKind::Magnet | LoadKind::BoltPretension)
@@ -284,6 +288,10 @@ pub(super) struct Forms {
     pub spring_pre: f64,
     pub spring_to: String,
     pub remote_pt: [f64; 3],
+    pub lp_from: [f64; 3],
+    pub lp_to: [f64; 3],
+    pub lp_z: f64,
+    pub lp_v: f64,
     pub remote_moment: [f64; 3],
     pub remote_rot: [(bool, f64); 3],
     pub remote_rigid: bool,
@@ -353,6 +361,10 @@ impl Default for Forms {
             spring_pre: 0.0,
             spring_to: String::new(),
             remote_pt: [0.0; 3],
+            lp_from: [0.0; 3],
+            lp_to: [0.0, 0.0, 1.0],
+            lp_z: 50.0,
+            lp_v: 1.0,
             remote_moment: [0.0; 3],
             remote_rot: [(false, 0.0); 3],
             remote_rigid: false,

@@ -287,7 +287,9 @@ impl SimApp {
             let label = if r.history_label.is_empty() { "value".to_string() } else { r.history_label.clone() };
             let xl = if r.history_x.is_empty() { "step".to_string() } else { r.history_x.clone() };
             let sz = vec2(ui.available_width().max(300.0), (ui.available_height() - 10.0).max(170.0));
-            line_chart(ui, &p, &[(label, r.history.clone())], &xl, sz);
+            let mut curves = vec![(label, r.history.clone())];
+            curves.extend(r.series.iter().filter(|c| c.2).map(|c| (c.0.clone(), c.1.clone())));
+            line_chart(ui, &p, &curves, &xl, sz);
             return;
         }
         let avail = r.available_fields();

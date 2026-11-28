@@ -143,6 +143,13 @@ fn load_to_draft(id: u32, load: &Load) -> LoadDraft {
             }
             LoadKind::PointMass
         }
+        Load::LumpedPort { from, to, impedance, voltage } => {
+            f.lp_from = *from;
+            f.lp_to = *to;
+            f.lp_z = *impedance;
+            f.lp_v = *voltage;
+            LoadKind::LumpedPort
+        }
     };
     faces.shrink_to_fit();
     LoadDraft { id, kind, f, faces, body }
@@ -218,6 +225,7 @@ fn load_from_draft(k: LoadKind, f: &Forms, faces: Vec<String>, body: &str, is_ch
             rigid: f.remote_rigid,
         },
         LoadKind::PointMass => Load::PointMass { faces, mass_kg: f.value.max(1e-9), point: f.mass_offset.then_some(f.remote_pt) },
+        LoadKind::LumpedPort => Load::LumpedPort { from: f.lp_from, to: f.lp_to, impedance: f.lp_z, voltage: f.lp_v },
     }
 }
 
@@ -303,6 +311,7 @@ fn load_tool_args(k: LoadKind, f: &Forms, sel: &[String], body: &str, is_cht: bo
             }
             ("add_point_mass", a)
         }
+        LoadKind::LumpedPort => ("add_lumped_port", json!({"from": f.lp_from, "to": f.lp_to, "impedance": f.lp_z, "voltage": f.lp_v})),
     }
 }
 
@@ -528,6 +537,21 @@ fn load_definition_ui(ui: &mut egui::Ui, p: &super::theme::Pal, units: UnitSyste
             if f.mass_offset {
                 xyz_scaled(ui, &format!("{id_salt}-pm"), &mut f.remote_pt, units.len_scale(), "", 0.5);
             }
+        }
+        LoadKind::LumpedPort => {
+            ui.label(RichText::new(format!("From ({}) — one conductor", units.len_suffix().trim())).small().color(p.weak));
+            xyz_scaled(ui, &format!("{id_salt}-lpa"), &mut f.lp_from, units.len_scale(), "", 0.5);
+            ui.label(RichText::new(format!("To ({}) — the other conductor, along one axis", units.len_suffix().trim())).small().color(p.weak));
+            xyz_scaled(ui, &format!("{id_salt}-lpb"), &mut f.lp_to, units.len_scale(), "", 0.5);
+            egui::Grid::new(format!("{id_salt}-lp")).num_columns(2).show(ui, |ui| {
+                ui.label("Impedance");
+                ui.add(egui::DragValue::new(&mut f.lp_z).speed(1.0).range(1e-3..=1e6).suffix(" Ω"));
+                ui.end_row();
+                ui.label("Source");
+                ui.add(egui::DragValue::new(&mut f.lp_v).speed(0.1).range(0.0..=1e6).suffix(" V"));
+                ui.end_row();
+            });
+            ui.label(RichText::new("0 V = passive matched termination. Broadband EM reports S-parameters, input impedance and VSWR.").small().color(p.weak));
         }
     }
 }

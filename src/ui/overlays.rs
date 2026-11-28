@@ -249,6 +249,13 @@ pub(super) fn draw_load_glyphs(
                     draw_arrow_3d(cam, rect, painter, c, *velocity, 30.0, false, col, Some("Vw"));
                 }
             }
+            Load::LumpedPort { from, to, .. } => {
+                let (a, b) = (world_to_screen(cam, rect, *from), world_to_screen(cam, rect, *to));
+                painter.line_segment([a, b], Stroke::new(3.0, col));
+                painter.circle_filled(a, 3.5, col);
+                painter.circle_filled(b, 3.5, col);
+                painter.text(a.lerp(b, 0.5) + vec2(8.0, 0.0), Align2::LEFT_CENTER, "Port", FontId::proportional(11.0), col);
+            }
             Load::Port { polarization, .. } => {
                 let mut e = [0.0; 3];
                 e[polarization.idx()] = 1.0;
