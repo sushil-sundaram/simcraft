@@ -39,11 +39,12 @@ fn to_nodes(mesh: &Mesh, elem: &[f64], only_region: Option<u8>) -> Vec<f64> {
 
 /// Gradient of a nodal scalar at each element centre [unit/m].
 fn elem_gradients(mesh: &Mesh, phi: &[f64]) -> Vec<V3> {
-    let h = mesh.h * 1e-3;
     let cg = center_grads();
     mesh.elems
         .iter()
-        .map(|en| {
+        .enumerate()
+        .map(|(e, en)| {
+            let h = mesh.elem_h_m(e);
             let mut g = [0.0; 3];
             for a in 0..8 {
                 for c in 0..3 {
@@ -77,16 +78,16 @@ fn voltage_bcs(model: &Model, mesh: &Mesh) -> Result<ScalarBc> {
 
 /// Solve the scalar Poisson problem K φ = f with Dirichlet values; returns (φ, K before BCs).
 fn solve_scalar(mesh: &Mesh, coef: &[f64], fixed: &[Option<f64>], f: &[f64], prog: Prog, res: &mut Results) -> Result<(Vec<f64>, NodeSparse)> {
-    let h = mesh.h * 1e-3;
     let ku = hex_conduction_unit();
     let ties = mesh.interface_ties();
     let mut k = NodeSparse::new_with_edges(mesh.nodes.len(), &mesh.elems, &ties, 1);
+    k.hang = mesh.hang_ctx();
     for (e, en) in mesh.elems.iter().enumerate() {
-        k.add_element(en, &ku, coef[e] * h);
+        k.add_element(en, &ku, coef[e] * mesh.elem_h_m(e));
     }
     if !ties.is_empty() {
         let avg = coef.iter().sum::<f64>() / coef.len().max(1) as f64;
-        crate::fem::add_scalar_ties(mesh, &mut k, avg.max(1e-18) * h * 1e4);
+        crate::fem::add_scalar_ties(mesh, &mut k, avg.max(1e-18) * mesh.h * 1e-3 * 1e4);
     }
     let k0 = k.clone();
     let mut rhs = f.to_vec();
@@ -104,6 +105,13 @@ fn solve_scalar(mesh: &Mesh, coef: &[f64], fixed: &[Option<f64>], f: &[f64], pro
 fn set_reactions(k0: &NodeSparse, phi: &[f64], f: &[f64], sets: &[(u32, String, Vec<u32>, f64)], res: &mut Results) -> Vec<f64> {
     let mut kp = vec![0.0; phi.len()];
     k0.matvec(phi, &mut kp);
+    // octree: residual on the independent dofs (hanging-node shares go to their parents)
+    for (v, fi) in kp.iter_mut().zip(f) {
+        *v -= fi;
+    }
+    if let Some(h) = &k0.hang {
+        h.condense_rhs(&mut kp, 1);
+    }
     let mut claimed = vec![false; phi.len()];
     let mut out = Vec::new();
     for (id, label, nodes, _) in sets {
@@ -112,7 +120,7 @@ fn set_reactions(k0: &NodeSparse, phi: &[f64], f: &[f64], sets: &[(u32, String, 
             let n = n as usize;
             if !claimed[n] {
                 claimed[n] = true;
-                q += kp[n] - f[n];
+                q += kp[n];
             }
         }
         res.reactions.push(Reaction { load_id: *id, label: label.clone(), value: [float(q), 0.0, 0.0] });
@@ -162,7 +170,6 @@ pub fn electrostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
 
 /// DC current flow in the solid conductors. Returns Joule heat per element [W/m³].
 pub fn current_flow(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<Vec<f64>> {
-    let h = mesh.h * 1e-3;
     let bc = voltage_bcs(model, mesh)?;
     if bc.sets.is_empty() {
         bail!("current flow needs at least one Voltage boundary condition (e.g. 0 V ground) — add Current or a second Voltage to drive it");
@@ -190,7 +197,7 @@ pub fn current_flow(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -
     let grads = elem_gradients(mesh, &v);
     let jmag: Vec<f64> = grads.iter().zip(&sigma).map(|(g, s)| s * mag(g)).collect();
     let q: Vec<f64> = grads.iter().zip(&sigma).map(|(g, s)| s * dot(*g, *g)).collect();
-    let power: f64 = q.iter().sum::<f64>() * h * h * h;
+    let power: f64 = q.iter().enumerate().map(|(e, v)| v * mesh.elem_h_m(e).powi(3)).sum::<f64>();
     let currents = set_reactions(&k0, &v, &f, &bc.sets, res);
     res.quantity("Total Joule heating power", power, "W");
     if bc.sets.len() >= 2 {
@@ -248,19 +255,19 @@ fn grad_integrals() -> Vec<V3> {
 }
 
 pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Result<()> {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     prog.report(0.0, "assembling magnetic system")?;
     let nu: Vec<f64> = mesh.elem_mat.iter().map(|&m| 1.0 / (MU0 * mesh.materials[m as usize].relative_permeability.max(1e-6))).collect();
     let ku = curl_div_unit();
     let ties = mesh.interface_ties();
     let mut k = NodeSparse::new_with_edges(nn, &mesh.elems, &ties, 3);
+    k.hang = mesh.hang_ctx();
     for (e, en) in mesh.elems.iter().enumerate() {
-        k.add_element(en, &ku, nu[e] * h);
+        k.add_element(en, &ku, nu[e] * mesh.elem_h_m(e));
     }
     if !ties.is_empty() {
         let avg = nu.iter().sum::<f64>() / nu.len().max(1) as f64;
-        crate::fem::add_vec3_ties(mesh, &mut k, avg.max(1.0) * h * 1e4);
+        crate::fem::add_vec3_ties(mesh, &mut k, avg.max(1.0) * mesh.h * 1e-3 * 1e4);
     }
     let k0 = k.clone();
     let gi = grad_integrals();
@@ -296,6 +303,7 @@ pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
                         }
                     };
                     let j = scale(dir, jmag);
+                    let h = mesh.elem_h_m(e);
                     total_area_current += jmag * h * h * h;
                     for &n in &mesh.elems[e] {
                         for c in 0..3 {
@@ -311,6 +319,7 @@ pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
                 let m = scale(*remanence, 1.0 / MU0);
                 for &e in &els {
                     mag_m[e] = m;
+                    let h = mesh.elem_h_m(e);
                     for (a, &n) in mesh.elems[e].iter().enumerate() {
                         let fm = cross(m, scale(gi[a], h * h));
                         for c in 0..3 {
@@ -351,6 +360,7 @@ pub fn magnetostatic(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) 
     let mut hmag = vec![0.0; mesh.elems.len()];
     let mut energy = 0.0;
     for (e, en) in mesh.elems.iter().enumerate() {
+        let h = mesh.elem_h_m(e);
         let mut b = [0.0; 3];
         for (q, &n) in en.iter().enumerate() {
             let av = [a[n as usize * 3], a[n as usize * 3 + 1], a[n as usize * 3 + 2]];

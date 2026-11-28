@@ -187,6 +187,55 @@ impl SimApp {
                         self.f.mesh_size = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).element_size();
                     }
                 });
+                let (ms, sel, kind) = {
+                    let s = self.core.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (s.model.mesh.clone(), s.selection.clone(), s.model.analysis.kind)
+                };
+                let octree_ok = kind.supports_octree();
+                group(ui, &p, "LOCAL REFINEMENT", |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(8.0);
+                        ui.add(egui::DragValue::new(&mut self.f.refine_size).speed(0.05).range(0.01..=1000.0).suffix(" mm"))
+                            .on_hover_text("Element size on the selected faces or bodies (octree, 2:1 balanced)");
+                        let n = ms.refinements.len();
+                        let status = if !octree_ok { "uniform grid for this analysis".to_string() } else if n == 0 && sel.is_empty() { "select faces, then Refine".to_string() } else { String::new() };
+                        ui.label(RichText::new(if !status.is_empty() { status } else if n == 0 { "no refinements".to_string() } else { format!("{n} refinement{}", if n == 1 { "" } else { "s" }) }).small().color(p.weak));
+                    });
+                    if tool(ui, &p, "⊞", "Refine selection", None, octree_ok && !sel.is_empty()) {
+                        let mut rs = serde_json::to_value(&ms.refinements).unwrap_or(json!([]));
+                        if let Some(a) = rs.as_array_mut() {
+                            a.push(json!({"faces": sel, "size_mm": self.f.refine_size}));
+                        }
+                        self.run("set_mesh", json!({"refinements": rs, "local_refinement": true}));
+                    }
+                    if tool(ui, &p, "⊟", "Clear", None, n_refine(&ms) > 0) {
+                        self.run("set_mesh", json!({"refinements": [], "local_refinement": false, "feature_refinement": false, "adaptive_passes": 0}));
+                    }
+                    ui.vertical(|ui| {
+                        ui.add_space(8.0);
+                        let mut feat = ms.feature_refinement;
+                        if ui.add_enabled(octree_ok, egui::Checkbox::new(&mut feat, "Auto features")).on_hover_text("Refine small holes, curved faces and thin walls automatically").changed() {
+                            self.run("set_mesh", json!({"feature_refinement": feat}));
+                        }
+                        let mut lv = ms.max_levels as i32;
+                        if ui.add(egui::DragValue::new(&mut lv).range(1..=5).prefix("max levels ")).on_hover_text("Deepest octree subdivision below the element size (each level halves it)").changed() {
+                            self.run("set_mesh", json!({"max_levels": lv}));
+                        }
+                    });
+                });
+                group(ui, &p, "ADAPTIVE", |ui| {
+                    ui.vertical(|ui| {
+                        ui.add_space(8.0);
+                        let mut passes = ms.adaptive_passes as i32;
+                        if ui.add_enabled(octree_ok, egui::DragValue::new(&mut passes).range(0..=8).prefix("passes ")).on_hover_text("Static structural and steady thermal: re-solve and refine where the Zienkiewicz–Zhu error is largest (0 = off)").changed() {
+                            self.run("set_mesh", json!({"adaptive_passes": passes}));
+                        }
+                        let mut tgt = ms.adaptive_error_pct;
+                        if ui.add_enabled(octree_ok && ms.adaptive_passes > 0, egui::DragValue::new(&mut tgt).speed(0.1).range(0.1..=50.0).prefix("target ").suffix(" %")).on_hover_text("Stop when the estimated energy-norm error is below this").changed() {
+                            self.run("set_mesh", json!({"adaptive_error_pct": tgt}));
+                        }
+                    });
+                });
                 group(ui, &p, "DISPLAY", |ui| {
                     ui.vertical(|ui| {
                         ui.add_space(8.0);
@@ -913,4 +962,8 @@ impl SimApp {
             ui.label(RichText::new(format!("✖ {e}")).color(p.err));
         }
     }
+}
+
+fn n_refine(ms: &crate::model::MeshSettings) -> usize {
+    ms.refinements.len() + ms.feature_refinement as usize + (ms.adaptive_passes > 0) as usize
 }

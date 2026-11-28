@@ -312,6 +312,34 @@ SimCraft fills the model with equal cubes ("voxels") of the **element size** you
 - Size the cubes so thin layers line up with the grid (e.g. 1 mm cubes for a 4 mm dielectric):
   a 4 mm layer meshed with 1.5 mm cubes becomes 4.5 mm.
 
+### Local refinement and adaptive meshing
+
+Small holes and fillets need small elements, but the rest of the part does not. **Local refinement**
+builds an *octree* mesh: cubes are halved (each level halves the size) only where you ask, with at
+most a factor 2 between neighbours. Where a small cube meets a large one, the extra ("hanging")
+nodes are tied to the large cube's corners so the mesh stays continuous.
+
+- **MESH ▸ Local refinement**: select faces or bodies in the viewport, set the size and click
+  **Refine selection** (repeat for other features; **Clear** removes them). **Auto features**
+  refines small holes, curved faces and thin walls automatically. **max levels** (1–5, default 3)
+  caps how many times a cube is halved.
+- **MESH ▸ Adaptive**: with **passes** > 0, SimCraft solves, estimates the discretisation error
+  (Zienkiewicz–Zhu: the jump between element stresses or heat fluxes and their smoothed nodal
+  values), refines the elements carrying half of the error, and solves again, until the estimate is
+  below the **target** (default 2 %) or the passes run out. Each pass is listed in the results
+  ("Adaptive pass n: ZZ error"); Static Structural and Steady Thermal show the estimate on every
+  solve as "Estimated discretisation error".
+- MCP / Python: `set_mesh {"element_size_mm": 2, "refinements": [{"faces": ["Hole.side"], "size_mm": 0.5}]}`,
+  `{"feature_refinement": true}`, `{"adaptive_passes": 4, "adaptive_error_pct": 1}`.
+- Works with Static Structural, Thermal Stress, Steady and Transient Thermal, Modal, Buckling,
+  Plasticity, Harmonic, Response Spectrum, Random Vibration, Transient Structural, electrostatics,
+  current flow and magnetostatics, with curved-surface fitting on top. CFD, full-wave EM, KiCad
+  boards and models with contact pairs or bolt pretension stay on the uniform grid; octree models
+  use the direct or PCG solver (not multigrid).
+- Example (plate with a hole, §15): a 2 mm mesh refined to 0.5 mm at the hole gives the same Kt as a
+  uniform 1 mm mesh with 7× fewer elements; the adaptive loop reaches 0.7 % estimated error with a
+  fifth of the unknowns of the uniform 1 mm mesh.
+
 The MESH tab also toggles element edges in the viewport.
 
 ---

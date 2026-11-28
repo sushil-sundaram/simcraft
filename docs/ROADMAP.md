@@ -45,7 +45,7 @@ Sizes: **S** ≈ one session, **M** ≈ 2–3, **L** ≈ 4–6, **XL** > 6.
 | P2.2 | Path plots, cylindrical results, mesh-convergence assistant | S–M | cheap, raises trust in every result | done |
 | P2.3 | STEP import (spike first) | M–L | unlocks real CAD parts and assemblies | done |
 | P2.4 | Contact, bolt pretension, springs, remote points | L | assemblies; best after P2.3 | done |
-| P2.5 | Local mesh refinement (octree) + adaptive error control | XL | real parts with small features; touches every FE solver | planned |
+| P2.5 | Local mesh refinement (octree) + adaptive error control | XL | real parts with small features; touches every FE solver | done |
 | P2.6 | Broadband FDTD: lumped ports, S-parameters, emissions spectrum, ground plane | M–L | completes the EMC story started in Tier 3 | planned |
 | P2.7 | Fans, grilles / porous media, compact package models, PCB Joule heat | M | Icepak parity for boards and enclosures | planned |
 | P2.8 | Transient CFD + k-ω SST turbulence | L | unsteady flows, better separated-flow accuracy | planned |
@@ -168,6 +168,12 @@ Trilinear hex-mesh point locator and straight-line path sampling (`Mesh::locate_
   same Kt with ≥ 5× fewer elements; adaptive loop shows the expected energy-norm convergence rate.
 - **Risks**: the largest refactor of the plan (mesh, assembly, multigrid, fitting, rendering,
   probes); done behind a mesh option until every solver passes its tests on octree meshes.
+- **Done**: octree mesher with user / feature / adaptive zones; hanging nodes condensed (`CᵀKC`) inside
+  the linear solver so every FE analysis gets them; per-element sizes in assembly, loads and
+  recovery; ZZ estimate + Dörfler marking loop. Patch tests exact (structural, thermal,
+  electrostatic); Kirsch Kt with 7.4× fewer elements; adaptive energy-norm rate ≫ uniform
+  (`tests/octree.rs`, bench `kirsch_octree`, `kirsch_adaptive`). Not done: multigrid on the octree
+  (octree models use direct / PCG), octree with contact pairs or bolt pretension.
 
 ### P2.6 Broadband FDTD and EMC (M–L)
 

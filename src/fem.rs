@@ -436,7 +436,7 @@ pub fn center_grads_general(x: &[[f64; 3]; 8]) -> Vec<[f64; 3]> {
 /// mass, heat capacity and volumetric loads so boundary-fitted elements carry their true volume.
 pub fn node_volumes(mesh: &Mesh, e: usize) -> [f64; 8] {
     if !mesh.is_fitted(e) {
-        return [(mesh.h * 1e-3).powi(3) / 8.0; 8];
+        return [mesh.elem_h_m(e).powi(3) / 8.0; 8];
     }
     let x = elem_xyz_m(mesh, e);
     let mut v = [0.0; 8];
@@ -454,7 +454,7 @@ pub fn node_volumes(mesh: &Mesh, e: usize) -> [f64; 8] {
 /// ∫ Nᵢ dA [m²]. Exact for any bilinear (possibly boundary-fitted) quad; h²/4 on a voxel face.
 pub fn face_shares(mesh: &Mesh, fi: usize) -> ([V3; 4], [f64; 4]) {
     let face = &mesh.faces[fi];
-    let h = mesh.h * 1e-3;
+    let h = mesh.elem_h_m(face.elem as usize);
     if mesh.fitted.is_empty() {
         return ([scale(dir_normal(face.dir), h * h / 4.0); 4], [h * h / 4.0; 4]);
     }
@@ -1197,10 +1197,10 @@ pub struct Assembled {
 }
 
 pub fn assemble_structural(model: &Model, mesh: &Mesh, prog: Prog) -> Result<(Assembled, Vec<ElemUnit>)> {
-    let h = mesh.h * 1e-3;
     prog.report(0.0, "assembling stiffness")?;
     let units: Vec<ElemUnit> = mesh.materials.iter().map(|m| hex_elastic_unit(m.poisson_ratio)).collect();
-    let (couplings, fixed, support_nodes, owner) = StructuralCouplings::build(model, mesh)?;
+    let (couplings, mut fixed, support_nodes, owner) = StructuralCouplings::build(model, mesh)?;
+    mesh.release_hanging(&mut fixed, 3);
     let (_, _, contact, _) = structural_bcs(model, mesh)?;
     let mut k = NodeSparse::new_with_edges(couplings.total_nodes, &mesh.elems, &couplings.extra_edges, 3);
     let general: Vec<Option<ElemGeneral>> = (0..mesh.elems.len())
@@ -1216,10 +1216,11 @@ pub fn assemble_structural(model: &Model, mesh: &Mesh, prog: Prog) -> Result<(As
         let m = &mesh.materials[mesh.elem_mat[e] as usize];
         match &general[e] {
             Some(g) => k.add_element(en, &g.k, m.youngs_modulus_gpa * 1e9),
-            None => k.add_element(en, &units[mesh.elem_mat[e] as usize].k, m.youngs_modulus_gpa * 1e9 * h),
+            None => k.add_element(en, &units[mesh.elem_mat[e] as usize].k, m.youngs_modulus_gpa * 1e9 * mesh.elem_h_m(e)),
         }
     }
     couplings.apply_elastic_couplings(&mut k);
+    k.hang = mesh.hang_ctx();
     Ok((Assembled { k, fixed, support_nodes, contact, owner, couplings }, units))
 }
 
@@ -1294,7 +1295,7 @@ fn structural_bcs_len(model: &Model, mesh: &Mesh, total_nodes: usize) -> Result<
 pub const MG_MIN_ELEMENTS: usize = 60_000;
 
 fn use_multigrid(model: &Model, mesh: &Mesh) -> bool {
-    if !mesh.contacts.is_empty()
+    if mesh.octree || !mesh.contacts.is_empty()
         || !mesh.pretensions.is_empty()
         || model.loads.iter().any(|l| {
             matches!(
@@ -1379,7 +1380,6 @@ fn structural_mg(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog, 
 
 /// External nodal forces [N]: forces, pressure, gravity, remote forces, spring preloads, point masses and thermal expansion.
 pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Result<Vec<f64>> {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let tunits: Vec<Vec<f64>> = mesh.materials.iter().map(|m| thermal_load_unit(m.poisson_ratio)).collect();
     let tref = model.analysis.reference_temperature;
@@ -1395,6 +1395,19 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
         match &it.load {
             Load::Force { faces, vector } => {
                 let fs = mesh.resolve_faces(faces)?;
+                if mesh.octree {
+                    // mixed face sizes: spread as a uniform traction (area-weighted nodal shares)
+                    let sh: Vec<[f64; 4]> = fs.iter().map(|&fi| face_shares(mesh, fi as usize).1).collect();
+                    let area: f64 = sh.iter().flatten().sum::<f64>().max(1e-300);
+                    for (&fi, w) in fs.iter().zip(&sh) {
+                        for (k, &n) in mesh.faces[fi as usize].nodes.iter().enumerate() {
+                            for c in 0..3 {
+                                f[n as usize * 3 + c] += vector[c] * w[k] / area;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let share = 1.0 / (fs.len() as f64 * 4.0);
                 for &fi in &fs {
                     for &n in &mesh.faces[fi as usize].nodes {
@@ -1490,7 +1503,7 @@ pub fn external_forces(model: &Model, mesh: &Mesh, temps: Option<&[f64]>) -> Res
             let mi = mesh.elem_mat[e] as usize;
             let m = &mesh.materials[mi];
             let eth = m.youngs_modulus_gpa * 1e9 * m.thermal_expansion * elem_dt(e);
-            let (s, ft) = if mesh.is_fitted(e) { (eth, hex_elastic_general(&elem_xyz_m(mesh, e), m.poisson_ratio).fth) } else { (eth * h * h, tunits[mi].clone()) };
+            let (s, ft) = if mesh.is_fitted(e) { (eth, hex_elastic_general(&elem_xyz_m(mesh, e), m.poisson_ratio).fth) } else { (eth * mesh.elem_h_m(e).powi(2), tunits[mi].clone()) };
             for a in 0..8 {
                 for c in 0..3 {
                     f[en[a] as usize * 3 + c] += s * ft[a * 3 + c];
@@ -1514,6 +1527,7 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
     }
     let mut f_ext = external_forces(model, mesh, temps)?;
     f_ext.resize(n, 0.0);
+    mesh.condense_rhs(&mut f_ext, 3);
 
     // Fast path: no assembly contact pairs and no bolt pretensions -> existing active-set compression-only / linear solve
     if mesh.contacts.is_empty() && mesh.pretensions.is_empty() {
@@ -1529,6 +1543,7 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
             prog.report(0.05, "factorising")?;
             let solver = Solver::new(&k).map_err(|e| if comp_contact.is_empty() { e } else { anyhow::anyhow!("{e} (the part may be lifting off its compression-only supports: add a support that holds it)") })?;
             let its = solver.solve(&k, &f, &mut u, 1e-8, &prog.scalar(0.05, 0.85, "solving (PCG)"))?;
+            mesh.expand_solution(&mut u, 3);
             res.info.solver = solver.name().to_string();
             res.info.iterations += its;
             if comp_contact.is_empty() {
@@ -1536,6 +1551,7 @@ pub fn structural(model: &Model, mesh: &Mesh, temps: Option<&[f64]>, prog: Prog,
             }
             let mut ku = vec![0.0; n];
             k0.matvec(&u, &mut ku);
+            mesh.condense_rhs(&mut ku, 3);
             let mut changed = 0;
             for &(dof, sgn) in &comp_contact {
                 if fixed[dof].is_some() {
@@ -2000,7 +2016,6 @@ pub fn structural_post(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f6
 
 #[allow(clippy::too_many_arguments)]
 pub fn structural_post_ex(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&[f64]>, units: &[ElemUnit], fixed: &[Option<f64>], f_ext: &[f64], support_nodes: &[(u32, String, Vec<u32>)], owner: &[u32], couplings: Option<&StructuralCouplings>, res: &mut Results) {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let tunits: Vec<Vec<f64>> = mesh.materials.iter().map(|m| thermal_load_unit(m.poisson_ratio)).collect();
     let tref = model.analysis.reference_temperature;
@@ -2024,6 +2039,7 @@ pub fn structural_post_ex(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&
                 return general_post(mesh, e, m, &ue, m.thermal_expansion * elem_dt(e));
             }
             let eu = &units[mi];
+            let h = mesh.elem_h_m(e);
             let alpha: Vec<f64> = (0..9).map(|i| (0..24).map(|j| eu.r[i * 24 + j] * ue[j]).sum()).collect();
             let ath = m.thermal_expansion * elem_dt(e);
             let d = dmat(m.poisson_ratio);
@@ -2087,6 +2103,8 @@ pub fn structural_post_ex(model: &Model, mesh: &Mesh, u: &[f64], temps: Option<&
     if let Some(cp) = couplings {
         cp.add_internal_forces(u, &mut fint);
     }
+    // reactions live on the independent dofs: hanging-node forces go to their parents
+    mesh.condense_rhs(&mut fint, 3);
     let stress: Vec<[f64; 6]> = acc.iter().zip(&cnt).map(|(s, &c)| s.map(|v| v / c.max(1) as f64)).collect();
     let vm: Vec<f64> = stress
         .iter()
@@ -2266,6 +2284,7 @@ pub fn assemble_thermal_k(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, se
     };
     let ties = mesh.interface_ties();
     let mut k = NodeSparse::new_with_edges(nn, &elems, &ties, 1);
+    k.hang = mesh.hang_ctx();
     let kax = hex_conduction_unit_axes();
     let general: Vec<Option<[Vec<f64>; 4]>> = (0..mesh.elems.len()).into_par_iter().map(|e| (on(e) && mesh.is_fitted(e)).then(|| hex_conduction_general(&elem_xyz_m(mesh, e)))).collect();
     for (e, en) in mesh.elems.iter().enumerate() {
@@ -2279,10 +2298,10 @@ pub fn assemble_thermal_k(model: &Model, mesh: &Mesh, elem_q: Option<&[f64]>, se
                         k.add_element(en, &g[a + 1], kk[a] * ks);
                     }
                 }
-                (None, None) => k.add_element(en, &ku, m.thermal_conductivity * h * ks),
+                (None, None) => k.add_element(en, &ku, m.thermal_conductivity * mesh.elem_h_m(e) * ks),
                 (None, Some(kk)) => {
                     for a in 0..3 {
-                        k.add_element(en, &kax[a], kk[a] * h * ks);
+                        k.add_element(en, &kax[a], kk[a] * mesh.elem_h_m(e) * ks);
                     }
                 }
             }
@@ -2477,7 +2496,6 @@ pub fn radiation_quantities(r: &crate::radiation::Radiation, t: &[f64], res: &mu
 
 /// Heat flux field and (optionally) heat flow through fixed-temperature faces.
 pub fn thermal_post(mesh: &Mesh, t: &[f64], sys: Option<&ThermalSystem>, res: &mut Results) {
-    let h = mesh.h * 1e-3;
     let nn = mesh.nodes.len();
     let ku = hex_conduction_unit();
     let kax = hex_conduction_unit_axes();
@@ -2490,6 +2508,7 @@ pub fn thermal_post(mesh: &Mesh, t: &[f64], sys: Option<&ThermalSystem>, res: &m
         let mat = &mesh.materials[mesh.elem_mat[e] as usize];
         let ks = kscale.as_ref().map(|v| v[e]).unwrap_or(1.0);
         let kc = mat.thermal_conductivity * ks;
+        let h = mesh.elem_h_m(e);
         let kv = [mat.k_axis(0) * ks, mat.k_axis(1) * ks, mat.k_axis(2) * ks];
         let ortho = mat.conductivity_xyz.is_some();
         let fitted = mesh.is_fitted(e);
@@ -2526,13 +2545,16 @@ pub fn thermal_post(mesh: &Mesh, t: &[f64], sys: Option<&ThermalSystem>, res: &m
     }
     if let Some(sys) = sys {
         let mut claimed = vec![false; nn];
+        // nodal heat residual; on octree meshes hanging-node shares go to their parents
+        let mut resid: Vec<f64> = (0..nn).map(|n| fint[n] + sys.conv_diag[n] * t[n] - sys.f[n]).collect();
+        mesh.condense_rhs(&mut resid, 1);
         for (id, label, nodes) in &sys.temp_sets {
             let mut q = 0.0;
             for &n in nodes {
                 let n = n as usize;
                 if !claimed[n] {
                     claimed[n] = true;
-                    q += fint[n] + sys.conv_diag[n] * t[n] - sys.f[n];
+                    q += resid[n];
                 }
             }
             // positive = heat flowing INTO the body through this face (negative = heat leaving)

@@ -160,6 +160,50 @@ pub fn cases() -> Vec<Case> {
         }),
     });
     v.push(Case {
+        id: "kirsch_octree",
+        group: "Structural",
+        title: "Strip with a hole, octree mesh refined 4× at the hole only (P2.5)",
+        source: "Heywood / Howland: Kt(net) = 2 + (1 − d/W)³, on the gross section ÷ (1 − d/W)",
+        sizes: vec![2.0, 1.0],
+        size_unit: "mm",
+        quick: true,
+        metrics: vec![m("kirsch_octree.kt", "Kt (gross section)", (2.0 + 0.9f64.powi(3)) / 0.9, "", 0.03)],
+        run: Box::new(|hh| {
+            let c = new_core();
+            let r = script(&c, &[
+                ("add_box", json!({"name": "Plate", "min": [0, 0, 0], "size": [300, 100, 2]})),
+                ("add_cylinder", json!({"name": "Hole", "base": [0, 0, 0], "axis": "z", "radius": 10, "height": 2, "operation": "subtract"})),
+                ("set_mesh", json!({"element_size_mm": hh, "refinements": [{"faces": ["Hole.side"], "size_mm": hh / 4.0}]})),
+                ("add_symmetry", json!({"faces": ["Plate.xmin", "Plate.ymin", "Plate.zmin"]})),
+                ("add_pressure", json!({"faces": ["Plate.xmax"], "value_mpa": -10})),
+                ("solve", json!({})),
+            ])?;
+            out(vec![field(&r, "max_principal", "max")? / 10.0], &r)
+        }),
+    });
+    v.push(Case {
+        id: "kirsch_adaptive",
+        group: "Structural",
+        title: "Strip with a hole, adaptive Zienkiewicz–Zhu refinement to 1 % error (P2.5)",
+        source: "Heywood / Howland: Kt(net) = 2 + (1 − d/W)³, on the gross section ÷ (1 − d/W)",
+        sizes: vec![2.0],
+        size_unit: "mm",
+        quick: false,
+        metrics: vec![m("kirsch_adaptive.kt", "Kt (gross section)", (2.0 + 0.9f64.powi(3)) / 0.9, "", 0.03)],
+        run: Box::new(|hh| {
+            let c = new_core();
+            let r = script(&c, &[
+                ("add_box", json!({"name": "Plate", "min": [0, 0, 0], "size": [300, 100, 2]})),
+                ("add_cylinder", json!({"name": "Hole", "base": [0, 0, 0], "axis": "z", "radius": 10, "height": 2, "operation": "subtract"})),
+                ("set_mesh", json!({"element_size_mm": hh, "adaptive_passes": 4, "adaptive_error_pct": 1.0})),
+                ("add_symmetry", json!({"faces": ["Plate.xmin", "Plate.ymin", "Plate.zmin"]})),
+                ("add_pressure", json!({"faces": ["Plate.xmax"], "value_mpa": -10})),
+                ("solve", json!({})),
+            ])?;
+            out(vec![field(&r, "max_principal", "max")? / 10.0], &r)
+        }),
+    });
+    v.push(Case {
         id: "step_kirsch",
         group: "Structural",
         title: "STEP B-rep strip with circular hole in tension, d/W = 0.1: stress concentration",
