@@ -194,7 +194,7 @@ fn run(s: &Setup, ports: &[LPort], drive: usize, pulse: Pulse, max_steps: usize,
         for p in 0..np {
             peak[p] = peak[p].max(v[p][n - 1].abs()).max((cur[p][n - 1] * ports[p].z).abs());
         }
-        if n % window == 0 {
+        if n.is_multiple_of(window) {
             if !e.iter().step_by(97).all(|x| x.is_finite()) {
                 bail!("the FDTD solution became unstable (non-finite fields)");
             }
@@ -452,7 +452,7 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Results) -> Resul
         let fcen = fdtd::far_field_at(&s, &nre, &nim, 1.0, fc)?;
         if std::env::var_os("SIMCRAFT_DEBUG_PORT").is_some() {
             let nt = fdtd::Ntff::new(&s, &nre, &nim, 1.0, fc)?;
-            eprintln!("[ntff] poynting through box {:.4e} W, far-field integral {:.4e} W, delivered {:.4e} W", nt.poynting() / (1e3 * 1e3 / 1e6), fcen.prad, p_fc);
+            eprintln!("[ntff] poynting through box {:.4e} W, far-field integral {:.4e} W, delivered {:.4e} W", nt.poynting(), fcen.prad, p_fc);
         }
         res.quantity(&format!("Power delivered at {:.4} GHz", fc / 1e9), p_fc * 1e3, "mW");
         res.quantity(&format!("Radiated power at {:.4} GHz", fc / 1e9), fcen.prad * 1e3, "mW");

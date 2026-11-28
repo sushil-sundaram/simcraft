@@ -1213,6 +1213,8 @@ pub(crate) fn ntff_shell(s: &Setup) -> Result<Vec<u32>> {
 pub(crate) struct Ntff {
     patches: Vec<([f64; 3], CV, CV)>,
     normals: Vec<[f64; 3]>,
+    /// Patch area [m²] (J and M are stored already multiplied by it).
+    da: f64,
     pub k0: f64,
     /// Box centre in grid metres (from grid index 0).
     pub centre: [f64; 3],
@@ -1290,7 +1292,7 @@ impl Ntff {
                 }
             }
         }
-        Ok(Ntff { patches, normals, k0: omega / C0, centre, outside })
+        Ok(Ntff { patches, normals, da: h * h, k0: omega / C0, centre, outside })
     }
 
     /// Radiation vectors N = ∫J e^{jk r̂·r'} dA and L = ∫M e^{jk r̂·r'} dA towards unit `rhat`.
@@ -1319,7 +1321,7 @@ impl Ntff {
             let sv = crs(et, hc);
             p += 0.5 * (sv[0].re * n[0] + sv[1].re * n[1] + sv[2].re * n[2]);
         }
-        p
+        p / self.da
     }
 
     /// Radiation intensity U(θ, φ) [W/sr] = k²/(32π²η)(|L_φ+ηN_θ|²+|L_θ−ηN_φ|²).

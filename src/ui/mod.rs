@@ -852,6 +852,7 @@ impl SimApp {
                 "busbar" => self.example_busbar(),
                 "coil" => self.example_coil(),
                 "microwave" => self.example_microwave(),
+                "dipole" => self.example_dipole(),
                 "heatsink_cht" => self.example_heatsink_cht(),
                 _ => self.example_cfd(),
             },
@@ -1042,6 +1043,17 @@ impl SimApp {
             ("set_analysis", json!({"type": "microwave_heating", "frequency_ghz": 2.45, "em_boundary": "pec", "end_time": 30, "time_steps": 30, "initial_temperature": 5})),
             ("set_mesh", json!({"element_size_mm": 1.6})),
             ("add_port", json!({"faces": ["Enclosure.xmin"], "power": 800, "polarization": "z", "profile": "te10"})),
+        ]);
+    }
+    fn example_dipole(&mut self) {
+        self.script(&[
+            ("new_model", json!({})),
+            ("add_box", json!({"name": "ArmA", "min": [-2.5, -2.5, -75], "size": [5, 5, 70], "material": "Copper C101"})),
+            ("add_box", json!({"name": "ArmB", "min": [-2.5, -2.5, 0], "size": [5, 5, 70], "material": "Copper C101"})),
+            ("add_enclosure", json!({"material": "Air", "min": [-152.5, -152.5, -225], "size": [305, 305, 445]})),
+            ("set_analysis", json!({"type": "broadband_em", "freq_min_ghz": 0.5, "freq_max_ghz": 1.5, "freq_steps": 201, "em_boundary": "open"})),
+            ("set_mesh", json!({"element_size_mm": 5})),
+            ("add_lumped_port", json!({"from": [-2.5, -2.5, -5], "to": [-2.5, -2.5, 0], "impedance": 73, "voltage": 1})),
         ]);
     }
     fn example_heatsink_cht(&mut self) {

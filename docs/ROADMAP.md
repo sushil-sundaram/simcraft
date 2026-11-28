@@ -46,7 +46,7 @@ Sizes: **S** ≈ one session, **M** ≈ 2–3, **L** ≈ 4–6, **XL** > 6.
 | P2.3 | STEP import (spike first) | M–L | unlocks real CAD parts and assemblies | done |
 | P2.4 | Contact, bolt pretension, springs, remote points | L | assemblies; best after P2.3 | done |
 | P2.5 | Local mesh refinement (octree) + adaptive error control | XL | real parts with small features; touches every FE solver | done |
-| P2.6 | Broadband FDTD: lumped ports, S-parameters, emissions spectrum, ground plane | M–L | completes the EMC story started in Tier 3 | planned |
+| P2.6 | Broadband FDTD: lumped ports, S-parameters, emissions spectrum, ground plane | M–L | completes the EMC story started in Tier 3 | done |
 | P2.7 | Fans, grilles / porous media, compact package models, PCB Joule heat | M | Icepak parity for boards and enclosures | planned |
 | P2.8 | Transient CFD + k-ω SST turbulence | L | unsteady flows, better separated-flow accuracy | planned |
 | P2.9 | Large deformation + hyperelastic materials | L | seals, snap fits, rubber | planned |
@@ -185,6 +185,15 @@ Trilinear hex-mesh point locator and straight-line path sampling (`Mesh::locate_
   **ground plane** (image theory) and an antenna-height scan for a test-site estimate.
 - **Validate**: half-wave dipole Zin ≈ 73 + j42 Ω at resonance; microstrip Z₀ vs Hammerstad–Jensen;
   patch-antenna resonance vs the cavity model; S11 of a matched waveguide < −25 dB.
+- **Done**: `broadband_em` analysis (Gaussian-modulated pulse, port DFTs at every frequency, field DFTs
+  on the far-field shell at ≤ 21 frequencies and on the full grid at the band centre); lumped ports
+  (`add_lumped_port`: resistive Norton source on a line of edges, V from the edge sum, I from the H
+  loop) → S-matrix columns, Zin, VSWR, resonance, −10 dB bandwidth; emissions at 3 / 10 m vs FCC /
+  CISPR limits in free space or over a ground plane (image theory, 1–4 m height scan, turntable).
+  Validated: 145 mm dipole Rin 70.6 Ω at resonance, D 2.2 dBi, radiated = delivered within 1.6 %;
+  microstrip Z₀ within 4 % and εeff within 5 % of Hammerstad–Jensen; patch resonance within 5 % of the
+  cavity model; ground-plane gain 3.5–5 dB (≤ 6 dB by image theory). **Not done**: S-parameters of the
+  waveguide (RF Port) feeds and the matched-waveguide S11 check; broadband runs are CPU-only.
 
 ### P2.7 Electronics-cooling components (M)
 

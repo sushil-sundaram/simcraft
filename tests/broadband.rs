@@ -60,7 +60,6 @@ impl C {
     fn sub(self, o: C) -> C { C(self.0 - o.0, self.1 - o.1) }
     fn mul(self, o: C) -> C { C(self.0 * o.0 - self.1 * o.1, self.0 * o.1 + self.1 * o.0) }
     fn div(self, o: C) -> C { let d = o.0 * o.0 + o.1 * o.1; C((self.0 * o.0 + self.1 * o.1) / d, (self.1 * o.0 - self.0 * o.1) / d) }
-    fn sqrt(self) -> C { let r = (self.0 * self.0 + self.1 * self.1).sqrt().sqrt(); let a = self.1.atan2(self.0) / 2.0; C(r * a.cos(), r * a.sin()) }
 }
 
 /// S11, S21 of a microstrip of length `len` mm between two 50 Ω lumped ports, by frequency.
@@ -128,4 +127,61 @@ fn microstrip_impedance() {
         }
     }
     assert!(checked >= 4, "only {checked} frequencies checked");
+}
+
+/// Probe-fed rectangular patch (L 30 × W 38 mm on 2 mm, εr 4.4): S11 dips at the TM010
+/// resonance; the transmission-line (cavity) model gives f = c / (2 (L + 2ΔL) √εeff).
+#[test]
+fn patch_antenna_resonance() {
+    let c = new_core();
+    call(&c, "new_model", json!({}));
+    call(&c, "add_box", json!({"name": "Ground", "min": [-30, -30, 0], "size": [60, 60, 1], "material": "Copper C101"}));
+    call(&c, "add_box", json!({"name": "Substrate", "min": [-30, -30, 1], "size": [60, 60, 2], "material": "FR-4 (PCB laminate)"}));
+    call(&c, "add_box", json!({"name": "Patch", "min": [-15, -19, 3], "size": [30, 38, 1], "material": "Copper C101"}));
+    call(&c, "add_enclosure", json!({"min": [-45, -45, -15], "size": [90, 90, 35]}));
+    call(&c, "set_analysis", json!({"type": "broadband_em", "freq_min_ghz": 1.5, "freq_max_ghz": 3.5, "em_boundary": "open", "freq_steps": 201, "max_periods": 2000}));
+    call(&c, "set_mesh", json!({"element_size_mm": 1}));
+    // probe 6 mm in from the radiating edge along the resonant length (x)
+    call(&c, "add_lumped_port", json!({"from": [-9, 0, 1], "to": [-9, 0, 3], "impedance": 50}));
+    let r = solve(&c);
+    let fmin = qty(&r, "Port #1: best match at");
+    let s11 = qty(&r, "Minimum |S11|");
+    let (l, w, h, er) = (30.0f64, 38.0f64, 2.0f64, 4.4f64);
+    let eeff = (er + 1.0) / 2.0 + (er - 1.0) / 2.0 / (1.0 + 12.0 * h / w).sqrt();
+    let dl = 0.412 * h * (eeff + 0.3) * (w / h + 0.264) / ((eeff - 0.258) * (w / h + 0.8));
+    let f_cavity = 299.792_458 / (2.0 * (l + 2.0 * dl) * eeff.sqrt());
+    eprintln!("S11 minimum {s11:.1} dB at {fmin:.3} GHz; cavity model {f_cavity:.3} GHz; warnings {}", r["warnings"]);
+    assert!(s11 < -6.0, "no clear resonance (|S11| min {s11} dB)");
+    assert!((fmin - f_cavity).abs() < 0.06 * f_cavity, "patch resonance {fmin} GHz vs cavity model {f_cavity} GHz");
+}
+
+/// Emissions over a ground plane: a small horizontal dipole at 1 m above a metal ground plane,
+/// received at 3 m with a 1–4 m height scan. Image theory for a horizontal current gives at most
+/// a 2× (6 dB) gain over free space; the scan must land between 0 and +6.5 dB of free space.
+#[test]
+fn emissions_ground_plane() {
+    let run = |gp: bool| -> Value {
+        let c = new_core();
+        call(&c, "new_model", json!({}));
+        call(&c, "add_box", json!({"name": "ArmA", "min": [-40, -2.5, -2.5], "size": [37.5, 5, 5], "material": "Copper C101"}));
+        call(&c, "add_box", json!({"name": "ArmB", "min": [2.5, -2.5, -2.5], "size": [37.5, 5, 5], "material": "Copper C101"}));
+        call(&c, "add_enclosure", json!({"min": [-112.5, -72.5, -72.5], "size": [225, 145, 145]}));
+        call(&c, "set_analysis", json!({"type": "broadband_em", "freq_min_ghz": 0.3, "freq_max_ghz": 1.0, "em_boundary": "open", "freq_steps": 41, "ground_plane": gp, "eut_height_m": 1.0}));
+        call(&c, "set_mesh", json!({"element_size_mm": 5}));
+        call(&c, "add_lumped_port", json!({"from": [-2.5, -2.5, -2.5], "to": [2.5, -2.5, -2.5], "impedance": 50}));
+        solve(&c)
+    };
+    let (fs, gp) = (run(false), run(true));
+    let pick = |r: &Value, pre: &str| -> Vec<(f64, f64)> {
+        let s = r["curves"]["series"].as_object().unwrap();
+        let (_, v) = s.iter().find(|(k, _)| k.starts_with(pre)).unwrap_or_else(|| panic!("no curve {pre} in {:?}", s.keys().collect::<Vec<_>>()));
+        v.as_array().unwrap().iter().map(|p| (p[0].as_f64().unwrap(), p[1].as_f64().unwrap())).collect()
+    };
+    let (a, b) = (pick(&fs, "E at 3 m"), pick(&gp, "E at 3 m"));
+    for (x, y) in a.iter().zip(&b) {
+        let d = y.1 - x.1;
+        eprintln!("{:.3} GHz: free space {:.1}, ground plane {:.1} dBµV/m (+{d:.1} dB)", x.0, x.1, y.1);
+        assert!(d > -0.5 && d < 6.5, "ground-plane gain {d} dB at {} GHz", x.0);
+    }
+    assert!(qty(&gp, "Margin to FCC class B").is_finite());
 }

@@ -85,6 +85,7 @@ density, permanent magnet, velocity inlet, pressure outlet.
   buoyancy, conjugate heat transfer.
 - **Mesher**: voxel hex mesh of a CSG model (add/subtract boxes, cylinders, spheres, closed STL files).
 - **Local refinement (P2.5)**: 2:1-balanced octree meshes refined per face / body, automatically at small features, or adaptively from a Zienkiewicz–Zhu error estimate; hanging nodes are condensed inside the linear solver so every FE analysis supports them (plate with a hole: same Kt with 7× fewer elements).
+- **Broadband EM (P2.6)**: one pulsed FDTD run gives S-parameters, input impedance, VSWR and resonances at lumped ports, plus the radiated-emissions spectrum at 3 m / 10 m against FCC / CISPR limits, in free space or over a ground plane with an antenna-height scan (dipole: Rin 70.6 Ω at resonance, radiated = delivered within 1.6 %).
 
 ### Validation (`cargo test --release`)
 | Case | SimCraft | Theory |
