@@ -307,6 +307,13 @@ impl SimApp {
                             num(ui, "Frequency", st.frequency_hz / 1e9, "frequency_ghz", 0.01, " GHz", &mut changes);
                             num(ui, "Max RF periods", st.max_periods as f64, "max_periods", 10.0, "", &mut changes);
                         }
+                        if kind == AnalysisType::BroadbandEm {
+                            let (flo, fhi) = st.band();
+                            num(ui, "From", flo / 1e9, "freq_min_ghz", 0.01, " GHz", &mut changes);
+                            num(ui, "To", fhi / 1e9, "freq_max_ghz", 0.01, " GHz", &mut changes);
+                            num(ui, "Points", st.freq_steps as f64, "freq_steps", 1.0, "", &mut changes);
+                            num(ui, "Max periods", st.max_periods as f64, "max_periods", 10.0, "", &mut changes);
+                        }
                         if matches!(kind, AnalysisType::TransientThermal | AnalysisType::MicrowaveHeating) {
                             num(ui, "Initial temp.", st.initial_temperature, "initial_temperature", 0.5, " °C", &mut changes);
                         }
@@ -375,7 +382,7 @@ impl SimApp {
                                 }
                             });
                         }
-                        if matches!(kind, AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating) {
+                        if matches!(kind, AnalysisType::FullWaveEm | AnalysisType::MicrowaveHeating | AnalysisType::BroadbandEm) {
                             ui.horizontal(|ui| {
                                 ui.label("Outer boundary");
                                 for (b, l, tip) in [("pec", "Metal cavity", "The enclosure walls are metal (microwave oven, shielded box)"), ("open", "Open", "Absorbing boundary: waves leave the enclosure (antennas, radiated emissions)")] {
@@ -384,6 +391,21 @@ impl SimApp {
                                     }
                                 }
                             });
+                        }
+                        if kind == AnalysisType::BroadbandEm && st.em_boundary == "open" {
+                            let mut gp = st.ground_plane;
+                            if ui.checkbox(&mut gp, "Ground plane (test site)").on_hover_text("Emissions over a metal ground plane with a 1–4 m receive-antenna height scan, as on an open-area test site").changed() {
+                                self.run("set_analysis", json!({"ground_plane": gp}));
+                            }
+                            if gp {
+                                ui.horizontal(|ui| {
+                                    ui.label("Height above ground");
+                                    let mut hh = st.eut_height_m;
+                                    if ui.add(egui::DragValue::new(&mut hh).speed(0.05).range(0.0..=10.0).suffix(" m")).changed() {
+                                        self.run("set_analysis", json!({"eut_height_m": hh}));
+                                    }
+                                });
+                            }
                         }
                         if matches!(kind, AnalysisType::ResponseSpectrum | AnalysisType::RandomVibration) {
                             let dir = serde_json::to_value(st.direction).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();

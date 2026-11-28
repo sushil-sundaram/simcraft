@@ -64,14 +64,14 @@ pub struct Setup {
 }
 
 impl Setup {
-    fn n1(&self) -> [usize; 3] {
+    pub(crate) fn n1(&self) -> [usize; 3] {
         [self.n[0] + 1, self.n[1] + 1, self.n[2] + 1]
     }
-    fn node(&self, i: usize, j: usize, k: usize) -> usize {
+    pub(crate) fn node(&self, i: usize, j: usize, k: usize) -> usize {
         let n1 = self.n1();
         i + n1[0] * (j + n1[1] * k)
     }
-    fn cell(&self, i: usize, j: usize, k: usize) -> usize {
+    pub(crate) fn cell(&self, i: usize, j: usize, k: usize) -> usize {
         i + self.n[0] * (j + self.n[1] * k)
     }
     pub fn cells(&self) -> usize {
@@ -83,11 +83,18 @@ fn axis_of(d: u8) -> (usize, bool) {
     ((d / 2) as usize, d % 2 == 1)
 }
 
-/// Build the FDTD grid from the mesh (which includes the enclosure).
+/// Build the FDTD grid from the mesh (which includes the enclosure) and its RF ports.
 pub fn setup(model: &Model, mesh: &Mesh) -> Result<Setup> {
+    let freq = model.analysis.frequency_hz;
+    let mut s = setup_grid(model, mesh, freq, freq)?;
+    add_sheet_ports(model, mesh, &mut s)?;
+    Ok(s)
+}
+
+/// The FDTD grid without sources: losses evaluated at `freq`, resolution checked at `freq_check`.
+pub fn setup_grid(model: &Model, mesh: &Mesh, freq: f64, freq_check: f64) -> Result<Setup> {
     let st = &model.analysis;
-    let freq = st.frequency_hz;
-    if !(freq > 0.0) {
+    if !(freq > 0.0) || !(freq_check > 0.0) {
         bail!("frequency must be > 0");
     }
     let omega = std::f64::consts::TAU * freq;
@@ -156,12 +163,12 @@ pub fn setup(model: &Model, mesh: &Mesh) -> Result<Setup> {
 
     // ---- resolution check
     let max_eps = (0..mcells).filter(|&c| !m_pec[c]).map(|c| m_eps[c]).fold(1.0, f64::max);
-    let lambda_min = C0 / (freq * max_eps.sqrt());
+    let lambda_min = C0 / (freq_check * max_eps.sqrt());
     let cpw = lambda_min / h;
     if cpw < 3.0 {
         bail!(
             "the mesh is far too coarse for {:.3} GHz: {:.1} cells per wavelength in the densest material (εr = {:.0}); use an element size ≤ {:.2} mm",
-            freq / 1e9,
+            freq_check / 1e9,
             cpw,
             max_eps,
             lambda_min * 1e3 / 10.0
@@ -239,7 +246,7 @@ pub fn setup(model: &Model, mesh: &Mesh) -> Result<Setup> {
         }
     });
 
-    let mut s = Setup {
+    Ok(Setup {
         n,
         pad,
         h,
@@ -258,8 +265,14 @@ pub fn setup(model: &Model, mesh: &Mesh) -> Result<Setup> {
         power: 0.0,
         cells_per_wavelength: cpw,
         warnings,
-    };
+    })
+}
 
+/// RF ports (`Load::Port`): current sheets on their faces.
+pub fn add_sheet_ports(model: &Model, mesh: &Mesh, s: &mut Setup) -> Result<()> {
+    let nn = s.nn;
+    let h = s.h;
+    let pad = s.pad;
     // ---- ports
     let ports: Vec<(&Vec<String>, f64, usize, &String)> = model
         .loads
@@ -344,7 +357,76 @@ pub fn setup(model: &Model, mesh: &Mesh) -> Result<Setup> {
         s.src_amp.push((s.ecoef[3 * nn + idx as usize] as f64 * h * j) as f32);
         s.src_j.push(j);
     }
-    Ok(s)
+    Ok(())
+}
+
+/// H^{n+1/2} from E^n (no sources).
+pub(crate) fn step_h(s: &Setup, e: &[f32], h: &mut [f32]) {
+    let nn = s.nn;
+    let n1 = s.n1();
+    let (sy, sz) = (n1[0], n1[0] * n1[1]);
+    let coord = |idx: usize| (idx % n1[0], (idx / n1[0]) % n1[1], idx / sz);
+    let (da, db) = s.hcoef.split_at(3 * nn);
+    let (hx, rest) = h.split_at_mut(nn);
+    let (hy, hz) = rest.split_at_mut(nn);
+    let (ex, ey, ez) = (&e[..nn], &e[nn..2 * nn], &e[2 * nn..]);
+    hx.par_iter_mut().enumerate().for_each(|(idx, v)| {
+        let (_, j, k) = coord(idx);
+        if j + 1 < n1[1] && k + 1 < n1[2] {
+            *v = da[idx] * *v - db[idx] * ((ez[idx + sy] - ez[idx]) - (ey[idx + sz] - ey[idx]));
+        }
+    });
+    hy.par_iter_mut().enumerate().for_each(|(idx, v)| {
+        let (i, _, k) = coord(idx);
+        if i + 1 < n1[0] && k + 1 < n1[2] {
+            *v = da[nn + idx] * *v - db[nn + idx] * ((ex[idx + sz] - ex[idx]) - (ez[idx + 1] - ez[idx]));
+        }
+    });
+    hz.par_iter_mut().enumerate().for_each(|(idx, v)| {
+        let (i, j, _) = coord(idx);
+        if i + 1 < n1[0] && j + 1 < n1[1] {
+            *v = da[2 * nn + idx] * *v - db[2 * nn + idx] * ((ey[idx + 1] - ey[idx]) - (ex[idx + sy] - ex[idx]));
+        }
+    });
+}
+
+/// Loop integral ∮H·dl around E edge `k` (component·nn + node): the total current [A] through
+/// the edge's dual face along +axis (conduction + source + displacement).
+pub(crate) fn loop_current(s: &Setup, h: &[f32], k: usize) -> f64 {
+    let nn = s.nn;
+    let n1 = s.n1();
+    let (sy, sz) = (n1[0], n1[0] * n1[1]);
+    let (a, idx) = (k / nn, k % nn);
+    let (hx, hy, hz) = (&h[..nn], &h[nn..2 * nn], &h[2 * nn..]);
+    let curl = match a {
+        0 => (hz[idx] - hz[idx - sy]) - (hy[idx] - hy[idx - sz]),
+        1 => (hx[idx] - hx[idx - sz]) - (hz[idx] - hz[idx - 1]),
+        _ => (hy[idx] - hy[idx - 1]) - (hx[idx] - hx[idx - sy]),
+    };
+    curl as f64
+}
+
+/// E^{n+1} from H^{n+1/2} (no sources).
+pub(crate) fn step_e(s: &Setup, h: &[f32], e: &mut [f32]) {
+    let nn = s.nn;
+    let n1 = s.n1();
+    let (sy, sz) = (n1[0], n1[0] * n1[1]);
+    let (ca, cb) = s.ecoef.split_at(3 * nn);
+    let (hx, hy, hz) = (&h[..nn], &h[nn..2 * nn], &h[2 * nn..]);
+    e.par_chunks_mut(nn).enumerate().for_each(|(a, ea)| {
+        ea.par_iter_mut().enumerate().for_each(|(idx, v)| {
+            let k = a * nn + idx;
+            if cb[k] == 0.0 {
+                return;
+            }
+            let curl = match a {
+                0 => (hz[idx] - hz[idx - sy]) - (hy[idx] - hy[idx - sz]),
+                1 => (hx[idx] - hx[idx - sz]) - (hz[idx] - hz[idx - 1]),
+                _ => (hy[idx] - hy[idx - 1]) - (hx[idx] - hx[idx - sy]),
+            };
+            *v = ca[k] * *v + cb[k] * curl;
+        });
+    });
 }
 
 // ------------------------------------------------------------------ engines
@@ -793,7 +875,7 @@ fn cell_power(s: &Setup, re: &[f32], im: &[f32], k: f64) -> Vec<f64> {
 }
 
 /// Peak |E| at a cell centre (raw units).
-fn cell_e(s: &Setup, re: &[f32], im: &[f32], k: f64, c: usize) -> f64 {
+pub(crate) fn cell_e(s: &Setup, re: &[f32], im: &[f32], k: f64, c: usize) -> f64 {
     let nn = s.nn;
     let n = s.n;
     let (i, j, kk) = (c % n[0], (c / n[0]) % n[1], c / (n[0] * n[1]));
@@ -1049,31 +1131,31 @@ pub fn microwave_heating(model: &Model, mesh: &Mesh, prog: Prog, res: &mut Resul
 // ------------------------------------------------------------------ far field (NTFF)
 
 #[derive(Clone, Copy, Default, Debug)]
-struct Cx {
-    re: f64,
-    im: f64,
+pub(crate) struct Cx {
+    pub(crate) re: f64,
+    pub(crate) im: f64,
 }
 impl Cx {
-    fn new(re: f64, im: f64) -> Cx {
+    pub(crate) fn new(re: f64, im: f64) -> Cx {
         Cx { re, im }
     }
-    fn add(self, o: Cx) -> Cx {
+    pub(crate) fn add(self, o: Cx) -> Cx {
         Cx::new(self.re + o.re, self.im + o.im)
     }
-    fn sub(self, o: Cx) -> Cx {
+    pub(crate) fn sub(self, o: Cx) -> Cx {
         Cx::new(self.re - o.re, self.im - o.im)
     }
-    fn mul(self, o: Cx) -> Cx {
+    pub(crate) fn mul(self, o: Cx) -> Cx {
         Cx::new(self.re * o.re - self.im * o.im, self.re * o.im + self.im * o.re)
     }
-    fn scale(self, s: f64) -> Cx {
+    pub(crate) fn scale(self, s: f64) -> Cx {
         Cx::new(self.re * s, self.im * s)
     }
-    fn norm2(self) -> f64 {
+    pub(crate) fn norm2(self) -> f64 {
         self.re * self.re + self.im * self.im
     }
 }
-type CV = [Cx; 3];
+pub(crate) type CV = [Cx; 3];
 fn cross_c(a: [f64; 3], b: CV) -> CV {
     [b[2].scale(a[1]).sub(b[1].scale(a[2])), b[0].scale(a[2]).sub(b[2].scale(a[0])), b[1].scale(a[0]).sub(b[0].scale(a[1]))]
 }
@@ -1091,108 +1173,181 @@ pub struct FarField {
     pub outside: usize,
 }
 
-/// Near-to-far-field transform: equivalent currents J = n×H, M = −n×E on a box two cells inside
-/// the absorbing layer, radiation vectors N, L over the sphere, U = k²/(32π²η)(|L_φ+ηN_θ|²+|L_θ−ηN_φ|²).
-/// `scale` turns the raw phasors into V/m.
-pub fn far_field(s: &Setup, re: &[f32], im: &[f32], scale: f64) -> Result<FarField> {
+/// Transform box (cell indices) two cells inside the absorbing layer.
+pub(crate) fn ntff_box(s: &Setup) -> Result<([usize; 3], [usize; 3])> {
     if s.pad == 0 {
         bail!("far field needs an open boundary");
     }
-    let nn = s.nn;
-    let n1 = s.n1();
-    let (sy, sz) = (n1[0], n1[0] * n1[1]);
-    let h = s.h;
-    let omega = std::f64::consts::TAU * s.freq;
-    // discrete-time angular frequency (Yee leapfrog)
-    let wt = 2.0 / s.dt * (omega * s.dt / 2.0).sin();
-    let e = |c: usize, idx: usize| Cx::new(re[c * nn + idx] as f64 * scale, -(im[c * nn + idx] as f64) * scale);
-    // H = j curl E / (ω μ0), curl from the Yee update stencils
-    let hk = Cx::new(0.0, 1.0 / (wt * MU0 * h));
-    let hf = |c: usize, idx: usize| -> Cx {
-        let curl = match c {
-            0 => e(2, idx + sy).sub(e(2, idx)).sub(e(1, idx + sz).sub(e(1, idx))),
-            1 => e(0, idx + sz).sub(e(0, idx)).sub(e(2, idx + 1).sub(e(2, idx))),
-            _ => e(1, idx + 1).sub(e(1, idx)).sub(e(0, idx + sy).sub(e(0, idx))),
-        };
-        curl.mul(hk)
-    };
     let m = 2usize;
     let b0 = [s.pad + m; 3];
     let b1 = [s.n[0] - s.pad - m, s.n[1] - s.pad - m, s.n[2] - s.pad - m];
     if (0..3).any(|a| b1[a] < b0[a] + 2) {
         bail!("the enclosure is too small for the far-field transform");
     }
-    // material between the transform surface and the absorber
-    let mut outside = 0usize;
-    for k in s.pad..s.n[2] - s.pad {
-        for j in s.pad..s.n[1] - s.pad {
-            for i in s.pad..s.n[0] - s.pad {
-                let inside = i >= b0[0] && i < b1[0] && j >= b0[1] && j < b1[1] && k >= b0[2] && k < b1[2];
-                let c = s.cell(i, j, k);
-                if !inside && (s.cell_pec[c] || s.cell_eps[c] > 1.01 || s.cell_sig[c] > 1e-6) {
-                    outside += 1;
+    Ok((b0, b1))
+}
+
+/// Flat E indices (component·nn + node) the far-field transform reads: every edge on the three
+/// node layers around each face of the transform box.
+pub(crate) fn ntff_shell(s: &Setup) -> Result<Vec<u32>> {
+    let (b0, b1) = ntff_box(s)?;
+    let n1 = s.n1();
+    let mut out = Vec::new();
+    for k in b0[2] - 1..=(b1[2] + 1).min(n1[2] - 1) {
+        for j in b0[1] - 1..=(b1[1] + 1).min(n1[1] - 1) {
+            for i in b0[0] - 1..=(b1[0] + 1).min(n1[0] - 1) {
+                let p = [i, j, k];
+                let on = (0..3).any(|a| p[a] + 1 >= b0[a] && p[a] <= b0[a] + 1 || p[a] + 1 >= b1[a] && p[a] <= b1[a] + 1);
+                if on {
+                    for c in 0..3 {
+                        out.push((c * s.nn + s.node(i, j, k)) as u32);
+                    }
                 }
             }
         }
     }
-    let centre = [0, 1, 2].map(|a| 0.5 * (b0[a] + b1[a]) as f64 * h);
-    // surface patches: position, J, M (per unit area), area
-    let mut patches: Vec<([f64; 3], CV, CV)> = Vec::new();
-    for a in 0..3 {
-        let (u, v) = ((a + 1) % 3, (a + 2) % 3);
-        for (p, sign) in [(b0[a], -1.0), (b1[a], 1.0)] {
-            let mut nrm = [0.0; 3];
-            nrm[a] = sign;
-            for iu in b0[u]..b1[u] {
-                for iv in b0[v]..b1[v] {
-                    let node = |pa: usize, pu: usize, pv: usize| {
-                        let mut q = [0usize; 3];
-                        q[a] = pa;
-                        q[u] = pu;
-                        q[v] = pv;
-                        s.node(q[0], q[1], q[2])
-                    };
-                    let mut ev: CV = [Cx::default(); 3];
-                    ev[u] = e(u, node(p, iu, iv)).add(e(u, node(p, iu, iv + 1))).scale(0.5);
-                    ev[v] = e(v, node(p, iu, iv)).add(e(v, node(p, iu + 1, iv))).scale(0.5);
-                    let mut hv: CV = [Cx::default(); 3];
-                    hv[u] = hf(u, node(p - 1, iu, iv)).add(hf(u, node(p, iu, iv))).add(hf(u, node(p - 1, iu + 1, iv))).add(hf(u, node(p, iu + 1, iv))).scale(0.25);
-                    hv[v] = hf(v, node(p - 1, iu, iv)).add(hf(v, node(p, iu, iv))).add(hf(v, node(p - 1, iu, iv + 1))).add(hf(v, node(p, iu, iv + 1))).scale(0.25);
-                    let j = cross_c(nrm, hv);
-                    let mm = cross_c(nrm, ev).map(|x| x.scale(-1.0));
-                    let mut pos = [0.0; 3];
-                    pos[a] = p as f64 * h - centre[a];
-                    pos[u] = (iu as f64 + 0.5) * h - centre[u];
-                    pos[v] = (iv as f64 + 0.5) * h - centre[v];
-                    patches.push((pos, j, mm));
+    Ok(out)
+}
+
+/// Equivalent surface currents of the transform box at one frequency (radiation vectors N, L).
+pub(crate) struct Ntff {
+    patches: Vec<([f64; 3], CV, CV)>,
+    normals: Vec<[f64; 3]>,
+    /// Patch area [m²] (J and M are stored already multiplied by it).
+    da: f64,
+    pub k0: f64,
+    /// Box centre in grid metres (from grid index 0).
+    pub centre: [f64; 3],
+    pub outside: usize,
+}
+
+impl Ntff {
+    /// Equivalent currents J = n×H, M = −n×E on a box two cells inside the absorbing layer;
+    /// `scale` turns the raw phasors (Ê = re − i·im) into V/m.
+    pub(crate) fn new(s: &Setup, re: &[f32], im: &[f32], scale: f64, freq: f64) -> Result<Ntff> {
+        let nn = s.nn;
+        let n1 = s.n1();
+        let (sy, sz) = (n1[0], n1[0] * n1[1]);
+        let h = s.h;
+        let omega = std::f64::consts::TAU * freq;
+        // discrete-time angular frequency (Yee leapfrog)
+        let wt = 2.0 / s.dt * (omega * s.dt / 2.0).sin();
+        let e = |c: usize, idx: usize| Cx::new(re[c * nn + idx] as f64 * scale, -(im[c * nn + idx] as f64) * scale);
+        // H = j curl E / (ω μ0), curl from the Yee update stencils
+        let hk = Cx::new(0.0, 1.0 / (wt * MU0 * h));
+        let hf = |c: usize, idx: usize| -> Cx {
+            let curl = match c {
+                0 => e(2, idx + sy).sub(e(2, idx)).sub(e(1, idx + sz).sub(e(1, idx))),
+                1 => e(0, idx + sz).sub(e(0, idx)).sub(e(2, idx + 1).sub(e(2, idx))),
+                _ => e(1, idx + 1).sub(e(1, idx)).sub(e(0, idx + sy).sub(e(0, idx))),
+            };
+            curl.mul(hk)
+        };
+        let (b0, b1) = ntff_box(s)?;
+        // material between the transform surface and the absorber
+        let mut outside = 0usize;
+        for k in s.pad..s.n[2] - s.pad {
+            for j in s.pad..s.n[1] - s.pad {
+                for i in s.pad..s.n[0] - s.pad {
+                    let inside = i >= b0[0] && i < b1[0] && j >= b0[1] && j < b1[1] && k >= b0[2] && k < b1[2];
+                    let c = s.cell(i, j, k);
+                    if !inside && (s.cell_pec[c] || s.cell_eps[c] > 1.01 || s.cell_sig[c] > 1e-6) {
+                        outside += 1;
+                    }
                 }
             }
         }
+        let centre = [0, 1, 2].map(|a| 0.5 * (b0[a] + b1[a]) as f64 * h);
+        let mut patches: Vec<([f64; 3], CV, CV)> = Vec::new();
+        let mut normals = Vec::new();
+        for a in 0..3 {
+            let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+            for (p, sign) in [(b0[a], -1.0), (b1[a], 1.0)] {
+                let mut nrm = [0.0; 3];
+                nrm[a] = sign;
+                for iu in b0[u]..b1[u] {
+                    for iv in b0[v]..b1[v] {
+                        let node = |pa: usize, pu: usize, pv: usize| {
+                            let mut q = [0usize; 3];
+                            q[a] = pa;
+                            q[u] = pu;
+                            q[v] = pv;
+                            s.node(q[0], q[1], q[2])
+                        };
+                        let mut ev: CV = [Cx::default(); 3];
+                        ev[u] = e(u, node(p, iu, iv)).add(e(u, node(p, iu, iv + 1))).scale(0.5);
+                        ev[v] = e(v, node(p, iu, iv)).add(e(v, node(p, iu + 1, iv))).scale(0.5);
+                        let mut hv: CV = [Cx::default(); 3];
+                        hv[u] = hf(u, node(p - 1, iu, iv)).add(hf(u, node(p, iu, iv))).add(hf(u, node(p - 1, iu + 1, iv))).add(hf(u, node(p, iu + 1, iv))).scale(0.25);
+                        hv[v] = hf(v, node(p - 1, iu, iv)).add(hf(v, node(p, iu, iv))).add(hf(v, node(p - 1, iu, iv + 1))).add(hf(v, node(p, iu, iv + 1))).scale(0.25);
+                        let j = cross_c(nrm, hv);
+                        let mm = cross_c(nrm, ev).map(|x| x.scale(-1.0));
+                        let mut pos = [0.0; 3];
+                        pos[a] = p as f64 * h - centre[a];
+                        pos[u] = (iu as f64 + 0.5) * h - centre[u];
+                        pos[v] = (iv as f64 + 0.5) * h - centre[v];
+                        patches.push((pos, j.map(|x| x.scale(h * h)), mm.map(|x| x.scale(h * h))));
+                        normals.push(nrm);
+                    }
+                }
+            }
+        }
+        Ok(Ntff { patches, normals, da: h * h, k0: omega / C0, centre, outside })
     }
-    let k0 = omega / C0;
-    let eta = (MU0 / EPS0).sqrt();
-    let da = h * h;
-    let (nth, nph) = (60usize, 72usize);
-    let (dth, dph) = (std::f64::consts::PI / nth as f64, std::f64::consts::TAU / nph as f64);
-    let dirs: Vec<(f64, f64)> = (0..nth).flat_map(|i| (0..nph).map(move |j| ((i as f64 + 0.5) * dth, j as f64 * dph))).collect();
-    let u_of = |th: f64, ph: f64| -> f64 {
-        let (st, ct, sp, cp) = (th.sin(), th.cos(), ph.sin(), ph.cos());
-        let rhat = [st * cp, st * sp, ct];
+
+    /// Radiation vectors N = ∫J e^{jk r̂·r'} dA and L = ∫M e^{jk r̂·r'} dA towards unit `rhat`.
+    pub(crate) fn nl(&self, rhat: [f64; 3]) -> (CV, CV) {
         let (mut nv, mut lv): (CV, CV) = ([Cx::default(); 3], [Cx::default(); 3]);
-        for (pos, j, mm) in &patches {
-            let phase = k0 * (rhat[0] * pos[0] + rhat[1] * pos[1] + rhat[2] * pos[2]);
-            let w = Cx::new(phase.cos(), phase.sin()).scale(da);
+        for (pos, j, mm) in &self.patches {
+            let phase = self.k0 * (rhat[0] * pos[0] + rhat[1] * pos[1] + rhat[2] * pos[2]);
+            let w = Cx::new(phase.cos(), phase.sin());
             for c in 0..3 {
                 nv[c] = nv[c].add(j[c].mul(w));
                 lv[c] = lv[c].add(mm[c].mul(w));
             }
         }
+        (nv, lv)
+    }
+
+    /// Net power out of the transform box, ½ Re ∮ (E × H*)·n dA (a check on the transform).
+    pub(crate) fn poynting(&self) -> f64 {
+        let crs = |a: CV, b: CV| -> CV { [a[1].mul(b[2]).sub(a[2].mul(b[1])), a[2].mul(b[0]).sub(a[0].mul(b[2])), a[0].mul(b[1]).sub(a[1].mul(b[0]))] };
+        let mut p = 0.0;
+        for ((_, j, m), n) in self.patches.iter().zip(&self.normals) {
+            let nc: CV = n.map(|v| Cx::new(v, 0.0));
+            let ht = crs(*j, nc); // J × n = H_t (·dA)
+            let et = crs(nc, *m); // n × M = E_t (·dA)
+            let hc = ht.map(|x| Cx::new(x.re, -x.im));
+            let sv = crs(et, hc);
+            p += 0.5 * (sv[0].re * n[0] + sv[1].re * n[1] + sv[2].re * n[2]);
+        }
+        p / self.da
+    }
+
+    /// Radiation intensity U(θ, φ) [W/sr] = k²/(32π²η)(|L_φ+ηN_θ|²+|L_θ−ηN_φ|²).
+    pub(crate) fn u(&self, th: f64, ph: f64) -> f64 {
+        let (st, ct, sp, cp) = (th.sin(), th.cos(), ph.sin(), ph.cos());
+        let (nv, lv) = self.nl([st * cp, st * sp, ct]);
         let th_c = |x: CV| x[0].scale(ct * cp).add(x[1].scale(ct * sp)).sub(x[2].scale(st));
         let ph_c = |x: CV| x[1].scale(cp).sub(x[0].scale(sp));
         let (nt, np, lt, lp) = (th_c(nv), ph_c(nv), th_c(lv), ph_c(lv));
-        k0 * k0 / (32.0 * std::f64::consts::PI.powi(2) * eta) * (lp.add(nt.scale(eta)).norm2() + lt.sub(np.scale(eta)).norm2())
-    };
-    let us: Vec<f64> = dirs.par_iter().map(|&(t, p)| u_of(t, p)).collect();
+        let eta = (MU0 / EPS0).sqrt();
+        self.k0 * self.k0 / (32.0 * std::f64::consts::PI.powi(2) * eta) * (lp.add(nt.scale(eta)).norm2() + lt.sub(np.scale(eta)).norm2())
+    }
+}
+
+/// Near-to-far-field transform at the setup's frequency.
+pub fn far_field(s: &Setup, re: &[f32], im: &[f32], scale: f64) -> Result<FarField> {
+    far_field_at(s, re, im, scale, s.freq)
+}
+
+/// Far field at `freq`: radiated power, peak intensity and its direction, and a θ cut.
+pub fn far_field_at(s: &Setup, re: &[f32], im: &[f32], scale: f64, freq: f64) -> Result<FarField> {
+    let nt = Ntff::new(s, re, im, scale, freq)?;
+    let (nth, nph) = (60usize, 72usize);
+    let (dth, dph) = (std::f64::consts::PI / nth as f64, std::f64::consts::TAU / nph as f64);
+    let dirs: Vec<(f64, f64)> = (0..nth).flat_map(|i| (0..nph).map(move |j| ((i as f64 + 0.5) * dth, j as f64 * dph))).collect();
+    let us: Vec<f64> = dirs.par_iter().map(|&(t, p)| nt.u(t, p)).collect();
     let prad: f64 = dirs.iter().zip(&us).map(|(&(t, _), u)| u * t.sin() * dth * dph).sum();
     let (imax, umax) = us.iter().enumerate().fold((0, 0.0f64), |b, (i, &u)| if u > b.1 { (i, u) } else { b });
     let (tmax, pmax) = dirs[imax];
@@ -1200,11 +1355,11 @@ pub fn far_field(s: &Setup, re: &[f32], im: &[f32], scale: f64) -> Result<FarFie
         .into_par_iter()
         .map(|i| {
             let t = (i as f64 * 3.0).to_radians();
-            let u = u_of(t, pmax);
+            let u = nt.u(t, pmax);
             (i as f64 * 3.0, 10.0 * (4.0 * std::f64::consts::PI * u / prad.max(1e-300)).max(1e-12).log10())
         })
         .collect();
-    Ok(FarField { prad, umax, dir: (tmax.to_degrees(), pmax.to_degrees()), cut, outside })
+    Ok(FarField { prad, umax, dir: (tmax.to_degrees(), pmax.to_degrees()), cut, outside: nt.outside })
 }
 
 /// FCC Part 15 class B radiated limit at 3 m [dBµV/m] (quasi-peak below 1 GHz, average above).

@@ -289,6 +289,7 @@ pub fn suggested_responses(model: &Model) -> Vec<String> {
         CurrentFlow | ThermalElectric => f(&["quantity:Resistance", "quantity:Total Joule heating power", "max:current_density", "max:temperature"]),
         Magnetostatic => f(&["quantity:Peak |B| in solids", "quantity:Stored magnetic energy", "max:magnetic_flux_density"]),
         FullWaveEm => f(&["quantity:Absorbed power", "quantity:Absorbed fraction", "max:electric_field", "max:absorbed_power"]),
+        BroadbandEm => f(&["quantity:Minimum |S11|", "quantity:Worst emission margin", "max:electric_field"]),
         MicrowaveHeating => f(&["max:temperature", "min:temperature", "quantity:Absorbed power", "quantity:Temperature spread"]),
         ConjugateHeatTransfer => f(&["max:temperature", "quantity:Heat carried away by the flow", "max:velocity", "quantity:Inlet pressure"]),
         Fluid => f(&["quantity:Force on solids X (drag)", "max:velocity", "max:fluid_pressure"]),

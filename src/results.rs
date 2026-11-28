@@ -288,6 +288,10 @@ pub struct Results {
     /// x-axis of `history` ("time [s]", "frequency [Hz]", "load factor"…).
     #[allow(dead_code)]
     pub history_x: String,
+    /// Further curves on the same x-axis as `history`: (label, points, shown in the chart).
+    pub series: Vec<(String, Vec<(f64, f64)>, bool)>,
+    /// Structured extras for scripting (e.g. "s_parameters"), returned by get_results.
+    pub data: BTreeMap<String, serde_json::Value>,
     /// What the displayed fields mean (e.g. "1σ RMS", "at 812 Hz", "SRSS combined").
     pub note: String,
     pub reactions: Vec<Reaction>,
@@ -318,6 +322,8 @@ impl Results {
             history: vec![],
             history_label: String::new(),
             history_x: String::new(),
+            series: vec![],
+            data: BTreeMap::new(),
             note: String::new(),
             reactions: vec![],
             quantities: vec![],
@@ -488,6 +494,17 @@ impl Results {
             let stride = (self.history.len() / 25).max(1);
             let h: Vec<[f64; 2]> = self.history.iter().step_by(stride).map(|(t, v)| [float(*t), float(*v)]).collect();
             out["history"] = json!({"quantity": self.history_label, "x": self.history_x, "samples": h});
+        }
+        if !self.series.is_empty() {
+            let mut cv = serde_json::Map::new();
+            for (name, pts, _) in &self.series {
+                let stride = (pts.len() / 50).max(1);
+                cv.insert(name.clone(), json!(pts.iter().step_by(stride).map(|(x, y)| [float(*x), float(*y)]).collect::<Vec<_>>()));
+            }
+            out["curves"] = json!({"x": self.history_x, "series": cv});
+        }
+        for (k, v) in &self.data {
+            out[k.as_str()] = v.clone();
         }
         out
     }

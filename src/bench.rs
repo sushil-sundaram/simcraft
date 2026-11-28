@@ -1202,6 +1202,41 @@ END-ISO-10303-21;
         }),
     });
 
+    v.push(Case {
+        id: "dipole_broadband",
+        group: "Electromagnetics",
+        title: "Centre-fed dipole (145 mm), broadband FDTD with a lumped port: resonance and energy balance (P2.6)",
+        source: "half-wave dipole: directivity 1.64 (2.15 dBi); radiated = delivered; Rin ≈ 70 Ω at resonance (King, L/a ≈ 50)",
+        sizes: vec![5.0],
+        size_unit: "mm",
+        quick: false,
+        metrics: vec![
+            m("dipole_bb.rin", "Rin at resonance", 70.0, "Ω", 0.08),
+            m("dipole_bb.balance", "radiated / delivered (1 GHz)", 1.0, "", 0.04),
+            m("dipole_bb.d", "directivity (linear, 1 GHz)", 1.64, "", 0.06),
+        ],
+        run: Box::new(|hh| {
+            let c = new_core();
+            let r = script(&c, &[
+                ("add_box", json!({"name": "ArmA", "min": [-2.5, -2.5, -75], "size": [5, 5, 70], "material": "Copper C101"})),
+                ("add_box", json!({"name": "ArmB", "min": [-2.5, -2.5, 0], "size": [5, 5, 70], "material": "Copper C101"})),
+                ("add_enclosure", json!({"min": [-152.5, -152.5, -225], "size": [305, 305, 445]})),
+                ("set_analysis", json!({"type": "broadband_em", "freq_min_ghz": 0.5, "freq_max_ghz": 1.5, "em_boundary": "open", "freq_steps": 101})),
+                ("set_mesh", json!({"element_size_mm": hh})),
+                ("add_lumped_port", json!({"from": [-2.5, -2.5, -5], "to": [-2.5, -2.5, 0], "impedance": 73})),
+                ("solve", json!({})),
+            ])?;
+            out(
+                vec![
+                    qty(&r, "Port #1: Re Zin at resonance")?,
+                    qty(&r, "Radiated / delivered power at the band centre")? / 100.0,
+                    10f64.powf(qty(&r, "Directivity at the band centre")? / 10.0),
+                ],
+                &r,
+            )
+        }),
+    });
+
     // ---------------------------------------------------------------- electronics
     let dc_board = |via: bool| {
         let (seg, tp2) = if via {

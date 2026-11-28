@@ -528,6 +528,45 @@ waveguides and RF fields around parts.
   CPU). A 240 × 240 × 160 mm oven at 1.6 mm (2.25 M cells, 136 RF periods) takes ≈ 24 s on an
   RTX 3070 Ti Laptop.
 
+**Broadband EM (S-parameters, emissions)** — one FDTD run with a short Gaussian-modulated pulse gives
+the response over a whole band (SOLVE ▸ From / To / Points; MCP `set_analysis broadband_em
+freq_min_ghz freq_max_ghz freq_steps`). Use it for antennas, RF interconnects and filters, and for
+radiated-emissions estimates across frequency.
+- **Lumped Port** (SETUP ▸ ELECTROMAGNETIC ▸ Lumped Port, MCP `add_lumped_port`): a resistive source
+  across the gap between two conductors — an antenna feed, the end of a trace over its ground, a
+  connector. Give the two points **From** and **To** on the two conductors, on a line parallel to
+  x, y or z, crossing at least one cell of air or dielectric; the **impedance** (default 50 Ω) is the
+  source / termination resistance and the S-parameter reference; **Source** (V) drives the port,
+  0 V makes it a passive matched termination. With several driven ports SimCraft runs once per
+  driven port, so the full S-matrix column of each is available.
+- **Results**: the chart shows |S11| (dB) against frequency, plus |S21| … to the other ports and the
+  emission spectrum; quantities give, per driven port, the best match (|S11|, frequency, Zin, VSWR),
+  the −10 dB bandwidth, the **series resonance** (Im Zin = 0) with Re Zin there, Zin at the band
+  centre and |S21| between ports. `get_results` returns the complex S-parameters and input
+  impedances at every frequency (`s_parameters`) and every curve (`curves`); the viewport shows |E| at
+  the band centre for the port voltages.
+- **Emissions** (Open boundary): the far field at up to 21 frequencies across the band gives the field
+  at **3 m and 10 m** against the **FCC Part 15 class B** and **CISPR 32 class B** limits, for the
+  port voltage as a sine at each frequency, and the worst margin. By default this is the free-space
+  field in the strongest direction; tick **Ground plane (test site)** (`ground_plane: true`,
+  `eut_height_m`, default 0.8 m) for a metal ground plane under the model (image theory) with the
+  receive antenna scanned from 1 to 4 m in height and the model turned on a turntable, taking the
+  larger of horizontal and vertical polarisation — as on an open-area test site.
+- **Mesh and enclosure**: ≥ 10 cells per wavelength at the top of the band. For radiated power, gain
+  and emissions leave about **λ/4 at the bottom of the band** between the model and the enclosure
+  wall — closer, the absorbing layer sits in the near field and results drift by 10 % or more
+  (SimCraft warns). For S-parameters alone a smaller enclosure is fine.
+- **Max periods** (default 400 periods of the band centre) caps the run if the pulse does not ring
+  down (very high-Q resonators); SimCraft warns when that happens.
+- Validation (`tests/broadband.rs`, bench `dipole_broadband`): a 145 mm dipole resonates at 0.90 GHz
+  with Rin = 70.6 Ω, directivity 2.2 dBi and radiated = delivered power within 1.6 %; a 50 Ω-class
+  microstrip (4 mm on 2 mm FR-4) gives Z₀ within 4 % and εeff within 5 % of Hammerstad–Jensen
+  (de-embedded with two line lengths); a probe-fed 30 × 38 mm patch resonates within 5 % of the
+  cavity model (2.23 vs 2.35 GHz with a 2-cell substrate); over a ground plane the height scan adds
+  3.5–5 dB to a horizontal dipole's free-space field (image theory allows up to 6 dB).
+- *Limits*: lumped ports are a single line of grid edges (their feed inductance shows above a few
+  GHz on thick substrates); runs on the CPU; waveguide (RF Port) feeds are not used in this analysis.
+
 **Microwave Heating** — Full-Wave EM followed by transient heat conduction in the solid bodies, with
 the absorbed power as the heat source (the cavity air is held at the initial temperature). Settings
 add heating time (end time), time steps and initial temperature; thermal loads (convection on the

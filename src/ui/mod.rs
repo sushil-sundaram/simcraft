@@ -76,6 +76,7 @@ pub(super) enum LoadKind {
     RemoteForce,
     RemoteDisplacement,
     PointMass,
+    LumpedPort,
 }
 
 impl LoadKind {
@@ -94,7 +95,7 @@ impl LoadKind {
         LoadKind::PointMass,
     ];
     pub(super) const THERMAL: [LoadKind; 5] = [LoadKind::Temperature, LoadKind::HeatFlux, LoadKind::Convection, LoadKind::Radiation, LoadKind::HeatGen];
-    pub(super) const ELECTRO: [LoadKind; 5] = [LoadKind::Voltage, LoadKind::Current, LoadKind::Coil, LoadKind::Magnet, LoadKind::Port];
+    pub(super) const ELECTRO: [LoadKind; 6] = [LoadKind::Voltage, LoadKind::Current, LoadKind::Coil, LoadKind::Magnet, LoadKind::Port, LoadKind::LumpedPort];
     pub(super) const FLUID: [LoadKind; 5] = [LoadKind::Inlet, LoadKind::Outlet, LoadKind::Symmetry, LoadKind::MovingWall, LoadKind::Gravity];
 
     pub(super) fn label(self) -> &'static str {
@@ -124,6 +125,7 @@ impl LoadKind {
             LoadKind::RemoteForce => "Remote Force",
             LoadKind::RemoteDisplacement => "Remote Disp.",
             LoadKind::PointMass => "Point Mass",
+            LoadKind::LumpedPort => "Lumped Port",
         }
     }
     pub(super) fn title(self) -> &'static str {
@@ -156,6 +158,7 @@ impl LoadKind {
             LoadKind::RemoteForce => "↗",
             LoadKind::RemoteDisplacement => "🎯",
             LoadKind::PointMass => "⚖",
+            LoadKind::LumpedPort => "⏚",
         }
     }
     pub(super) fn sample(self) -> Load {
@@ -186,6 +189,7 @@ impl LoadKind {
             LoadKind::RemoteForce => Load::RemoteForce { faces: f, point: [0.0; 3], force: [0.0; 3], moment: [0.0; 3] },
             LoadKind::RemoteDisplacement => Load::RemoteDisplacement { faces: f, point: [0.0; 3], x: None, y: None, z: None, rx: None, ry: None, rz: None, rigid: false },
             LoadKind::PointMass => Load::PointMass { faces: f, mass_kg: 1.0, point: None },
+            LoadKind::LumpedPort => Load::LumpedPort { from: [0.0; 3], to: [0.0; 3], impedance: 50.0, voltage: 1.0 },
         }
     }
     pub(super) fn color(self) -> Color32 {
@@ -197,7 +201,7 @@ impl LoadKind {
         Color32::from_rgb(c[0], c[1], c[2])
     }
     pub(super) fn needs_faces(self) -> bool {
-        !matches!(self, LoadKind::Gravity | LoadKind::HeatGen | LoadKind::Coil | LoadKind::Magnet | LoadKind::BoltPretension)
+        !matches!(self, LoadKind::Gravity | LoadKind::HeatGen | LoadKind::Coil | LoadKind::Magnet | LoadKind::BoltPretension | LoadKind::LumpedPort)
     }
     pub(super) fn needs_body(self) -> bool {
         matches!(self, LoadKind::Coil | LoadKind::Magnet | LoadKind::BoltPretension)
@@ -284,6 +288,10 @@ pub(super) struct Forms {
     pub spring_pre: f64,
     pub spring_to: String,
     pub remote_pt: [f64; 3],
+    pub lp_from: [f64; 3],
+    pub lp_to: [f64; 3],
+    pub lp_z: f64,
+    pub lp_v: f64,
     pub remote_moment: [f64; 3],
     pub remote_rot: [(bool, f64); 3],
     pub remote_rigid: bool,
@@ -353,6 +361,10 @@ impl Default for Forms {
             spring_pre: 0.0,
             spring_to: String::new(),
             remote_pt: [0.0; 3],
+            lp_from: [0.0; 3],
+            lp_to: [0.0, 0.0, 1.0],
+            lp_z: 50.0,
+            lp_v: 1.0,
             remote_moment: [0.0; 3],
             remote_rot: [(false, 0.0); 3],
             remote_rigid: false,
@@ -840,6 +852,7 @@ impl SimApp {
                 "busbar" => self.example_busbar(),
                 "coil" => self.example_coil(),
                 "microwave" => self.example_microwave(),
+                "dipole" => self.example_dipole(),
                 "heatsink_cht" => self.example_heatsink_cht(),
                 _ => self.example_cfd(),
             },
@@ -1030,6 +1043,17 @@ impl SimApp {
             ("set_analysis", json!({"type": "microwave_heating", "frequency_ghz": 2.45, "em_boundary": "pec", "end_time": 30, "time_steps": 30, "initial_temperature": 5})),
             ("set_mesh", json!({"element_size_mm": 1.6})),
             ("add_port", json!({"faces": ["Enclosure.xmin"], "power": 800, "polarization": "z", "profile": "te10"})),
+        ]);
+    }
+    fn example_dipole(&mut self) {
+        self.script(&[
+            ("new_model", json!({})),
+            ("add_box", json!({"name": "ArmA", "min": [-2.5, -2.5, -75], "size": [5, 5, 70], "material": "Copper C101"})),
+            ("add_box", json!({"name": "ArmB", "min": [-2.5, -2.5, 0], "size": [5, 5, 70], "material": "Copper C101"})),
+            ("add_enclosure", json!({"material": "Air", "min": [-152.5, -152.5, -225], "size": [305, 305, 445]})),
+            ("set_analysis", json!({"type": "broadband_em", "freq_min_ghz": 0.5, "freq_max_ghz": 1.5, "freq_steps": 201, "em_boundary": "open"})),
+            ("set_mesh", json!({"element_size_mm": 5})),
+            ("add_lumped_port", json!({"from": [-2.5, -2.5, -5], "to": [-2.5, -2.5, 0], "impedance": 73, "voltage": 1})),
         ]);
     }
     fn example_heatsink_cht(&mut self) {

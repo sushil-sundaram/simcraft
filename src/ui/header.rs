@@ -88,6 +88,10 @@ impl SimApp {
                                     ui.close();
                                     self.guard(Pending::Example("microwave"));
                                 }
+                                if ui.button("📶  Dipole antenna: S11 and emissions (broadband EM)").clicked() {
+                                    ui.close();
+                                    self.guard(Pending::Example("dipole"));
+                                }
                                 ui.separator();
                                 if ui.button("🔥  Heat sink in a duct (conjugate heat transfer)").clicked() {
                                     ui.close();

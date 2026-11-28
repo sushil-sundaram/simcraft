@@ -519,6 +519,7 @@ pub fn solve(model: &Model, mesh: &Mesh, prog: Prog) -> Result<Results> {
             crate::fdtd::full_wave(model, mesh, prog, &mut res)?;
         }
         MicrowaveHeating => crate::fdtd::microwave_heating(model, mesh, prog, &mut res)?,
+        BroadbandEm => crate::broadband::solve(model, mesh, prog, &mut res)?,
         Electrostatic => crate::fields::electrostatic(model, mesh, prog, &mut res)?,
         CurrentFlow => {
             crate::fields::current_flow(model, mesh, prog, &mut res)?;
